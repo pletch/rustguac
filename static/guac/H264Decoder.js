@@ -52,6 +52,43 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var pendingDecodes = 0;
 
     /**
+     * Maximum number of frames allowed to remain in flight (submitted to the
+     * decoder but not yet painted) when acknowledging a Guacamole sync. A depth
+     * of 0 forces the sync ack to wait for every frame to fully decode and
+     * paint, serializing network RTT and async decode time on every frame and
+     * causing severe input lag. Allowing a shallow pipeline overlaps RTT with
+     * decode while keeping the backlog bounded, so guacd backpressure still
+     * applies once the queue exceeds this depth.
+     *
+     * @private
+     * @constant
+     * @type {number}
+     */
+    var MAX_PIPELINE_DEPTH = 2;
+
+    /**
+     * Safety timeout (ms) for the sync gate. If pending decodes do not drain
+     * within this window the sync is acked anyway, preventing a permanent
+     * stall if the decoder wedges. Kept short: it is a pure safety net, not a
+     * throttle, so a healthy decoder never reaches it.
+     *
+     * @private
+     * @constant
+     * @type {number}
+     */
+    var SYNC_WAIT_TIMEOUT_MS = 200;
+
+    /**
+     * Timestamp of the last sync-timeout warning, for rate-limiting the log
+     * so a struggling decoder cannot flood the console (heavy logging on the
+     * main thread itself worsens decode/paint latency).
+     *
+     * @private
+     * @type {number}
+     */
+    var lastTimeoutWarn = 0;
+
+    /**
      * Per-frame draw positions keyed by chunk timestamp. The VideoDecoder
      * output callback uses this to draw each frame at the correct position,
      * avoiding shared mutable state between concurrent decodes.
@@ -100,6 +137,35 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     this.peakQueueDepth = 0;
 
     /**
+     * Decode latency of the most recent frame: milliseconds from submitting
+     * the chunk to decoder.decode() until its decoded frame arrived in the
+     * output callback. This isolates browser-side decode cost (and any
+     * decoder reordering, e.g. B-frames) from server-side encoder latency:
+     * if this stays small but motion-to-photon lag is high, the buffering is
+     * upstream of the browser (the xrdp H.264 encoder).
+     *
+     * @type {number}
+     */
+    this.lastDecodeLatency = 0;
+
+    /**
+     * Peak per-frame decode latency seen this session, in milliseconds.
+     *
+     * @type {number}
+     */
+    this.peakDecodeLatency = 0;
+
+    /**
+     * Running sum and count of per-frame decode latencies, used to report a
+     * session average in stats().
+     *
+     * @private
+     * @type {number}
+     */
+    var decodeLatencySum = 0;
+    var decodeLatencyCount = 0;
+
+    /**
      * Reference to this for closures.
      */
     var self = this;
@@ -141,6 +207,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 try {
                     var pos = pendingPositions[frame.timestamp];
                     delete pendingPositions[frame.timestamp];
+                    if (pos && pos.t !== undefined) {
+                        var latency = performance.now() - pos.t;
+                        self.lastDecodeLatency = latency;
+                        if (latency > self.peakDecodeLatency)
+                            self.peakDecodeLatency = latency;
+                        decodeLatencySum += latency;
+                        decodeLatencyCount++;
+                    }
                     if (pos && pos.layer) {
                         var canvas = pos.layer.getCanvas();
                         var ctx = canvas.getContext('2d');
@@ -161,10 +235,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             }
         });
 
-        // Configure for H.264 Constrained Baseline
+        // Configure for H.264 High Profile, Level 4.1 (matches xrdp)
         // Let the decoder auto-detect level from the SPS NAL in the stream
         decoder.configure({
-            codec: 'avc1.42001f', // Baseline profile, level 3.1
+            codec: 'avc1.640029', // High profile, level 4.1
+            hardwareAcceleration: 'prefer-hardware',
             optimizeForLatency: true
         });
 
@@ -202,8 +277,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 data: nalData
             });
 
-            // Store per-frame position before submitting to decoder
-            pendingPositions[timestamp] = {layer: layer, x: x, y: y};
+            // Store per-frame position (and submit time, for decode-latency
+            // measurement) before submitting to decoder
+            pendingPositions[timestamp] = {layer: layer, x: x, y: y, t: performance.now()};
             pendingDecodes++;
             timestamp += 33333; // ~30fps in microseconds
 
@@ -219,13 +295,16 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * Used to gate the Guacamole sync response so that guacd receives
      * accurate backpressure from the client's decode speed.
      *
-     * Includes a 1-second safety timeout to prevent permanent stall if the
-     * decoder enters an unexpected state.
+     * Includes a short safety timeout (SYNC_WAIT_TIMEOUT_MS) to prevent a
+     * permanent stall if the decoder enters an unexpected state.
      *
      * @param {function} callback - Called when all pending decodes are done.
      */
     this.waitForPending = function(callback) {
-        if (pendingDecodes <= 0 || !decoder || decoder.state === 'closed') {
+        // Ack as soon as the backlog is within the allowed pipeline depth.
+        // Gating strictly on <= 0 serializes network RTT and async decode
+        // time on every frame, causing severe input lag.
+        if (pendingDecodes <= MAX_PIPELINE_DEPTH || !decoder || decoder.state === 'closed') {
             callback();
             return;
         }
@@ -238,10 +317,16 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var timer = setTimeout(function() {
             if (!resolved) {
                 resolved = true;
-                console.warn('[rustguac] H.264: sync wait timeout (' + waitingOn + ' frames pending), forcing flush');
+                // Rate-limit: at most one warning per second, so a wedged
+                // decoder cannot flood the console (which would itself add jank).
+                var now = performance.now();
+                if (now - lastTimeoutWarn > 1000) {
+                    lastTimeoutWarn = now;
+                    console.warn('[rustguac] H.264: sync wait timeout (' + waitingOn + ' frames pending), forcing flush');
+                }
                 callback();
             }
-        }, 1000);
+        }, SYNC_WAIT_TIMEOUT_MS);
 
         flushResolvers.push(function() {
             if (!resolved) {
@@ -293,6 +378,10 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             pendingDecodes: pendingDecodes,
             decodeQueueSize: decoder ? decoder.decodeQueueSize : 0,
             peakQueueDepth: self.peakQueueDepth,
+            lastDecodeLatencyMs: +self.lastDecodeLatency.toFixed(1),
+            avgDecodeLatencyMs: decodeLatencyCount
+                ? +(decodeLatencySum / decodeLatencyCount).toFixed(1) : 0,
+            peakDecodeLatencyMs: +self.peakDecodeLatency.toFixed(1),
             decoderState: decoder ? decoder.state : 'none'
         };
         console.table(s);
