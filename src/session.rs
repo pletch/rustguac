@@ -182,6 +182,18 @@ pub struct CreateSessionRequest {
     /// is told `secondary-monitors = max_monitors - 1`, which it advertises to
     /// the client. Default 1 (single monitor).
     pub max_monitors: Option<u32>,
+    /// SSH terminal font size in points (SSH only; default 12).
+    pub ssh_font_size: Option<u32>,
+    /// Wake-on-LAN: send a magic packet before connecting (SSH/RDP/VNC).
+    pub wol_send_packet: Option<bool>,
+    /// Wake-on-LAN: target MAC address.
+    pub wol_mac_addr: Option<String>,
+    /// Wake-on-LAN: broadcast address.
+    pub wol_broadcast_addr: Option<String>,
+    /// Wake-on-LAN: UDP port.
+    pub wol_udp_port: Option<u16>,
+    /// Wake-on-LAN: wait time in seconds after sending the packet.
+    pub wol_wait_time: Option<u32>,
 }
 
 /// Session status in the lifecycle.
@@ -707,6 +719,15 @@ impl SessionManager {
         // proxy hops); merged into the session's tunnel list after the match.
         let mut proxmox_tunnels: Vec<tunnel::SshTunnel> = Vec::new();
 
+        // Wake-on-LAN params, applied to SSH/RDP/VNC alike (passed through to guacd).
+        let wol = guacd::WolParams {
+            send_packet: req.wol_send_packet.unwrap_or(false),
+            mac_addr: req.wol_mac_addr.clone(),
+            broadcast_addr: req.wol_broadcast_addr.clone(),
+            udp_port: req.wol_udp_port,
+            wait_time: req.wol_wait_time,
+        };
+
         let (
             mut conn_params,
             hostname,
@@ -814,7 +835,12 @@ impl SessionManager {
                     private_key,
                     width,
                     height,
-                    dpi,
+                    // SSH terminal text size is driven by font_size, not device
+                    // DPI. The client sends a devicePixelRatio-scaled DPI (correct
+                    // for RDP/VNC) which would render the terminal font oversized
+                    // on HiDPI displays, so pin SSH to a 96 baseline — the client
+                    // auto-scales the canvas to fit regardless.
+                    dpi: 96,
                     enable_sftp: drive_enabled,
                     sftp_disable_download: !drive_cfg.allow_download,
                     sftp_disable_upload: !drive_cfg.allow_upload,
@@ -826,6 +852,8 @@ impl SessionManager {
                         .as_ref()
                         .map(|(_, _, c)| *c)
                         .unwrap_or(false),
+                    font_size: req.ssh_font_size,
+                    wol: wol.clone(),
                 });
                 (
                     params, hostname, username, None, None, ssh_banner, None, None, None,
@@ -920,6 +948,7 @@ impl SessionManager {
                     force_lossless: req.force_lossless.unwrap_or(false),
                     enable_h264: req.enable_h264.unwrap_or(false),
                     secondary_monitors: req.max_monitors.unwrap_or(1).saturating_sub(1),
+                    wol: wol.clone(),
                 }));
                 (
                     params,
@@ -959,6 +988,7 @@ impl SessionManager {
                     dpi,
                     disable_copy: req.disable_copy.unwrap_or(false),
                     disable_paste: req.disable_paste.unwrap_or(false),
+                    wol: wol.clone(),
                 });
                 (
                     params, hostname, username, None, None, None, None, None, None,
@@ -1227,6 +1257,8 @@ impl SessionManager {
                     dpi,
                     disable_copy: req.disable_copy.unwrap_or(false),
                     disable_paste: req.disable_paste.unwrap_or(false),
+                    // Local Xvnc — WoL not applicable.
+                    wol: guacd::WolParams::default(),
                 });
                 (
                     params,
@@ -1381,6 +1413,8 @@ impl SessionManager {
                     force_lossless: false,
                     enable_h264: true,
                     secondary_monitors: req.max_monitors.unwrap_or(1).saturating_sub(1),
+                    // VDI container on the Docker host — WoL not applicable.
+                    wol: guacd::WolParams::default(),
                 }));
                 (
                     params,
