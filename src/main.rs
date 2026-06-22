@@ -18,8 +18,8 @@ mod vdi;
 mod websocket;
 
 use crate::api::{
-    AppState, CredentialDefaultScope, DriveConfigured, OidcEnabled, SiteTitle, ThemeData,
-    VaultBackends, VaultCell, VaultConfigured, VaultState,
+    AppState, CredentialDefaultScope, DriveConfigured, OidcEnabled, OidcHandle, SiteTitle,
+    ThemeData, VaultBackends, VaultCell, VaultConfigured, VaultState,
 };
 use crate::config::Config;
 use crate::db::Db;
@@ -1212,6 +1212,7 @@ async fn run_server(config: Config, database: Db) {
         .layer(middleware::from_fn(security_headers))
         .layer(Extension(tls_enabled))
         .layer(Extension(oidc_enabled))
+        .layer(Extension(OidcHandle(oidc_state.clone())))
         .layer(Extension(drive_configured))
         .layer(Extension(site_title))
         .layer(Extension(theme_data))
