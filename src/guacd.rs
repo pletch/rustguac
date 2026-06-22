@@ -31,6 +31,36 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncStream for T {}
 /// A type-erased async stream for the guacd connection (plain TCP or TLS).
 pub type GuacdStream = Box<dyn AsyncStream>;
 
+/// Wake-on-LAN parameters, passed through to guacd's `wol-*` connection args.
+/// guacd supports these for SSH, RDP, VNC, and telnet. Empty/None fields fall
+/// back to guacd's own defaults.
+#[derive(Default, Clone)]
+pub struct WolParams {
+    /// Send a magic packet to wake the host before connecting.
+    pub send_packet: bool,
+    /// Target MAC address (required when `send_packet` is true).
+    pub mac_addr: Option<String>,
+    /// Broadcast address for the magic packet (guacd default: 255.255.255.255).
+    pub broadcast_addr: Option<String>,
+    /// UDP port for the magic packet (guacd default: 9).
+    pub udp_port: Option<u16>,
+    /// Seconds to wait after sending before connecting (lets the host boot).
+    pub wait_time: Option<u32>,
+}
+
+/// Resolve a guacd `wol-*` arg name to its value. Returns None for non-WoL
+/// arg names so callers can fall through to their default handling.
+fn wol_arg_value(name: &str, w: &WolParams) -> Option<String> {
+    match name {
+        "wol-send-packet" => Some(if w.send_packet { "true" } else { "false" }.into()),
+        "wol-mac-addr" => Some(w.mac_addr.clone().unwrap_or_default()),
+        "wol-broadcast-addr" => Some(w.broadcast_addr.clone().unwrap_or_default()),
+        "wol-udp-port" => Some(w.udp_port.map(|p| p.to_string()).unwrap_or_default()),
+        "wol-wait-time" => Some(w.wait_time.map(|t| t.to_string()).unwrap_or_default()),
+        _ => None,
+    }
+}
+
 /// SSH connection parameters to pass to guacd.
 pub struct SshParams {
     pub hostname: String,
@@ -58,6 +88,10 @@ pub struct SshParams {
     pub typescript_name: Option<String>,
     /// Ask guacd to create `typescript_path` if it doesn't exist.
     pub create_typescript_path: bool,
+    /// Terminal font size in points (guacd default: 12).
+    pub font_size: Option<u32>,
+    /// Wake-on-LAN parameters.
+    pub wol: WolParams,
 }
 
 /// VNC connection parameters to pass to guacd.
@@ -71,6 +105,8 @@ pub struct VncParams {
     pub dpi: u32,
     pub disable_copy: bool,
     pub disable_paste: bool,
+    /// Wake-on-LAN parameters.
+    pub wol: WolParams,
 }
 
 /// SPICE connection parameters to pass to guacd.
@@ -160,6 +196,8 @@ pub struct RdpParams {
     /// advertises this to the client as `secondary-monitors` and drives RDP
     /// multi-monitor via the Display Control channel. 0 = single monitor.
     pub secondary_monitors: u32,
+    /// Wake-on-LAN parameters.
+    pub wol: WolParams,
 }
 
 /// Connection parameters — SSH, VNC, or RDP.
@@ -241,7 +279,7 @@ pub async fn connect_and_handshake(
                 "height" => p.height.to_string(),
                 "dpi" => p.dpi.to_string(),
                 "color-scheme" => "gray-black".into(),
-                "font-size" => "12".into(),
+                "font-size" => p.font_size.unwrap_or(12).to_string(),
                 "font-name" => "monospace".into(),
                 "terminal-type" => "xterm-256color".into(),
                 "scrollback" => "1000".into(),
@@ -273,10 +311,10 @@ pub async fn connect_and_handshake(
                     "false"
                 }
                 .into(),
-                _ => {
+                _ => wol_arg_value(name, &p.wol).unwrap_or_else(|| {
                     tracing::debug!("Unknown guacd SSH parameter '{}', sending empty", name);
                     String::new()
-                }
+                }),
             },
             ConnectionParams::Vnc(p) => match name.as_str() {
                 "hostname" => p.hostname.clone(),
@@ -294,10 +332,10 @@ pub async fn connect_and_handshake(
                 "enable-audio" => "false".into(),
                 "disable-copy" => if p.disable_copy { "true" } else { "false" }.into(),
                 "disable-paste" => if p.disable_paste { "true" } else { "false" }.into(),
-                _ => {
+                _ => wol_arg_value(name, &p.wol).unwrap_or_else(|| {
                     tracing::debug!("Unknown guacd VNC parameter '{}', sending empty", name);
                     String::new()
-                }
+                }),
             },
             ConnectionParams::Rdp(p) => match name.as_str() {
                 "hostname" => p.hostname.clone(),
@@ -362,10 +400,10 @@ pub async fn connect_and_handshake(
                 "remote-app" => p.remote_app.clone().unwrap_or_default(),
                 "remote-app-dir" => p.remote_app_dir.clone().unwrap_or_default(),
                 "remote-app-args" => p.remote_app_args.clone().unwrap_or_default(),
-                _ => {
+                _ => wol_arg_value(name, &p.wol).unwrap_or_else(|| {
                     tracing::debug!("Unknown guacd RDP parameter '{}', sending empty", name);
                     String::new()
-                }
+                }),
             },
             // Note: SPICE has no width/height/dpi connect args (it sizes via the
             // `size` instruction) and no `password` arg (delivered via argv below).

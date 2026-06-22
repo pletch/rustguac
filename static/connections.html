@@ -485,6 +485,10 @@
                 <label>Private key (PEM)
                     <textarea id="em-private-key" rows="3" style="resize:vertical;font-size:0.85em" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
                 </label>
+                <label>Terminal font size <span style="color:var(--text-muted);font-size:0.85em">(optional)</span>
+                    <input type="number" id="em-ssh-font-size" min="6" max="72" placeholder="12">
+                </label>
+                <div class="field-hint">Points. Leave blank for the default (12). Increase or decrease to tune readability — the terminal size no longer scales with display DPI.</div>
                 <label style="margin-top:0.8em">
                     <input type="checkbox" id="em-ssh-prompt-creds" style="display:inline;width:auto;margin-right:0.4em"> Prompt for credentials at connect time
                 </label>
@@ -843,6 +847,31 @@
                     <button type="button" class="btn-add" id="em-add-hop" style="margin-top:8px">+ Add Jump Host</button>
                 </div>
             </div>
+            <div id="em-wol-section" style="display:none;margin-top:1em;padding-top:0.8em;border-top:1px solid var(--border)">
+                <label style="cursor:pointer;color:var(--accent);font-size:0.95em" id="em-wol-toggle">
+                    <span id="em-wol-arrow">&#9654;</span> Wake-on-LAN
+                </label>
+                <div id="em-wol-fields" style="display:none">
+                    <div class="field-hint" style="margin-bottom:0.5em">Send a Wake-on-LAN magic packet to power on the target before connecting. The host's NIC must have WoL enabled, and the packet must be able to reach its subnet.</div>
+                    <label style="text-transform:none;letter-spacing:0;cursor:pointer">
+                        <input type="checkbox" id="em-wol-enabled" style="display:inline;width:auto;margin-right:0.5em">
+                        Send magic packet before connecting
+                    </label>
+                    <label>MAC address
+                        <input type="text" id="em-wol-mac" placeholder="00:11:22:33:44:55">
+                    </label>
+                    <label>Broadcast address <span style="color:var(--text-muted);font-size:0.85em">(optional)</span>
+                        <input type="text" id="em-wol-broadcast" placeholder="255.255.255.255">
+                    </label>
+                    <label>UDP port <span style="color:var(--text-muted);font-size:0.85em">(optional)</span>
+                        <input type="number" id="em-wol-port" placeholder="9">
+                    </label>
+                    <label>Wait time (seconds) <span style="color:var(--text-muted);font-size:0.85em">(optional)</span>
+                        <input type="number" id="em-wol-wait" placeholder="0">
+                    </label>
+                    <div class="field-hint">Seconds to wait after sending the packet before connecting, giving the host time to boot.</div>
+                </div>
+            </div>
             <div id="em-sharing-section" style="margin-top:1em;padding-top:0.8em;border-top:1px solid var(--border)">
                 <label style="text-transform:none;letter-spacing:0;cursor:pointer">
                     <input type="checkbox" id="em-allow-sharing" style="display:inline;width:auto;margin-right:0.5em">
@@ -937,9 +966,10 @@
 
     <!-- Onboarding wizard -->
     <div class="modal-overlay" id="onboarding-modal">
-        <div class="modal" style="max-width:520px;min-width:380px">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.3em">
-                <h3 id="onboard-title" style="margin:0"></h3>
+        <div class="modal" style="max-width:520px;min-width:380px;position:relative">
+            <button id="onboard-close" title="Skip the tour" style="position:absolute;top:0.4em;right:0.5em;background:none;border:none;color:var(--text-dim);font-size:1.7em;line-height:1;cursor:pointer;font-family:monospace;padding:0 0.2em;z-index:1">&times;</button>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.3em;gap:0.6em;padding-right:1.6em">
+                <h3 id="onboard-title" style="margin:0;flex:1"></h3>
                 <span id="onboard-step-indicator" style="color:var(--text-dim);font-size:0.85em"></span>
             </div>
             <div id="onboard-body" style="color:var(--text);font-size:0.92em;line-height:1.65;min-height:80px"></div>
@@ -2808,6 +2838,23 @@
             document.getElementById('em-recording-section').style.display = '';
             // Typescript recording is SSH-only (#159)
             document.getElementById('em-typescript-row').style.display = val === 'ssh' ? '' : 'none';
+            // SSH terminal font size is SSH-only
+            document.getElementById('em-ssh-font-size').parentElement.style.display = val === 'ssh' ? '' : 'none';
+            // Wake-on-LAN applies to SSH/RDP/VNC (guacd passes the magic packet)
+            document.getElementById('em-wol-section').style.display = (val === 'ssh' || val === 'rdp' || val === 'vnc') ? '' : 'none';
+        });
+
+        // Toggle Wake-on-LAN fields visibility
+        document.getElementById('em-wol-toggle').addEventListener('click', function() {
+            var fields = document.getElementById('em-wol-fields');
+            var arrow = document.getElementById('em-wol-arrow');
+            if (fields.style.display === 'none') {
+                fields.style.display = '';
+                arrow.innerHTML = '&#9660;';
+            } else {
+                fields.style.display = 'none';
+                arrow.innerHTML = '&#9654;';
+            }
         });
 
         // Toggle tunnel fields visibility
@@ -3247,6 +3294,14 @@
             document.getElementById('em-proxmox-color-depth').value = '';
             document.getElementById('em-proxmox-monitors').value = '1';
             document.getElementById('em-proxmox-verify-tls').checked = false;
+            document.getElementById('em-ssh-font-size').value = '';
+            document.getElementById('em-wol-enabled').checked = false;
+            document.getElementById('em-wol-mac').value = '';
+            document.getElementById('em-wol-broadcast').value = '';
+            document.getElementById('em-wol-port').value = '';
+            document.getElementById('em-wol-wait').value = '';
+            document.getElementById('em-wol-fields').style.display = 'none';
+            document.getElementById('em-wol-arrow').innerHTML = '&#9654;';
             document.getElementById('em-url').value = '';
             document.getElementById('em-banner').value = '';
             document.getElementById('em-web-username').value = '';
@@ -3356,6 +3411,7 @@
                     document.getElementById('em-hostname').value = entryData.hostname || '';
                     document.getElementById('em-port').value = entryData.port || '22';
                     document.getElementById('em-username').value = entryData.username || '';
+                    document.getElementById('em-ssh-font-size').value = entryData.ssh_font_size || '';
                     document.getElementById('em-ssh-prompt-creds').checked = !!entryData.prompt_credentials;
                 } else if (type === 'rdp') {
                     document.getElementById('em-rdp-hostname').value = entryData.hostname || '';
@@ -3511,6 +3567,18 @@
                 document.getElementById('em-fullscreen-on-connect').checked = !!entryData.fullscreen_on_connect;
                 // Populate autohide-side-tabs flag
                 document.getElementById('em-autohide-side-tabs').checked = !!entryData.autohide_side_tabs;
+                // Populate Wake-on-LAN fields (SSH/RDP/VNC)
+                if (type === 'ssh' || type === 'rdp' || type === 'vnc') {
+                    document.getElementById('em-wol-enabled').checked = !!entryData.wol_send_packet;
+                    document.getElementById('em-wol-mac').value = entryData.wol_mac_addr || '';
+                    document.getElementById('em-wol-broadcast').value = entryData.wol_broadcast_addr || '';
+                    document.getElementById('em-wol-port').value = entryData.wol_udp_port || '';
+                    document.getElementById('em-wol-wait').value = entryData.wol_wait_time || '';
+                    if (entryData.wol_send_packet || entryData.wol_mac_addr) {
+                        document.getElementById('em-wol-fields').style.display = '';
+                        document.getElementById('em-wol-arrow').innerHTML = '&#9660;';
+                    }
+                }
                 // Populate hop list from jump_hosts array
                 if (entryData.jump_hosts && entryData.jump_hosts.length > 0) {
                     hopList = entryData.jump_hosts.map(function(h) {
@@ -3556,6 +3624,8 @@
                 if (pw) entry.password = pw;
                 var pk = document.getElementById('em-private-key').value.trim();
                 if (pk) entry.private_key = pk;
+                var fs = parseInt(document.getElementById('em-ssh-font-size').value);
+                if (fs > 0) entry.ssh_font_size = fs;
                 if (document.getElementById('em-ssh-prompt-creds').checked) entry.prompt_credentials = true;
             } else if (type === 'rdp') {
                 var h = document.getElementById('em-rdp-hostname').value.trim();
@@ -3726,6 +3796,19 @@
             if (document.getElementById('em-fullscreen-on-connect').checked) entry.fullscreen_on_connect = true;
             // Auto-hide the clipboard/files side tabs when idle
             if (document.getElementById('em-autohide-side-tabs').checked) entry.autohide_side_tabs = true;
+
+            // Wake-on-LAN (SSH/RDP/VNC)
+            if (type === 'ssh' || type === 'rdp' || type === 'vnc') {
+                if (document.getElementById('em-wol-enabled').checked) entry.wol_send_packet = true;
+                var wolMac = document.getElementById('em-wol-mac').value.trim();
+                if (wolMac) entry.wol_mac_addr = wolMac;
+                var wolBc = document.getElementById('em-wol-broadcast').value.trim();
+                if (wolBc) entry.wol_broadcast_addr = wolBc;
+                var wolPort = parseInt(document.getElementById('em-wol-port').value);
+                if (wolPort > 0) entry.wol_udp_port = wolPort;
+                var wolWait = parseInt(document.getElementById('em-wol-wait').value);
+                if (wolWait > 0) entry.wol_wait_time = wolWait;
+            }
 
             // Tunnel / jump host settings — multi-hop (all types)
             if (type === 'ssh' || type === 'rdp' || type === 'vnc' || type === 'web') {
@@ -4264,6 +4347,12 @@
                 onboardCurrent--;
                 renderOnboardStep();
             }
+        });
+        document.getElementById('onboard-close').addEventListener('click', function() {
+            // Corner "×" skips the intro entirely and won't show again until
+            // re-triggered via Settings → Welcome Tour.
+            localStorage.setItem('rustguac_onboarding_dismissed', '1');
+            closeOnboarding();
         });
         document.getElementById('onboarding-modal').addEventListener('click', function(e) {
             if (e.target === this) closeOnboarding();

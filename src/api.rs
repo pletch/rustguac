@@ -2747,6 +2747,12 @@ pub async fn ab_connect_entry(
         proxmox_token_secret: ab_entry.proxmox_token_secret,
         proxmox_verify_tls: ab_entry.proxmox_verify_tls,
         max_monitors: ab_entry.max_monitors,
+        ssh_font_size: ab_entry.ssh_font_size,
+        wol_send_packet: ab_entry.wol_send_packet,
+        wol_mac_addr: ab_entry.wol_mac_addr,
+        wol_broadcast_addr: ab_entry.wol_broadcast_addr,
+        wol_udp_port: ab_entry.wol_udp_port,
+        wol_wait_time: ab_entry.wol_wait_time,
     };
 
     let proxies = trusted.map(|Extension(t)| t.0).unwrap_or_default();
@@ -4567,6 +4573,12 @@ pub async fn quick_connect(
             proxmox_token_secret: None,
             proxmox_verify_tls: None,
             max_monitors: None,
+            ssh_font_size: ab_entry.ssh_font_size,
+            wol_send_packet: ab_entry.wol_send_packet,
+            wol_mac_addr: ab_entry.wol_mac_addr,
+            wol_broadcast_addr: ab_entry.wol_broadcast_addr,
+            wol_udp_port: ab_entry.wol_udp_port,
+            wol_wait_time: ab_entry.wol_wait_time,
         };
 
         tracing::info!(
@@ -4686,6 +4698,12 @@ pub async fn quick_connect(
         proxmox_token_secret: None,
         proxmox_verify_tls: None,
         max_monitors: None,
+        ssh_font_size: None,
+        wol_send_packet: None,
+        wol_mac_addr: None,
+        wol_broadcast_addr: None,
+        wol_udp_port: None,
+        wol_wait_time: None,
     };
 
     match manager.create_session(create_req, admin_name).await {
