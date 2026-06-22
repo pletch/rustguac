@@ -214,7 +214,21 @@ pub async fn callback(
     // Verify the state cookie matches the state query parameter (binds flow to browser)
     let state_cookie = extract_cookie_from_headers(&headers, "rustguac_oidc_state");
     if state_cookie.as_deref() != Some(&state) {
-        tracing::warn!("OIDC callback state cookie mismatch");
+        // Distinguish "cookie absent" from "cookie present but different" and
+        // surface request context — this is the usual point of failure when the
+        // browser doesn't send the state cookie back on the callback (e.g. the
+        // proxy→rustguac leg running HTTPS dropping cookies, a SameSite
+        // interaction, or login host != redirect_uri host).
+        let present_cookies = cookie_names(&headers);
+        tracing::warn!(
+            cookie_present = state_cookie.is_some(),
+            cookies_seen = ?present_cookies,
+            host = ?header_str(&headers, "host"),
+            forwarded_host = ?header_str(&headers, "x-forwarded-host"),
+            forwarded_proto = ?header_str(&headers, "x-forwarded-proto"),
+            "OIDC callback state cookie mismatch ({})",
+            if state_cookie.is_some() { "present but different" } else { "absent" }
+        );
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({"error": "OIDC state cookie mismatch"})),
@@ -516,6 +530,30 @@ fn extract_groups_from_jwt(token_str: &str, groups_claim: &str) -> Vec<String> {
         groups.truncate(MAX_OIDC_GROUPS);
     }
     groups
+}
+
+/// Collect the names of cookies present in the request (values omitted, so we
+/// never log secrets). Used for diagnosing missing-cookie failures.
+fn cookie_names(headers: &axum::http::HeaderMap) -> Vec<String> {
+    headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(|cookies| {
+            cookies
+                .split(';')
+                .filter_map(|c| c.trim().split('=').next().map(|n| n.trim().to_string()))
+                .filter(|n| !n.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read a request header as a string for diagnostic logging.
+fn header_str(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 /// Extract a cookie value from request headers.
