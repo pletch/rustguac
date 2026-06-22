@@ -51,9 +51,9 @@ HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services
 Counter-intuitively this is required **for hardware encoding**, not for image
 quality: setting it to 0 on the test host stopped NVENC entirely and fell back
 to software encoding. Windows then sends AVC444, which rustguac handles — both
-views are forwarded to the browser and only the main one is drawn, so chroma
-renders 4:2:0. Auxiliary views were 3.6% of frames in practice, so little is
-lost.
+views are forwarded to the browser and combined there into full 4:4:4 chroma,
+so leaving this on costs nothing in image quality and is what makes hardware
+encoding engage.
 
 ### 3. Raise the frame rate cap
 

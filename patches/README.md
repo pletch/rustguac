@@ -98,7 +98,7 @@ An AVC444 picture is split across two views inside **one** H.264 sequence — Fr
 | 1 | AVC444 auxiliary chroma, v1 layout | no |
 | 2 | AVC444 auxiliary chroma, v2 layout | no |
 
-The client decodes every view and draws only view 0, so chroma renders 4:2:0 rather than 4:4:4. On the test host auxiliary views were 3.6% of frames, so the visible cost is small.
+The client decodes every view and draws view 0, combining the auxiliary view's chroma into it for full 4:4:4 (`static/guac/Yuv444.js`); it falls back to drawing view 0 alone, at 4:2:0 chroma, where WebGL2 is unavailable. On the test host auxiliary views were 3.6% of frames.
 
 **Threading.** The frame queue has its own lock, deliberately **not** the display's `pending_frame.lock`. The render thread holds that one across the whole flush including image encoding, so queueing under it blocked the protocol thread — which for RDP is the thread that sends `RDPGFX_FRAME_ACKNOWLEDGE`, and a server throttles when frames go unacknowledged. The NAL copy happens before locking, and the flush detaches the queue and sends outside it.
 
@@ -275,3 +275,301 @@ the session (for example via `xfconf-query -c xsettings -p
 **Client side.** `static/client.html` sends `desktop_scale` on the connect
 request, and only when it actually asked for a device-pixel framebuffer — see
 `localStorage.rgNativeRes`, which is off by default.
+
+## 012-rdpgfx-frame-ack-backpressure.patch
+
+**Problem:** H.264 passthrough has no adaptive quality, because guacd is not
+the encoder.
+
+Everywhere else it is. `guac_display_suggest_quality()` scales JPEG/WebP
+quality from 90 down to 30 as client processing lag rises from 20ms to 80ms,
+and the render thread waits that lag out before starting the next frame
+(`display-worker.c`, `display-render-thread.c`). Both read the same signal: the
+round trip of the Guacamole `sync` handshake.
+
+In passthrough guacd re-encodes nothing, so there is no quality to lower. The
+RDP server keeps sending at whatever rate it chose, frames pile up on the
+layer's H.264 queue, and at 120 frames `guac_display_layer_set_h264()` drops
+the oldest. A drop breaks the decoder's reference chain, so every later frame
+is discarded until the next IDR — the overload surfaces as a stall seconds
+after the moment that caused it, and costs far more than slowing down would
+have.
+
+**Gated on client processing lag, with the backlog as a backstop.** The signal
+that matters is how far behind the *client* is, and the backlog cannot see it:
+it counts frames still held by guacd, so a frame is invisible there the moment
+it reaches the socket, however long the browser then takes to decode and draw
+it. On a fast link the queue drains to nothing while the client falls steadily
+further behind — and an acknowledgement sent then reports a drained pipeline to
+a server that is in fact outrunning the viewer.
+
+`guac_client_get_processing_lag()` is the round trip of the Guacamole `sync`
+handshake. It ends at the client after the frame has been processed, and
+`user-handlers.c` subtracts an estimate of network round-trip time before
+storing it, so what remains is the client's own inability to keep up: decode
+cost, compositing, an AVC444 chroma combine. None of that is observable by the
+RDP server, and because the network component is already removed, an absolute
+threshold is meaningful on a WAN as well as a LAN.
+
+The render thread already waits this same value out before sending the next
+frame (`display-render-thread.c`, capped at `GUAC_DISPLAY_MAX_LAG_COMPENSATION`
+= 500ms). Gating acknowledgement on it makes the upstream and downstream halves
+of the pipeline agree, instead of leaving guacd to absorb the difference in its
+own queue until the drop cap discards frames.
+
+Note that FreeRDP cannot report a truthful `queueDepth` — it hardcodes
+`QUEUE_DEPTH_UNAVAILABLE` (`rdpgfx_main.c:1149`), with
+`SUSPEND_FRAME_ACKNOWLEDGEMENT` as the only alternative. Depth-based flow
+control would therefore require patching FreeRDP rather than guacd; delaying
+the acknowledgement is the lever available here.
+
+**Mechanism:** the party that *can* slow down is the server, and MS-RDPEGFX
+already provides the lever. A server applies flow control to unacknowledged
+graphics frames, and FreeRDP sends `RDPGFX_FRAME_ACKNOWLEDGE` from
+`rdpgfx_recv_end_frame_pdu()` immediately after `context->EndFrame` returns.
+Wrapping `EndFrame` therefore controls when the acknowledgement goes out.
+
+Patch 004 found this by accident and from the wrong side: queueing frames under
+the display-level `pending_frame.lock` blocked the same thread, and the
+resulting throttle looked like a low source frame rate rather than a stall in
+guacd. This patch does it deliberately and with a bound.
+
+| File | Change |
+|------|--------|
+| `src/libguac/guacamole/display.h` | Declare `guac_display_layer_h264_backlog()` |
+| `src/libguac/display-layer.c` | Implement it — main-view frames under `h264_queue_lock` |
+| `src/protocols/rdp/rdp.h` | Add `orig_end_frame` |
+| `src/protocols/rdp/channels/rdpgfx.c` | Wrap `EndFrame`, hold the ack while clients are behind by lag or backlog |
+
+**Counting is per frame of video, not per queue entry.** An AVC444 picture is
+queued as two access units, a main view and the auxiliary view refining its
+chroma, so a raw queue length counts the same second of video twice and the
+target would mean half as much under AVC444 as under AVC420 — engaging
+backpressure at a depth never intended and throttling a stream that was keeping
+up. `guac_display_layer_h264_backlog()` therefore counts main-view entries
+only, which also keeps the target meaningful if the view count ever changes.
+
+**The lag hold is proportional and computed once, not polled.** Processing lag
+is recalculated only when a sync response arrives, a sync is only sent when the
+render thread has a frame to flush, and against a lockstep server no further
+frame is captured until this acknowledgement goes out. Polling for the lag to
+fall therefore blocks the signal it is waiting for, and every hold runs to the
+cap no matter how the client is doing — measured as a collapse to 2.1fps under
+a 500ms cap, which is just 1000/cap. Holding for the excess (`lag - target`)
+instead closes the loop across frames: further behind means proportionally
+longer, and as the client catches up the hold shrinks and the rate recovers.
+The backlog keeps its poll loop, since the render thread drains it on another
+thread while we wait.
+
+**Tuning.** Acknowledgement is held for the amount by which client processing
+lag exceeds `GUAC_RDP_H264_LAG_TARGET` (default 50ms), and additionally while
+more than `GUAC_RDP_H264_BACKLOG_TARGET` (default 32) frames of video are
+queued. Either gate is disabled by setting it to `0`; with both at `0` the hook
+returns before taking any lock.
+
+`GUAC_RDP_H264_ACK_MAX_DELAY` (default 400ms) bounds a client that has stopped
+draining, not one that is merely behind — the proportional hold already covers
+"behind". Sizing it for the latter was measured as a mistake: at 100ms every
+frame of ordinary heavy content clamped, the hold became constant rather than
+proportional, and the loop could not converge because it was forbidden from
+slowing below 1000/cap. Against a lockstep server the cap is still a frame rate
+floor (2.5fps at 400ms), but it is now only reached under genuine overload.
+
+**Measured behaviour** against xrdp with xorgxrdp in lockstep, once the hold was
+proportional and the cap sized at 400ms — the loop is bimodal and recovers:
+
+| | light content | heavy content |
+|---|---|---|
+| frame rate | 30.0–30.2 fps | 11–12 fps |
+| xorgxrdp send→ack | 18–20ms (max 33) | 74–79ms (max 405) |
+| blocked callbacks /100 | 1–7 | 295–355 |
+| client rtt mean | 1–8ms | 265–324ms |
+
+It clamps under load and releases when the load drops (12 → 6.4 in transition →
+30 sustained → back to 11), which is the distinction between back-pressure and a
+runaway. Under light load `idle` tracks xrdp's own `h264_frame_interval` with
+`blocked` near zero: the server's frame interval is then the binding constraint
+rather than the client, which is the condition that makes a hand-tuned interval
+removable.
+
+This is a backstop, not a rate controller, and that distinction sets the value.
+The target was originally 4, reasoned from 60fps as "a little over 60ms of
+buffered video". Measured against a real xrdp session at ~16fps it was *below*
+the depth a healthy client runs at, and tripped continuously: a hold every 5–6
+frames, 15–145ms each, ~22% of wall-clock spent deliberately stalled. Frames
+arrived in bursts separated by stalls — visibly choppy, while the backlog it
+was reacting to was never dangerous. A target inside the working range makes
+things worse than no throttling at all.
+
+The value must sit above the depth a healthy session reaches and below the
+120-frame drop cap. Both it and `GUAC_RDP_H264_ACK_MAX_DELAY` (default 500ms)
+read an environment variable of the same name at first use, so they can be
+swept from `guacd.env` with a service restart instead of a rebuild. A target of
+`0` disables holding entirely, leaving the drop cap as the only limit — the
+control to compare against when deciding whether backpressure earns its place.
+
+The target is resolved *before* the backlog is queried, so `0` costs nothing.
+Querying takes `h264_queue_lock`, which the render thread needs to drain the
+queue, and doing that once per frame is not free — the same hot-path contention
+patch 004 hit by accident. A disabled backstop must be genuinely disabled. The wait is capped at `GUAC_RDP_H264_ACK_MAX_DELAY` (500ms) and
+abandoned if the client stops running: an unbounded stall is indistinguishable
+to the server from a client that has gone away, so a pathologically slow client
+must cost frame rate rather than the session. The render thread drains the
+queue on its own, so blocking here does not prevent the backlog from clearing.
+
+**Installed like `SurfaceCommand`**, by testing what is currently installed
+rather than a once-only flag: `gdi_graphics_pipeline_init()` reinstalls its own
+`EndFrame` on every RDPGFX reconnect (xrdp's login resize causes one), so a
+once-only guard would silently stop applying backpressure for the rest of the
+session.
+
+**Not a replacement for a sane source frame rate.** Back-pressure reacts to
+lag; it does not search for the rate that minimises cost per frame. A client's
+per-frame cost is not constant — pushed past its comfortable rate it enters a
+region where decode queueing and GPU contention make each frame more expensive,
+so throughput falls while latency climbs. The loop then holds longer, chasing an
+operating point that moved because of its own input rate. It still converges,
+but to a worse point than it started from, because nothing in it knows the lower
+rate was cheaper per frame.
+
+Measured by halving xrdp's `h264_frame_interval` from 33ms to 16ms, on the same
+client and content class, with this patch active throughout:
+
+| | interval 33 | interval 16 |
+|---|---|---|
+| frame rate | 30.0–30.2 fps | 24.7–29.5 fps |
+| blocked callbacks /100 | 1–7 | 130–172 |
+| client rtt mean | 1–8ms | 77–111ms |
+| client rtt max | 11–36ms | 317–543ms |
+
+Fewer frames delivered, for more than an order of magnitude more latency. The
+low round trip under the 33ms cap meant the client was comfortable at 30fps, not
+that it had capacity for 60. So the server's frame interval and this patch do
+different jobs: the interval selects the operating point, back-pressure absorbs
+deviation around it. Removing the interval on the grounds that back-pressure
+makes it redundant makes things worse.
+
+**Scope — this throttles frame rate, not bitrate.** Whether the server also
+lowers its quantiser is a decision its own encoder makes from its own view of
+the link, and that view is of the guacd↔server leg, which is typically a LAN.
+Influencing it means feeding the server an end-to-end figure instead of the
+LAN one it measures. The MS-RDPBCGR network auto-detect PDUs are the obvious
+route, but `rdpAutoDetect` is not hookable the way `EndFrame` is: in the client
+role FreeRDP's responses are sent by static functions called directly from
+`autodetect.c`, and the public callbacks fire on *receive* or in the server
+role, with `ClientBandwidthMeasureResult` arriving only after the PDU is
+serialised. Substituting a figure means patching FreeRDP, not guacd.
+
+## 013-rdp-avc420-only.patch
+
+**Problem:** there is no way to ask for AVC420. `enable-h264` sets `GfxH264` and
+`GfxAVC444` together, so every H.264 connection advertises AVC444 and takes
+whatever the server picks.
+
+That default exists for Windows, and is right for it: FreeRDP emits the RDPGFX
+V10 capability sets only when `GfxAVC444` is set, and Windows offers no H.264
+at all below V10 (verified by advertising AVC420 alone at V8.1 and receiving
+only CLEARCODEC and CAPROGRESSIVE). But it is not right everywhere. AVC444
+encodes each picture as two views, so the client pays a second decode per
+frame, plus a per-frame WebGL2 combine if it recovers the 4:4:4 chroma rather
+than discarding it — measured at ~290ms of client-side round trip on a 4 MP
+display, which no amount of server-side pacing can shorten.
+
+Against a client rendering at 2x scale that buys little. A 4:2:0 chroma block
+covers a single logical pixel at that density, so most of what 4:4:4 offers has
+already been paid for in pixels. Native Resolution and AVC444 largely purchase
+the same thing, and running both purchases it twice.
+
+**Mechanism: an `avc444` connection parameter, defaulting to automatic.**
+The right answer differs per target rather than per guacd — a Windows entry
+wants AVC444 forced on whatever its scale, while an xrdp entry beside it does
+not — so the decision is carried per connection: `1` always advertises, `0`
+never, and absent defers to the desktop scale. rustguac exposes it per entry as
+Automatic / Always / Never.
+
+`GUAC_RDP_DISABLE_AVC444` still sets the deployment-wide default for
+connections that do not specify (`1` never, `0` always), and is overridden by
+any connection that does.
+
+**The automatic rule is keyed on whether the session is HiDPI.** rustguac sets
+`desktop-scale` to 140 or 180 only when Native Resolution is enabled *and* the
+browser reported a HiDPI device pixel ratio (`src/api.rs`), so a non-zero scale
+is already a per-connection signal that the client is rendering in physical
+pixels. AVC444 is advertised at 100% or unset, and not above it — the density
+has bought most of the chroma already, and the decoder being asked to do twice
+the work is the same one drawing four times the pixels.
+
+`GUAC_RDP_DISABLE_AVC444` overrides in both directions: `1` never advertises
+AVC444, `0` always does. Forcing it on is what a Windows host needs, since it
+offers no H.264 below RDPGFX V10 and only `GfxAVC444` causes those sets to be
+emitted.
+
+Whichever way the decision goes, what happens next is the server's choice, and
+the two differ:
+
+- **xrdp** selects H.264 from the V8.1 set via `AVC420_ENABLED`, then
+  `xrdp_mm_egfx_caps_avc444()` has no case for V8.1 and returns 0 — so that
+  connection gets AVC420 while other clients on the same session still
+  negotiate AVC444 for themselves. Per-connection, no `sesman.ini` change.
+- **Windows** offers nothing below V10, so H.264 is lost entirely and the
+  session falls back to the tile path.
+
+Hence the automatic rule covers the case where the trade is clearly worth it —
+a HiDPI client, which is also the expensive one — and a Windows entry overrides
+it to Always.
+
+| File | Change |
+|------|--------|
+| `src/protocols/rdp/settings.c` | `avc444` argument, and `guac_rdp_avc444_enabled()` guarding `GfxAVC444` on both the FreeRDP 2 and 3 paths |
+| `src/protocols/rdp/settings.h` | `avc444` setting, `GUAC_RDP_AVC444_AUTO`, `GUAC_RDP_AVC444_SCALE_THRESHOLD` |
+
+Precedence is per-connection setting, then `GUAC_RDP_DISABLE_AVC444`, then the
+desktop scale.
+| `src/protocols/rdp/channels/rdpgfx.c` | Correct the caps-confirm warning, which named an unimplemented variable |
+
+**Not done via `AVC_THINCLIENT`.** That flag (0x40) is the protocol's own way
+to ask for AVC420, but it is advisory, FreeRDP attaches it only from capability
+version 10.3 onward, and xrdp ignores it outright —
+`XR_RDPGFX_CAPS_FLAG_AVC_THINCLIENT` is defined in `xrdp/xrdp_egfx.h` and used
+nowhere. Clearing `GfxAVC444` is structural instead: the V10+ sets are never
+advertised, so AVC444 is not a codec the server can select.
+
+The warning corrected here previously suggested `GUAC_RDP_H264_CAPS_FILTER=1`,
+which was never implemented — the string appeared only inside that log message.
+
+---
+
+## 014-rdpgfx-op-trace.patch — RDPGFX surface-operation trace
+
+Diagnostics only; changes no rendering behaviour. Written to catch an
+intermittent fault: parts of a Windows session going black after minutes of
+being idle, restored only by resizing. It is not reproducible on demand, so the
+logging has to be cheap enough to leave enabled and specific enough to identify
+the cause from a single occurrence.
+
+**What it records.** H.264 passthrough deliberately skips the GDI decode
+(`004`), so `gdi->primary_buffer` — the buffer guacd encodes from — holds no
+pixels for any region the server delivered as H.264, however correct that
+region looks in the browser, which painted it from its own decoder. Every
+RDPGFX operation that copies pixels between surfaces, stores them in the cache,
+or restores them from it therefore reads or writes a buffer guacd knows to be
+blank, and can move black over a working picture. Which of them a given host
+uses is otherwise invisible: `004` logs surface *commands* only.
+
+| Operation | Logged |
+|-----------|--------|
+| `ResetGraphics`, `CreateSurface`, `DeleteSurface` | Always (rare, and a reset is what a desktop switch — lock screen, UAC — looks like on the wire) |
+| `SolidFill`, `SurfaceToSurface`, `CacheToSurface` | First of the session, then per-operation while passthrough is active — capped at 10 lines per 10s so the detail survives being left on |
+| `SurfaceToCache` | First of the session |
+| All four counts | Summarised at INFO every 10s, alongside the number of H.264 frames passed through undecoded |
+
+`gdi.c` additionally warns when a desktop resize flushes the full-layer repaint
+added by `005` while passthrough is active — that repaint is encoded from the
+blank buffer, and `RefreshRect` cannot undo it because the RDPGFX surface cache
+ignores `RefreshRect`. See `sol1/rustguac#118`.
+
+| File | Change |
+|------|--------|
+| `src/protocols/rdp/rdp.h` | Per-connection original callbacks and operation counts |
+| `src/protocols/rdp/channels/rdpgfx.c` | Seven logging wrappers, installed with the same identity guard as `004` |
+| `src/protocols/rdp/gdi.c` | Warn when a resize repaint is flushed from a buffer passthrough left blank |
