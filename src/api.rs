@@ -2839,6 +2839,12 @@ pub async fn ab_connect_entry(
         max_monitors: ab_entry.max_monitors,
         owner: None,
         fence_all_targets: false,
+        ssh_font_size: ab_entry.ssh_font_size,
+        wol_send_packet: ab_entry.wol_send_packet,
+        wol_mac_addr: ab_entry.wol_mac_addr,
+        wol_broadcast_addr: ab_entry.wol_broadcast_addr,
+        wol_udp_port: ab_entry.wol_udp_port,
+        wol_wait_time: ab_entry.wol_wait_time,
     };
 
     let proxies = trusted.map(|Extension(t)| t.0).unwrap_or_default();
@@ -4661,6 +4667,12 @@ pub async fn quick_connect(
             max_monitors: None,
             owner: None,
             fence_all_targets: false,
+            ssh_font_size: ab_entry.ssh_font_size,
+            wol_send_packet: ab_entry.wol_send_packet,
+            wol_mac_addr: ab_entry.wol_mac_addr,
+            wol_broadcast_addr: ab_entry.wol_broadcast_addr,
+            wol_udp_port: ab_entry.wol_udp_port,
+            wol_wait_time: ab_entry.wol_wait_time,
         };
 
         tracing::info!(
@@ -4782,6 +4794,12 @@ pub async fn quick_connect(
         max_monitors: None,
         owner: None,
         fence_all_targets: false,
+        ssh_font_size: None,
+        wol_send_packet: None,
+        wol_mac_addr: None,
+        wol_broadcast_addr: None,
+        wol_udp_port: None,
+        wol_wait_time: None,
     };
 
     match manager.create_session(create_req, admin_name).await {
