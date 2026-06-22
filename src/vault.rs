@@ -267,6 +267,29 @@ pub struct AddressBookEntry {
     /// max_monitors - 1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_monitors: Option<u32>,
+    /// SSH terminal font size in points (default: 12). Only applies to SSH
+    /// sessions. Lets operators tune readability independently of display DPI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_font_size: Option<u32>,
+    /// Wake-on-LAN: send a magic packet to wake the target before connecting.
+    /// Passed through to guacd's `wol-send-packet` param (SSH/RDP/VNC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wol_send_packet: Option<bool>,
+    /// Wake-on-LAN: target MAC address (e.g. "00:11:22:33:44:55"). Required
+    /// when `wol_send_packet` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wol_mac_addr: Option<String>,
+    /// Wake-on-LAN: broadcast address to send the magic packet to
+    /// (default guacd value: 255.255.255.255).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wol_broadcast_addr: Option<String>,
+    /// Wake-on-LAN: UDP port for the magic packet (default guacd value: 9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wol_udp_port: Option<u16>,
+    /// Wake-on-LAN: seconds to wait after sending the packet before attempting
+    /// to connect, giving the host time to boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wol_wait_time: Option<u32>,
 }
 
 impl AddressBookEntry {
@@ -447,6 +470,24 @@ pub struct EntryInfo {
     /// Total monitors offered (SPICE/Proxmox multi-monitor); 1 = single.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_monitors: Option<u32>,
+    /// SSH terminal font size in points (SSH only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_font_size: Option<u32>,
+    /// Wake-on-LAN: send a magic packet before connecting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wol_send_packet: Option<bool>,
+    /// Wake-on-LAN: target MAC address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wol_mac_addr: Option<String>,
+    /// Wake-on-LAN: broadcast address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wol_broadcast_addr: Option<String>,
+    /// Wake-on-LAN: UDP port.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wol_udp_port: Option<u16>,
+    /// Wake-on-LAN: wait time (seconds) after sending the packet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wol_wait_time: Option<u32>,
 }
 
 impl From<(&str, &AddressBookEntry)> for EntryInfo {
@@ -529,6 +570,12 @@ impl From<(&str, &AddressBookEntry)> for EntryInfo {
                 .as_ref()
                 .is_some_and(|t| !t.is_empty()),
             max_monitors: e.max_monitors,
+            ssh_font_size: e.ssh_font_size,
+            wol_send_packet: e.wol_send_packet,
+            wol_mac_addr: e.wol_mac_addr.clone(),
+            wol_broadcast_addr: e.wol_broadcast_addr.clone(),
+            wol_udp_port: e.wol_udp_port,
+            wol_wait_time: e.wol_wait_time,
         }
     }
 }
