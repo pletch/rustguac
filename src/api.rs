@@ -757,12 +757,32 @@ pub async fn system_status(
 /// GET /api/auth/status — Returns whether OIDC is enabled. No auth required.
 pub async fn auth_status(
     Extension(oidc_enabled): Extension<OidcEnabled>,
+    Extension(oidc): Extension<OidcHandle>,
     Extension(site_title): Extension<SiteTitle>,
     Extension(theme): Extension<ThemeData>,
     Extension(drive_configured): Extension<DriveConfigured>,
 ) -> impl IntoResponse {
+    // Live provider availability: true once metadata has been discovered and
+    // cached. If OIDC is enabled but not yet ready (provider was down at
+    // startup and nobody has logged in since), kick off a background discovery
+    // so the cache warms and a subsequent poll flips availability — no user
+    // click required for recovery.
+    let oidc_available = match oidc.0 {
+        Some(state) => {
+            let ready = state.is_ready().await;
+            if !ready {
+                tokio::spawn(async move {
+                    let _ = state.client().await;
+                });
+            }
+            ready
+        }
+        None => false,
+    };
+
     let mut resp = json!({
         "oidc_enabled": oidc_enabled.0,
+        "oidc_available": oidc_available,
         "site_title": site_title.0,
         "drive_configured": drive_configured.0,
     });
@@ -797,6 +817,12 @@ pub struct ThemeData {
 /// Marker for whether OIDC is configured.
 #[derive(Clone)]
 pub struct OidcEnabled(pub bool);
+
+/// Handle to the live OIDC state (`None` when OIDC is not configured). Lets the
+/// status endpoint report current provider *availability* (metadata discovered)
+/// distinct from whether OIDC is merely configured.
+#[derive(Clone)]
+pub struct OidcHandle(pub Option<crate::oidc::OidcState>);
 
 /// Marker for whether Vault is configured (has [vault] in config).
 /// Distinct from VaultState which tracks whether it's currently connected.

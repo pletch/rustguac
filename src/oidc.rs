@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 /// The concrete CoreClient type after from_provider_metadata + set_redirect_uri.
 /// from_provider_metadata sets auth/token/userinfo to EndpointSet when present in metadata.
@@ -35,10 +35,18 @@ type OidcClient = CoreClient<
 type PendingFlows =
     Arc<Mutex<std::collections::HashMap<String, (PkceCodeVerifier, Nonce, Instant)>>>;
 
-/// Shared OIDC state initialized once at startup.
+/// Lazily-discovered OIDC client. `None` until provider metadata is fetched
+/// successfully; populated on first use (or by best-effort startup discovery)
+/// and re-attempted on the next use after a discovery failure.
+type LazyClient = Arc<RwLock<Option<OidcClient>>>;
+
+/// Shared OIDC state. The HTTP client and config are fixed at startup; the
+/// provider-derived `client` is discovered lazily so that an unreachable
+/// provider at boot does not permanently disable SSO (it is retried on first
+/// login once the provider becomes available).
 #[derive(Clone)]
 pub struct OidcState {
-    pub client: OidcClient,
+    pub client: LazyClient,
     pub http_client: openidconnect::reqwest::Client,
     pub config: OidcConfig,
     /// Auth session TTL in seconds.
@@ -47,10 +55,80 @@ pub struct OidcState {
     pub pending: PendingFlows,
 }
 
-/// Initialize OIDC client by discovering provider metadata.
+impl OidcState {
+    /// Return a ready OIDC client, discovering provider metadata on first use
+    /// (and re-attempting after a prior failure). The result is cached so
+    /// steady-state logins pay no discovery cost. Concurrent callers during a
+    /// cold start share a single discovery via the write lock.
+    pub async fn client(&self) -> Result<OidcClient, String> {
+        if let Some(client) = self.client.read().await.clone() {
+            return Ok(client);
+        }
+        // Cold (or previously-failed) cache: take the write lock and discover.
+        let mut guard = self.client.write().await;
+        // Another task may have populated the cache while we waited.
+        if let Some(client) = guard.clone() {
+            return Ok(client);
+        }
+        let client = discover_client(&self.config, &self.http_client).await?;
+        *guard = Some(client.clone());
+        tracing::info!("OIDC provider metadata discovered for {}", self.config.issuer_url);
+        Ok(client)
+    }
+
+    /// Whether provider metadata has already been discovered and cached.
+    /// Cheap (read lock, no network) — used by the status endpoint to report
+    /// availability without blocking on a discovery round-trip.
+    pub async fn is_ready(&self) -> bool {
+        self.client.read().await.is_some()
+    }
+}
+
+/// Discover provider metadata and build the OIDC client. Network-dependent —
+/// this is what fails when the provider (e.g. Authelia) is unreachable.
+async fn discover_client(
+    config: &OidcConfig,
+    http_client: &openidconnect::reqwest::Client,
+) -> Result<OidcClient, String> {
+    let issuer_url = IssuerUrl::new(config.issuer_url.clone())
+        .map_err(|e| format!("Invalid issuer URL: {}", e))?;
+
+    let provider_metadata = CoreProviderMetadata::discover_async(issuer_url, http_client)
+        .await
+        .map_err(|e| friendly_discovery_error(&format!("{:?}", e)))?;
+
+    // client_secret is validated at config-load time when [oidc] is
+    // configured (Config::load), so reaching this point with None
+    // means we were called with a partially-constructed config; treat
+    // that as a programming error rather than a user-facing one.
+    let client_secret = config
+        .client_secret
+        .clone()
+        .ok_or_else(|| "OIDC client_secret missing at startup".to_string())?;
+    let client = CoreClient::from_provider_metadata(
+        provider_metadata,
+        ClientId::new(config.client_id.clone()),
+        Some(ClientSecret::new(client_secret)),
+    )
+    .set_auth_type(AuthType::RequestBody)
+    .set_redirect_uri(
+        RedirectUrl::new(config.redirect_uri.clone())
+            .map_err(|e| format!("Invalid redirect URI: {}", e))?,
+    );
+    Ok(client)
+}
+
+/// Initialize OIDC state. Builds the HTTP client (fatal config errors here —
+/// e.g. a bad CA cert — disable SSO), then makes a best-effort attempt to
+/// discover provider metadata. Discovery failure is non-fatal: SSO stays
+/// enabled and discovery is retried on the first login.
 pub async fn init_oidc(config: &OidcConfig, session_ttl_secs: u64) -> Result<OidcState, String> {
     let mut builder = openidconnect::reqwest::ClientBuilder::new()
-        .redirect(openidconnect::reqwest::redirect::Policy::none());
+        .redirect(openidconnect::reqwest::redirect::Policy::none())
+        // Bound discovery/token requests so a hung or unreachable provider can't
+        // stall the lazy-discovery path (login, callback, or background warm).
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10));
 
     if config.tls_skip_verify {
         tracing::warn!(
@@ -73,39 +151,32 @@ pub async fn init_oidc(config: &OidcConfig, session_ttl_secs: u64) -> Result<Oid
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let issuer_url = IssuerUrl::new(config.issuer_url.clone())
-        .map_err(|e| format!("Invalid issuer URL: {}", e))?;
-
-    let provider_metadata = CoreProviderMetadata::discover_async(issuer_url, &http_client)
-        .await
-        .map_err(|e| friendly_discovery_error(&format!("{:?}", e)))?;
-
-    // client_secret is validated at config-load time when [oidc] is
-    // configured (Config::load), so reaching this point with None
-    // means we were called with a partially-constructed config; treat
-    // that as a programming error rather than a user-facing one.
-    let client_secret = config
-        .client_secret
-        .clone()
-        .ok_or_else(|| "OIDC client_secret missing at startup".to_string())?;
-    let client = CoreClient::from_provider_metadata(
-        provider_metadata,
-        ClientId::new(config.client_id.clone()),
-        Some(ClientSecret::new(client_secret)),
-    )
-    .set_auth_type(AuthType::RequestBody)
-    .set_redirect_uri(
-        RedirectUrl::new(config.redirect_uri.clone())
-            .map_err(|e| format!("Invalid redirect URI: {}", e))?,
-    );
-
-    Ok(OidcState {
-        client,
+    let state = OidcState {
+        client: Arc::new(RwLock::new(None)),
         http_client,
         config: config.clone(),
         session_ttl_secs,
         pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
-    })
+    };
+
+    // Best-effort eager discovery so the first login is fast and startup logs
+    // reflect provider reachability. A failure here is non-fatal — SSO remains
+    // enabled and discovery is retried on the next login (e.g. once Authelia
+    // finishes starting).
+    match discover_client(&state.config, &state.http_client).await {
+        Ok(client) => {
+            *state.client.write().await = Some(client);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "OIDC provider not reachable at startup ({}); SSO stays enabled \
+                 and discovery will be retried on the first login",
+                e
+            );
+        }
+    }
+
+    Ok(state)
 }
 
 #[derive(Deserialize)]
@@ -117,8 +188,17 @@ pub struct LoginParams {
 pub async fn login(State(oidc): State<OidcState>, Query(params): Query<LoginParams>) -> Response {
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-    let mut auth_request = oidc
-        .client
+    // Resolve the client lazily — this is the point where a provider that was
+    // unreachable at startup gets re-discovered.
+    let client = match oidc.client().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("OIDC discovery failed on login: {}", e);
+            return Redirect::temporary("/?sso_error=1").into_response();
+        }
+    };
+
+    let mut auth_request = client
         .authorize_url(
             AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
             CsrfToken::new_random,
@@ -249,8 +329,21 @@ pub async fn callback(
         }
     };
 
+    // Resolve the client lazily (same retry path as login).
+    let client = match oidc.client().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("OIDC discovery failed on callback: {}", e);
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"error": "OIDC provider not available"})),
+            )
+                .into_response();
+        }
+    };
+
     // Exchange authorization code for tokens
-    let code_request = match oidc.client.exchange_code(AuthorizationCode::new(code)) {
+    let code_request = match client.exchange_code(AuthorizationCode::new(code)) {
         Ok(req) => req,
         Err(e) => {
             tracing::error!("OIDC token endpoint not configured: {:?}", e);
@@ -291,7 +384,7 @@ pub async fn callback(
         }
     };
 
-    let claims: &CoreIdTokenClaims = match id_token.claims(&oidc.client.id_token_verifier(), &nonce)
+    let claims: &CoreIdTokenClaims = match id_token.claims(&client.id_token_verifier(), &nonce)
     {
         Ok(c) => c,
         Err(e) => {
