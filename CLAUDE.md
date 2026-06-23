@@ -81,6 +81,10 @@ Optional `[oidc]` section enables OpenID Connect authentication. Key settings: `
 
 If login fails on the callback with "OIDC state cookie mismatch", the callback logs whether the state cookie was absent vs. present-but-different, the cookie names received, and the Host/X-Forwarded-Host/X-Forwarded-Proto headers to help diagnose. One known cause: running the reverse-proxy→rustguac leg over HTTPS (rustguac serving TLS with the proxy doing `tls_insecure_skip_verify`) can drop the auth cookies — serve rustguac over plain HTTP behind the proxy instead (the browser→proxy leg stays HTTPS, so the `Secure` cookies still work).
 
+Provider discovery is **lazy with retry** (`OidcState::client()` in `src/oidc.rs`). `init_oidc` builds the HTTP client (fatal config errors like a bad CA cert here disable SSO) and makes a best-effort eager `discover_async`; if the provider is unreachable at startup the failure is logged as a warning but SSO stays enabled (`OidcEnabled` is `true` as long as `[oidc]` is configured). Metadata is then discovered on the first `/auth/login` (or `/auth/callback`) and cached, so SSO recovers on its own once the provider comes up — no rustguac restart needed. Concurrent cold-start logins share one discovery via a write lock; the OIDC HTTP client has connect/overall timeouts so discovery can't hang.
+
+`/api/auth/status` reports `oidc_available` (provider metadata discovered/cached) separately from `oidc_enabled` (configured). When enabled-but-not-ready it spawns a background `OidcState::client()` to warm the cache via `OidcHandle` (the live `Option<OidcState>` shared as an Extension; `OidcState::is_ready()` is the cheap read-lock check). `static/index.html` disables the SSO button with a "temporarily unavailable" notice while `oidc_available` is false and polls `/api/auth/status` every 5s, re-enabling it on recovery — so the login page reflects provider state without a reload. Remember: `index.html` is a branded page served from memory, so this needs a rustguac restart to deploy (see in-memory page caching note).
+
 ### Roles
 
 4-tier role hierarchy: `admin` (4) > `poweruser` (3) > `operator` (2) > `viewer` (1).

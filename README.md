@@ -32,6 +32,7 @@ This fork layers the following on top of upstream **v1.8.0**:
 - **Onboarding modal close button** to skip the welcome tour entirely.
 
 **OIDC**
+- **Lazy provider discovery with retry** — if the OIDC provider (e.g. Authelia) is unreachable at startup, SSO stays enabled instead of being silently disabled until restart; provider metadata is discovered on the first login and cached, so SSO recovers automatically once the provider comes up. The login page reflects live availability: while the provider is unreachable the SSO button is disabled with a "temporarily unavailable" notice and the page polls until it recovers (re-enabling the button without a reload).
 - **Callback diagnostics** — on a state-cookie mismatch, logs whether the cookie was absent vs. present-but-different plus `Host`/`X-Forwarded-*` headers, to diagnose reverse-proxy cookie issues.
 
 ## Architecture
