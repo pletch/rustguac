@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/sol1/rustguac)](LICENSE)
 [![Docker](https://img.shields.io/docker/pulls/sol1/rustguac)](https://hub.docker.com/r/sol1/rustguac)
 
-> **Fork notice** — This is a personal fork of [sol1/rustguac](https://github.com/sol1/rustguac) maintained by [@pletch](https://github.com/pletch), with additional fixes and features layered on top of upstream **v1.8.0** (see [Fork changes](#fork-changes)). Badges and install instructions below still point at the upstream project; for canonical releases and commercial support, use the upstream repository.
+> **Fork notice** — This is a personal fork of [sol1/rustguac](https://github.com/sol1/rustguac) maintained by [@pletch](https://github.com/pletch), with additional fixes and features layered on top of upstream **v1.9.7** (see [Fork changes](#fork-changes)). Badges and install instructions below still point at the upstream project; for canonical releases and commercial support, use the upstream repository.
 
 A lightweight Rust replacement for the Apache Guacamole Java webapp. Browser-based SSH, RDP, VNC, SPICE, Proxmox VE consoles, web browsing, and VDI desktop containers through [guacd](https://github.com/apache/guacamole-server).
 
@@ -13,27 +13,31 @@ No Java. No Tomcat. Single binary + guacd.
 
 ## Fork changes
 
-This fork layers the following on top of upstream **v1.8.0**:
+This fork layers the following on top of upstream **v1.9.7**:
 
 **RDP / H.264**
-- **AVC420-only H.264 passthrough** — forces AVC420 so Windows hosts no longer encode with AVC444, fixing the corrupted render (colors wrong, screen split into green/magenta blocks) while keeping hardware WebCodecs decode. RemoteFX/RFX was unaffected.
 - **Lower passthrough decode latency** — WebCodecs decode pipeline tuning plus per-frame instrumentation (`client._h264Decoder.stats()`).
-- **Upstream rendering fixes ported from `fixes-1.6.0`** — terminal OSC-consume and RDP mod-16 dirty-region fixes (guacd patches).
 
 **Connections / sessions**
 - **Per-entry Wake-on-LAN** — sends a magic packet via guacd and polls the target before connecting (SSH/RDP/VNC); configurable MAC, broadcast address, UDP port, and wait time.
 - **Configurable SSH terminal font size** with a **HiDPI fix** — SSH text no longer renders oversized on high-DPI displays (SSH DPI pinned to a 96 baseline; the client auto-scales).
 
-**Networking**
-- **TCP_NODELAY** — Nagle's algorithm disabled on rustguac's TCP sockets to cut interactive latency.
-
 **UI / admin**
-- **Local-time timestamps** on the admin page (previously shown in UTC).
 - **Onboarding modal close button** to skip the welcome tour entirely.
 
 **OIDC**
 - **Lazy provider discovery with retry** — if the OIDC provider (e.g. Authelia) is unreachable at startup, SSO stays enabled instead of being silently disabled until restart; provider metadata is discovered on the first login and cached, so SSO recovers automatically once the provider comes up. The login page reflects live availability: while the provider is unreachable the SSO button is disabled with a "temporarily unavailable" notice and the page polls until it recovers (re-enabling the button without a reload).
 - **Callback diagnostics** — on a state-cookie mismatch, logs whether the cookie was absent vs. present-but-different plus `Host`/`X-Forwarded-*` headers, to diagnose reverse-proxy cookie issues.
+
+### Merged upstream
+
+These started here and now ship in upstream rustguac, so they are no longer fork-specific:
+
+- **AVC420-only H.264 passthrough** — fixes AVC444 colour corruption on Windows hosts (upstream as of v1.8.1).
+- **Per-entry RDP desktop appearance** — configurable wallpaper, theming, and full-window drag (upstream as of v1.8.1).
+- **TCP_NODELAY** — Nagle's algorithm disabled on rustguac's TCP sockets.
+- **Local-time timestamps** on the admin page.
+- **Rendering fixes ported from `fixes-1.6.0`** — terminal OSC-consume and RDP mod-16 dirty-region guacd patches.
 
 ## Architecture
 
