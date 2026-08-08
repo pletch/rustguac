@@ -95,6 +95,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcairo2 libjpeg62-turbo libpng16-16t64 libwebp7 \
     libssh2-1 libssl3t64 libvncclient1 \
     libpango-1.0-0 libpulse0 \
+    libspice-client-glib-2.0-8 \
     libavcodec61 libavformat61 libavutil59 libswscale8 \
     libtelnet2 libwebsockets19t64 \
     libfreerdp3-3 libfreerdp-client3-3 libwinpr3-3 \
