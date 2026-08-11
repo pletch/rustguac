@@ -2069,6 +2069,20 @@ impl SessionManager {
         self.config.effective_recording_path()
     }
 
+    /// Recording paths of sessions that are still live. Their `.guac` files may
+    /// be open for writing by the recording tee, so rotation must never delete
+    /// them (unlinking an open recording loses the in-progress capture and
+    /// frees no disk space). Names follow the tee's `<recording_dir>/<id>.guac`
+    /// convention (see `websocket.rs`).
+    pub async fn active_recording_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        let dir = self.recording_path();
+        let sessions = self.sessions.read().await;
+        sessions
+            .keys()
+            .map(|id| dir.join(format!("{}.guac", id)))
+            .collect()
+    }
+
     /// Path to the thumbnails directory (under recording_path).
     pub fn thumbnails_dir(&self) -> std::path::PathBuf {
         self.config.effective_recording_path().join("thumbnails")

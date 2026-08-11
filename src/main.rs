@@ -917,6 +917,7 @@ async fn run_server(config: Config, database: Db) {
                 rec_config.max_recordings,
                 interval_secs
             );
+            let rot_manager = manager.clone();
             tokio::spawn(async move {
                 let mut interval =
                     tokio::time::interval(std::time::Duration::from_secs(interval_secs));
@@ -924,7 +925,11 @@ async fn run_server(config: Config, database: Db) {
                 loop {
                     interval.tick().await;
                     let cfg = rec_config.clone();
-                    let _ = tokio::task::spawn_blocking(move || recording::rotate(&cfg)).await;
+                    // Snapshot recordings of still-live sessions so rotation
+                    // never deletes an in-progress (open) recording.
+                    let active = rot_manager.active_recording_paths().await;
+                    let _ =
+                        tokio::task::spawn_blocking(move || recording::rotate(&cfg, &active)).await;
                 }
             });
         }
