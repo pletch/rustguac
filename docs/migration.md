@@ -70,6 +70,7 @@ rustguac --config /opt/rustguac/config.toml \
 | `--folder` | `imported` | Target folder in the connections |
 | `--scope` | `shared` | `shared` (visible to all instances) or `instance` (this instance only) |
 | `--dry-run` | off | Preview without writing to Vault |
+| `--map` | (none) | Rewrite a substring in the credential fields, repeatable; format `FROM=TO`. See [Mapping credential tokens](#mapping-credential-tokens). |
 
 ## What gets imported
 
@@ -110,6 +111,40 @@ Guacamole's connection group hierarchy is flattened into entry name prefixes. Fo
 - Duplicate names get a `-2`, `-3` suffix
 - Names are truncated to 64 characters
 - The original connection name is preserved in the `display_name` field
+
+## Mapping credential tokens
+
+Apache Guacamole uses passthrough tokens like `${GUAC_USERNAME}` and `${GUAC_PASSWORD}` in connection parameters, substituted from the logged-in user's Guacamole credentials (typically via LDAP). rustguac has no such tokens; it uses named [credential variables](credential-variables.md) instead. Imported verbatim, a `${GUAC_USERNAME}` value is just a literal string that rustguac cannot resolve.
+
+The `--map FROM=TO` flag rewrites substrings in the credential fields (`username`, `password`, `domain`, `private_key`) as they are imported, so you can convert Guacamole's tokens into rustguac credential variables in one pass. The flag is repeatable and the replacements are applied in order.
+
+For example, to route every imported connection through a `jumpcloud` credential domain:
+
+```bash
+rustguac --config /opt/rustguac/config.toml \
+  import-guacamole \
+  --file guacamole-dump.sql \
+  --map '${GUAC_USERNAME}=$jumpcloud_username' \
+  --map '${GUAC_PASSWORD}=$jumpcloud_password' \
+  --dry-run
+```
+
+Single-quote each mapping so your shell does not expand `$`. The run echoes the maps, reports how many entries were affected, and (in `--dry-run`) shows each entry's resulting username so you can confirm the rewrite:
+
+```
+Credential field maps:
+  ${GUAC_USERNAME} -> $jumpcloud_username
+  ${GUAC_PASSWORD} -> $jumpcloud_password
+Found 42 connections (3 skipped, 39 to import)
+Applied credential maps to 39 of 39 imported entries.
+...
+  imported/web-server (ssh) → 192.0.2.10:22
+    username: $jumpcloud_username
+```
+
+After importing, each user sets their `jumpcloud` username and password once in **My Credentials** and every imported connection resolves. See [Credential Variables](credential-variables.md) for the naming convention (`$<domain>_<suffix>`) and how users fill them in.
+
+`--map` is a plain substring replacement applied only to those four credential fields (the ones rustguac expands at connect time). Passwords and keys are never printed in the output.
 
 ## After import
 

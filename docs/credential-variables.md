@@ -36,6 +36,10 @@ Both reference the same `corp` domain. A user opens **My Credentials**, fills in
 
 An entry can also mix variables with static values. For example, an RDP entry might have a static hostname and port but use `$ad_username`, `$ad_password`, and `$ad_domain` for credentials.
 
+## Importing from Guacamole
+
+When migrating from Apache Guacamole, the `import-guacamole` command can convert Guacamole's `${GUAC_USERNAME}` / `${GUAC_PASSWORD}` passthrough tokens directly into credential variables with its `--map` flag, so imported connections arrive already wired to My Credentials. See [Mapping credential tokens](migration.md#mapping-credential-tokens).
+
 ## Where variables can be used
 
 Credential variables are expanded at connect time in the following entry fields:

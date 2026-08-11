@@ -151,6 +151,13 @@ enum Command {
         /// Preview without writing to Vault
         #[arg(long)]
         dry_run: bool,
+        /// Rewrite substrings in the credential fields (username, password,
+        /// domain, private_key) during import. Repeatable; format FROM=TO.
+        /// Maps Apache Guacamole passthrough tokens to rustguac credential
+        /// variables, e.g. --map '${GUAC_USERNAME}=$corp_username'
+        /// --map '${GUAC_PASSWORD}=$corp_password'
+        #[arg(long = "map")]
+        map: Vec<String>,
     },
 
     /// Copy an address-book scope subtree between configured Vault backends
@@ -228,9 +235,18 @@ async fn main() {
             scope,
             allowed_groups,
             dry_run,
+            map,
         }) => {
-            import::cmd_import_guacamole(&config, &file, &folder, &scope, &allowed_groups, dry_run)
-                .await;
+            import::cmd_import_guacamole(
+                &config,
+                &file,
+                &folder,
+                &scope,
+                &allowed_groups,
+                dry_run,
+                &map,
+            )
+            .await;
         }
         Some(Command::VaultMigrate {
             scope,

@@ -9,6 +9,28 @@ use std::collections::HashMap;
 use crate::config::Config;
 use crate::vault::{AddressBookEntry, FolderConfig, VaultClient};
 
+/// Parse `--map FROM=TO` pairs into (from, to) tuples. Splits on the first
+/// `=`, so the replacement may itself contain `=`. Rejects entries with no
+/// `=` or an empty FROM.
+fn parse_credential_maps(raw: &[String]) -> Result<Vec<(String, String)>, String> {
+    raw.iter()
+        .map(|m| match m.split_once('=') {
+            Some((from, to)) if !from.is_empty() => Ok((from.to_string(), to.to_string())),
+            _ => Err(format!("--map must be FROM=TO (got \"{}\")", m)),
+        })
+        .collect()
+}
+
+/// Apply the parsed `--map` replacements to a single credential-field value,
+/// in order. With no maps this is the identity.
+fn apply_credential_maps(value: &str, maps: &[(String, String)]) -> String {
+    let mut out = value.to_string();
+    for (from, to) in maps {
+        out = out.replace(from.as_str(), to.as_str());
+    }
+    out
+}
+
 /// Run the import-guacamole subcommand.
 pub async fn cmd_import_guacamole(
     config: &Config,
@@ -17,11 +39,29 @@ pub async fn cmd_import_guacamole(
     scope: &str,
     allowed_groups: &[String],
     dry_run: bool,
+    maps: &[String],
 ) {
     // Validate scope
     if scope != "shared" && scope != "instance" {
         eprintln!("Error: --scope must be \"shared\" or \"instance\"");
         std::process::exit(1);
+    }
+
+    // Parse --map FROM=TO pairs. These rewrite substrings in the credential
+    // fields during import, e.g. mapping Apache Guacamole passthrough tokens
+    // (${GUAC_USERNAME}) to rustguac credential variables ($corp_username).
+    let cred_maps = match parse_credential_maps(maps) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if !cred_maps.is_empty() {
+        println!("Credential field maps:");
+        for (from, to) in &cred_maps {
+            println!("  {} -> {}", from, to);
+        }
     }
 
     // Read SQL file (lossy: replace non-UTF-8 bytes from binary blobs)
@@ -51,6 +91,7 @@ pub async fn cmd_import_guacamole(
     // subfolder_path is relative to the target root folder; empty string means "at root".
     let mut entries: Vec<((String, String), AddressBookEntry)> = Vec::new();
     let mut skipped = 0;
+    let mut mapped = 0;
 
     for conn in &connections {
         let protocol = conn.protocol.to_lowercase();
@@ -73,11 +114,19 @@ pub async fn cmd_import_guacamole(
             session_type: protocol,
             hostname: param_map.get("hostname").map(|s| s.to_string()),
             port: param_map.get("port").and_then(|s| s.parse().ok()),
-            username: param_map.get("username").map(|s| s.to_string()),
-            password: param_map.get("password").map(|s| s.to_string()),
-            private_key: param_map.get("private-key").map(|s| s.to_string()),
+            username: param_map
+                .get("username")
+                .map(|s| apply_credential_maps(s, &cred_maps)),
+            password: param_map
+                .get("password")
+                .map(|s| apply_credential_maps(s, &cred_maps)),
+            private_key: param_map
+                .get("private-key")
+                .map(|s| apply_credential_maps(s, &cred_maps)),
             url: None,
-            domain: param_map.get("domain").map(|s| s.to_string()),
+            domain: param_map
+                .get("domain")
+                .map(|s| apply_credential_maps(s, &cred_maps)),
             security: param_map.get("security").map(|s| s.to_string()),
             ignore_cert: param_map
                 .get("ignore-cert")
@@ -140,6 +189,18 @@ pub async fn cmd_import_guacamole(
             max_monitors: None,
         };
 
+        if !cred_maps.is_empty()
+            && ["username", "password", "private-key", "domain"]
+                .iter()
+                .any(|k| {
+                    param_map.get(k).is_some_and(|v| {
+                        cred_maps.iter().any(|(from, _)| v.contains(from.as_str()))
+                    })
+                })
+        {
+            mapped += 1;
+        }
+
         // Place the entry into a subfolder matching its parent group path.
         // Connections with no parent group land at the root of the target folder.
         let subfolder = conn
@@ -160,6 +221,13 @@ pub async fn cmd_import_guacamole(
         skipped,
         entries.len()
     );
+    if !cred_maps.is_empty() {
+        println!(
+            "Applied credential maps to {} of {} imported entries.",
+            mapped,
+            entries.len()
+        );
+    }
 
     if dry_run {
         println!(
@@ -185,6 +253,13 @@ pub async fn cmd_import_guacamole(
             if let Some(ref dn) = entry.display_name {
                 if dn != name {
                     println!("    display_name: {}", dn);
+                }
+            }
+            // Show the username when it resolves to a credential variable, so a
+            // --map run can be verified. Passwords/keys are never printed.
+            if let Some(u) = &entry.username {
+                if u.starts_with('$') {
+                    println!("    username: {}", u);
                 }
             }
         }
@@ -722,6 +797,47 @@ fn deduplicate_names(entries: &mut [((String, String), AddressBookEntry)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_maps_parse_and_apply() {
+        let maps = parse_credential_maps(&[
+            "${GUAC_USERNAME}=$corp_username".to_string(),
+            "${GUAC_PASSWORD}=$corp_password".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(
+            apply_credential_maps("${GUAC_USERNAME}", &maps),
+            "$corp_username"
+        );
+        assert_eq!(
+            apply_credential_maps("${GUAC_PASSWORD}", &maps),
+            "$corp_password"
+        );
+        // Non-matching values pass through untouched.
+        assert_eq!(apply_credential_maps("admin", &maps), "admin");
+        // A token embedded in a larger value is rewritten in place.
+        assert_eq!(
+            apply_credential_maps("EXAMPLE\\${GUAC_USERNAME}", &maps),
+            "EXAMPLE\\$corp_username"
+        );
+    }
+
+    #[test]
+    fn credential_maps_reject_malformed() {
+        assert!(parse_credential_maps(&["noequalsign".to_string()]).is_err());
+        assert!(parse_credential_maps(&["=missingfrom".to_string()]).is_err());
+    }
+
+    #[test]
+    fn credential_maps_empty_is_identity() {
+        let maps = parse_credential_maps(&[]).unwrap();
+        assert!(maps.is_empty());
+        assert_eq!(
+            apply_credential_maps("${GUAC_USERNAME}", &maps),
+            "${GUAC_USERNAME}"
+        );
+    }
 
     #[test]
     fn test_sanitize_name() {
