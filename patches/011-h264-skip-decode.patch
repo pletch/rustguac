@@ -157,7 +157,7 @@ index e2bab4d0..11175956 100644
  
  typedef struct guac_display_state {
 diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
-index 55cd8cfe..1e2a7597 100644
+index 55cd8cfe..b820956b 100644
 --- a/src/protocols/rdp/channels/rdpgfx.c
 +++ b/src/protocols/rdp/channels/rdpgfx.c
 @@ -55,6 +55,25 @@ static int guac_rdp_h264_is_keyframe(const BYTE* data, UINT32 length) {
@@ -224,16 +224,23 @@ index 55cd8cfe..1e2a7597 100644
  
      /* Store saved H.264 data on the display layer for passthrough.
       * guac_display_layer_set_h264 acquires pending_frame.lock internally,
-@@ -129,6 +164,13 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+@@ -129,6 +164,20 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
          guac_display_layer_set_h264(default_layer,
                  saved_h264, saved_length, saved_keyframe,
                  cmd->left, cmd->top, cmd->width, cmd->height);
 +
-+        /* With the decode skipped, nothing marks the display as modified, so
-+         * the render thread would never wake and the queued frames would sit
-+         * unsent until some unrelated update arrived. Notify it explicitly. */
-+        if (skip_decode && rdp_client->render_thread != NULL)
-+            guac_display_render_thread_notify_modified(rdp_client->render_thread);
++        /* With the decode skipped, guac_rdp_gdi_end_paint() never runs, so
++         * nothing marks the display as modified and the queued frames would
++         * sit unsent until some unrelated update arrived. Raise exactly the
++         * flag end_paint would have raised, rather than notifying the render
++         * thread directly: the main RDP event loop batches gdi_modified into a
++         * single guac_display_render_thread_notify_modified() per message
++         * batch. Notifying per surface command instead keeps FRAME_MODIFIED
++         * permanently set at high frame rates, which prevents the render
++         * thread's frame-accumulation loop from ever settling and delays every
++         * flush until GUAC_DISPLAY_RENDER_THREAD_MAX_FRAME_DURATION (100ms). */
++        if (skip_decode)
++            rdp_client->gdi_modified = 1;
 +
          guac_client_log(client, GUAC_LOG_TRACE,
                  "H.264 passthrough: %u bytes, %s, %ux%u at %u,%u",
