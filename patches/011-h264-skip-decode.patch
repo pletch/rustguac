@@ -1,5 +1,5 @@
 diff --git a/src/libguac/display-flush.c b/src/libguac/display-flush.c
-index aef8208d..6b49a136 100644
+index aef8208d..9d2aa539 100644
 --- a/src/libguac/display-flush.c
 +++ b/src/libguac/display-flush.c
 @@ -391,6 +391,14 @@ void guac_display_end_multiple_frames(guac_display* display, int frames) {
@@ -12,21 +12,30 @@ index aef8208d..6b49a136 100644
 +     * frames still need to be sent. The worker threads are still idle at this
 +     * point (guac_display_plan_apply() below is what wakes them), so writing to
 +     * the client socket here does not contend with them. */
-+    PFW_guac_display_flush_h264(display);
++    int h264_sent = PFW_guac_display_flush_h264(display);
 +
      /* Awaken worker threads to perform the rest of the tasks required for the
       * frame (if any such tasks remain) */
      if (plan != NULL) {
+@@ -404,7 +412,7 @@ void guac_display_end_multiple_frames(guac_display* display, int frames) {
+      * then we must still send at least one operation to awaken the workers,
+      * flush any layer changes, and mark the end of the frame with a "sync",
+      * even though there is no display plan to optimize.  */
+-    if (frame_nonempty) {
++    if (frame_nonempty || h264_sent) {
+         guac_display_plan_operation end_frame_op = {
+             .type = GUAC_DISPLAY_PLAN_OPERATION_NOP
+         };
 diff --git a/src/libguac/display-plan.c b/src/libguac/display-plan.c
-index e703a1b6..efa9efd2 100644
+index e703a1b6..7eac1710 100644
 --- a/src/libguac/display-plan.c
 +++ b/src/libguac/display-plan.c
-@@ -487,50 +487,41 @@ static int guac_display_plan_flush_h264(guac_client* client,
+@@ -487,49 +487,45 @@ static int guac_display_plan_flush_h264(guac_client* client,
  
  }
  
 -void guac_display_plan_apply(guac_display_plan* plan) {
-+void PFW_guac_display_flush_h264(guac_display* display) {
++int PFW_guac_display_flush_h264(guac_display* display) {
  
 -    guac_display* display = plan->display;
      guac_client* client = display->client;
@@ -35,6 +44,7 @@ index e703a1b6..efa9efd2 100644
 -    /* Do not allow worker threads to move forward with image encoding until
 -     * AFTER the non-image instructions have finished being written */
 -    guac_fifo_lock(&display->ops);
++    int sent_any = 0;
  
 -    /* Send any pending H.264 passthrough data before dispatching operations
 -     * to worker threads. This runs while the ops FIFO is locked, so worker
@@ -68,18 +78,21 @@ index e703a1b6..efa9efd2 100644
 -                already_sent = 1;
 -                break;
 -            }
--        }
--
++        if (guac_display_plan_flush_h264(client, client->socket, layer) > 0) {
++            layer->h264_active = 1;
++            sent_any = 1;
+         }
+ 
 -        if (already_sent)
 -            continue;
--
++    }
+ 
 -        /* Flush all queued H.264 frames for this layer */
-         if (guac_display_plan_flush_h264(client, client->socket, layer) > 0)
+-        if (guac_display_plan_flush_h264(client, client->socket, layer) > 0)
 -            h264_layers[h264_layer_count++] = layer;
-+            layer->h264_active = 1;
++    return sent_any;
  
-     }
- 
+-    }
 +}
 +
 +void guac_display_plan_apply(guac_display_plan* plan) {
@@ -91,11 +104,10 @@ index e703a1b6..efa9efd2 100644
 +    /* Do not allow worker threads to move forward with image encoding until
 +     * AFTER the non-image instructions have finished being written */
 +    guac_fifo_lock(&display->ops);
-+
+ 
      /* Immediately send instructions for all updates that do not involve
       * significant processing (do not involve encoding anything). This allows
-      * us to use the worker threads solely for encoding, reducing contention
-@@ -539,17 +530,10 @@ void guac_display_plan_apply(guac_display_plan* plan) {
+@@ -539,17 +535,10 @@ void guac_display_plan_apply(guac_display_plan* plan) {
  
          guac_display_layer* display_layer = op->layer;
  
@@ -118,10 +130,10 @@ index e703a1b6..efa9efd2 100644
              continue;
          }
 diff --git a/src/libguac/display-priv.h b/src/libguac/display-priv.h
-index e2bab4d0..11175956 100644
+index e2bab4d0..c3c78f9a 100644
 --- a/src/libguac/display-priv.h
 +++ b/src/libguac/display-priv.h
-@@ -330,6 +330,20 @@ struct guac_h264_frame {
+@@ -330,6 +330,26 @@ struct guac_h264_frame {
      struct guac_h264_frame* next;
  };
  
@@ -136,13 +148,19 @@ index e2bab4d0..11175956 100644
 + *
 + * @param display
 + *     The display whose layers should be flushed.
++ *
++ * @return
++ *     Non-zero if H.264 frames were sent for at least one layer, zero
++ *     otherwise. A caller must treat a non-zero return as making the frame
++ *     non-empty, so that a frame boundary ("sync") is still sent for frames
++ *     whose only content was H.264.
 + */
-+void PFW_guac_display_flush_h264(guac_display* display);
++int PFW_guac_display_flush_h264(guac_display* display);
 +
  /**
   * Approximation of how often a region of a layer is modified, as well as what
   * changes have been made to that region since the last frame. This information
-@@ -664,6 +678,13 @@ struct guac_display_layer {
+@@ -664,6 +684,13 @@ struct guac_display_layer {
       */
      int h264_keyframe_sent;
  
