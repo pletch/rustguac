@@ -163,6 +163,39 @@ Vendored as the diff of the PR branch against its merge-base with our pinned gua
 
 **Files patched:** `src/protocols/rdp/settings.{c,h}`, `src/protocols/rdp/channels/disp.{c,h}`, `src/protocols/rdp/input.c`, `src/protocols/rdp/user.c`.
 
+## 011-h264-skip-decode.patch
+
+**Status: experimental / unmeasured in production.** Requires `004`.
+
+**Problem:** `004` skips the JPEG/PNG/WebP re-encode but still runs the full software H.264 decode — `guac_rdp_gfx_surface_command()` always calls the original GDI handler, which reaches `avc420_decompress()`. Those pixels are then discarded, because `guac_display_plan_apply()` suppresses every IMG operation for the layer. Profiling a 1080p xrdp session (guacd session child, `top -H`, cumulative CPU) found:
+
+| Thread | Share | Work |
+|---|---|---|
+| `display-render` | ~50% | dirty-region diffing + plan building on discarded pixels |
+| `rdp-worker` ×3 | ~50% | FreeRDP client thread + libavcodec decode threads |
+| `display-wrk` ×2 | ~0.2% | image encoding (correctly eliminated by `004`) |
+
+The decode is software: Debian's libfreerdp3 is built `WITH_VAAPI=OFF` (VAAPI decode is off by default upstream; the nearby `ON` default is `WITH_VAAPI_H264_ENCODING`, encoder-only and unused by guacd as a client).
+
+**Why the decode could not simply be removed:** it is load-bearing. `004` drives the flush by walking `plan->ops`, and `display-flush.c` only calls `guac_display_plan_apply()` when the plan is non-NULL — and `guac_display_plan_create()` returns NULL when nothing is dirty. So decode → dirty pixels → plan ops → flush. Dropping the decode alone stalls the H.264 stream entirely.
+
+**Architecture:** The flush moves out of `guac_display_plan_apply()` into `guac_display_end_multiple_frames()`, where it runs regardless of whether a plan was produced. It is placed *before* `plan_apply()` so it still writes to the socket while the worker threads are provably idle — the `defer_frame` check earlier in the same function has already established that the ops FIFO is empty and `active_workers` is zero, and `plan_apply()` is what enqueues the work that wakes them. This preserves the socket-contention fix that motivated `004`'s placement. Layers are found by walking `display->pending_frame.layers` (the pending frame write lock is already held there) instead of `plan->ops`, and a per-layer `h264_active` flag replaces the `h264_layers[8]` array, also removing its silent 8-layer cap.
+
+**Enabling:** opt-in via `GUAC_RDP_H264_SKIP_DECODE=1` in guacd's environment, so a single build can be A/B tested. Unset, behaviour is identical to `004`. Only H.264 surface commands are skipped; RemoteFX, planar, and progressive commands are always decoded normally.
+
+**Known risk — mixed codecs.** With `order = ["H.264", "RFX"]` in `gfx.toml`, a server may emit RemoteFX surface commands alongside H.264. `plan_apply` skips *all* ops for a layer that had H.264 sent, so RFX regions in such a frame would be dropped. This hazard exists in `004` today and is not introduced here, but skipping the decode makes it more likely to be noticed. Test a session that falls back to RFX before relying on this. A proper fix would skip only ops overlapping the H.264 rect.
+
+**Related client-side bug (not fixed here):** `static/recordings.html` does not load `H264Decoder.js`, so `Client.js`'s `h264` handler throws `TypeError` on `Guacamole.H264Decoder.isSupported()` when replaying a recording of an H.264 session. Recording itself is unaffected — `src/websocket.rs` tees the raw guacd instruction stream, so the `h264` instructions are captured correctly.
+
+**Files patched:**
+
+| File | Change |
+|------|-----|
+| `src/libguac/display-priv.h` | Declare `PFW_guac_display_flush_h264()`; add `h264_active` to `guac_display_layer` |
+| `src/libguac/display-plan.c` | Add `PFW_guac_display_flush_h264()`; remove the `plan->ops` scan; skip ops via `h264_active` |
+| `src/libguac/display-flush.c` | Call the flush before `plan_apply()`, outside the `plan != NULL` guard |
+| `src/protocols/rdp/channels/rdpgfx.c` | Add `guac_rdp_h264_skip_decode()`; conditionally skip the GDI decode; notify the render thread |
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

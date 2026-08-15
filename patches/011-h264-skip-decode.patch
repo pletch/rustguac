@@ -1,0 +1,240 @@
+diff --git a/src/libguac/display-flush.c b/src/libguac/display-flush.c
+index aef8208d..6b49a136 100644
+--- a/src/libguac/display-flush.c
++++ b/src/libguac/display-flush.c
+@@ -391,6 +391,14 @@ void guac_display_end_multiple_frames(guac_display* display, int frames) {
+     removed_layers = display->pending_frame_removed_layers;
+     display->pending_frame_removed_layers = NULL;
+ 
++    /* Flush any queued H.264 passthrough frames. This MUST happen outside the
++     * "plan != NULL" check below: a session that is passing H.264 through
++     * without decoding has no dirty pixels, so no plan is produced, yet its
++     * frames still need to be sent. The worker threads are still idle at this
++     * point (guac_display_plan_apply() below is what wakes them), so writing to
++     * the client socket here does not contend with them. */
++    PFW_guac_display_flush_h264(display);
++
+     /* Awaken worker threads to perform the rest of the tasks required for the
+      * frame (if any such tasks remain) */
+     if (plan != NULL) {
+diff --git a/src/libguac/display-plan.c b/src/libguac/display-plan.c
+index e703a1b6..efa9efd2 100644
+--- a/src/libguac/display-plan.c
++++ b/src/libguac/display-plan.c
+@@ -487,50 +487,41 @@ static int guac_display_plan_flush_h264(guac_client* client,
+ 
+ }
+ 
+-void guac_display_plan_apply(guac_display_plan* plan) {
++void PFW_guac_display_flush_h264(guac_display* display) {
+ 
+-    guac_display* display = plan->display;
+     guac_client* client = display->client;
+-    guac_display_plan_operation* op = plan->ops;
+-
+-    /* Do not allow worker threads to move forward with image encoding until
+-     * AFTER the non-image instructions have finished being written */
+-    guac_fifo_lock(&display->ops);
+ 
+-    /* Send any pending H.264 passthrough data before dispatching operations
+-     * to worker threads. This runs while the ops FIFO is locked, so worker
+-     * threads have not started yet and there is no socket contention.
+-     *
+-     * We track up to 8 unique layers that had H.264 data sent, so we can
+-     * skip their IMG operations below. In practice there is usually only
+-     * one (the default layer). */
+-    guac_display_layer* h264_layers[8] = { NULL };
+-    int h264_layer_count = 0;
++    /* Walk the layers of the pending frame directly rather than the display
++     * plan. A layer carrying an H.264 stream may have no plan operations at
++     * all (that is the entire point of skipping the decode), and with no dirty
++     * pixels anywhere guac_display_plan_create() returns NULL and
++     * guac_display_plan_apply() is never reached. */
++    for (guac_display_layer* layer = display->pending_frame.layers;
++            layer != NULL; layer = layer->pending_frame.next) {
+ 
+-    for (int i = 0; i < plan->length && h264_layer_count < 8; i++) {
++        /* Clear the previous frame's state before deciding this frame's */
++        layer->h264_active = 0;
+ 
+-        guac_display_layer* layer = plan->ops[i].layer;
+         if (layer->h264_queue == NULL)
+             continue;
+ 
+-        /* Check if we already flushed H.264 for this layer */
+-        int already_sent = 0;
+-        for (int j = 0; j < h264_layer_count; j++) {
+-            if (h264_layers[j] == layer) {
+-                already_sent = 1;
+-                break;
+-            }
+-        }
+-
+-        if (already_sent)
+-            continue;
+-
+-        /* Flush all queued H.264 frames for this layer */
+         if (guac_display_plan_flush_h264(client, client->socket, layer) > 0)
+-            h264_layers[h264_layer_count++] = layer;
++            layer->h264_active = 1;
+ 
+     }
+ 
++}
++
++void guac_display_plan_apply(guac_display_plan* plan) {
++
++    guac_display* display = plan->display;
++    guac_client* client = display->client;
++    guac_display_plan_operation* op = plan->ops;
++
++    /* Do not allow worker threads to move forward with image encoding until
++     * AFTER the non-image instructions have finished being written */
++    guac_fifo_lock(&display->ops);
++
+     /* Immediately send instructions for all updates that do not involve
+      * significant processing (do not involve encoding anything). This allows
+      * us to use the worker threads solely for encoding, reducing contention
+@@ -539,17 +530,10 @@ void guac_display_plan_apply(guac_display_plan* plan) {
+ 
+         guac_display_layer* display_layer = op->layer;
+ 
+-        /* Skip all operations for layers that had H.264 data sent — the
+-         * H.264 stream replaces JPEG/PNG/WebP encoding entirely */
+-        int is_h264_layer = 0;
+-        for (int j = 0; j < h264_layer_count; j++) {
+-            if (h264_layers[j] == display_layer) {
+-                is_h264_layer = 1;
+-                break;
+-            }
+-        }
+-
+-        if (is_h264_layer) {
++        /* Skip all operations for layers whose contents were sent as H.264
++         * this frame — the H.264 stream replaces JPEG/PNG/WebP encoding
++         * entirely */
++        if (display_layer->h264_active) {
+             op++;
+             continue;
+         }
+diff --git a/src/libguac/display-priv.h b/src/libguac/display-priv.h
+index e2bab4d0..11175956 100644
+--- a/src/libguac/display-priv.h
++++ b/src/libguac/display-priv.h
+@@ -330,6 +330,20 @@ struct guac_h264_frame {
+     struct guac_h264_frame* next;
+ };
+ 
++/**
++ * Sends all queued H.264 frames for all layers of the given display, marking
++ * each layer that had frames sent with h264_active so that the display plan
++ * knows to suppress its image operations.
++ *
++ * The pending frame write lock MUST be held when calling this function, and the
++ * worker threads MUST be idle (this function writes directly to the client
++ * socket).
++ *
++ * @param display
++ *     The display whose layers should be flushed.
++ */
++void PFW_guac_display_flush_h264(guac_display* display);
++
+ /**
+  * Approximation of how often a region of a layer is modified, as well as what
+  * changes have been made to that region since the last frame. This information
+@@ -664,6 +678,13 @@ struct guac_display_layer {
+      */
+     int h264_keyframe_sent;
+ 
++    /**
++     * Non-zero if H.264 frames were sent for this layer during the current
++     * frame. Set by PFW_guac_display_flush_h264() and read by
++     * guac_display_plan_apply() to suppress image operations for the layer.
++     */
++    int h264_active;
++
+ };
+ 
+ typedef struct guac_display_state {
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index 55cd8cfe..1e2a7597 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -55,6 +55,25 @@ static int guac_rdp_h264_is_keyframe(const BYTE* data, UINT32 length) {
+     return 0;
+ }
+ 
++/**
++ * Returns non-zero if the software H.264 decode should be skipped for surface
++ * commands that are being passed through to the client. Controlled by the
++ * GUAC_RDP_H264_SKIP_DECODE environment variable so that a single build can be
++ * measured both ways. Evaluated once per process.
++ */
++static int guac_rdp_h264_skip_decode(void) {
++
++    static int cached = -1;
++
++    if (cached == -1) {
++        const char* value = getenv("GUAC_RDP_H264_SKIP_DECODE");
++        cached = (value != NULL && strcmp(value, "1") == 0);
++    }
++
++    return cached;
++
++}
++
+ /**
+  * Wrapper for the FreeRDP GDI SurfaceCommand callback. Intercepts AVC420
+  * and AVC444 commands to store raw H.264 NAL units on the display layer
+@@ -111,14 +130,30 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+         }
+     }
+ 
+-    /* Run normal GDI decode — this calls BeginPaint/EndPaint internally,
+-     * updates the pixel buffer, and marks the dirty region. Must happen
+-     * after we've saved the H.264 data above. */
+     UINT result = CHANNEL_RC_OK;
+-    pcRdpgfxSurfaceCommand orig =
+-            (pcRdpgfxSurfaceCommand) rdp_client->orig_surface_command;
+-    if (orig != NULL)
+-        result = orig(context, cmd);
++
++    /* Skip the software H.264 decode when this command is being passed through
++     * to the client verbatim. The decoded pixels are discarded regardless —
++     * guac_display_plan_apply() suppresses every image operation for a layer
++     * carrying an H.264 stream — so decoding them costs the libavcodec decode
++     * plus the full dirty-region diff in the display render thread, for pixels
++     * nothing will ever read.
++     *
++     * Only H.264 commands are skipped. RemoteFX, planar, and progressive
++     * commands (saved_h264 == NULL) are always decoded normally, so a session
++     * whose server mixes codecs still renders those regions.
++     *
++     * Otherwise, run the normal GDI decode — this calls BeginPaint/EndPaint
++     * internally, updates the pixel buffer, and marks the dirty region. Must
++     * happen after we've saved the H.264 data above. */
++    int skip_decode = (saved_h264 != NULL) && guac_rdp_h264_skip_decode();
++
++    if (!skip_decode) {
++        pcRdpgfxSurfaceCommand orig =
++                (pcRdpgfxSurfaceCommand) rdp_client->orig_surface_command;
++        if (orig != NULL)
++            result = orig(context, cmd);
++    }
+ 
+     /* Store saved H.264 data on the display layer for passthrough.
+      * guac_display_layer_set_h264 acquires pending_frame.lock internally,
+@@ -129,6 +164,13 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+         guac_display_layer_set_h264(default_layer,
+                 saved_h264, saved_length, saved_keyframe,
+                 cmd->left, cmd->top, cmd->width, cmd->height);
++
++        /* With the decode skipped, nothing marks the display as modified, so
++         * the render thread would never wake and the queued frames would sit
++         * unsent until some unrelated update arrived. Notify it explicitly. */
++        if (skip_decode && rdp_client->render_thread != NULL)
++            guac_display_render_thread_notify_modified(rdp_client->render_thread);
++
+         guac_client_log(client, GUAC_LOG_TRACE,
+                 "H.264 passthrough: %u bytes, %s, %ux%u at %u,%u",
+                 saved_length,
