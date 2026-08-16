@@ -130,7 +130,7 @@ index d3bf7839..0ac4676a 100644
  /**
   * Returns a layer representing the current mouse cursor icon. Changes to the
 diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
-index 7cf201e7..a987fc37 100644
+index 7cf201e7..3d749dbc 100644
 --- a/src/protocols/rdp/channels/rdpgfx.c
 +++ b/src/protocols/rdp/channels/rdpgfx.c
 @@ -211,51 +211,51 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
@@ -322,7 +322,7 @@ index 7cf201e7..a987fc37 100644
  
          /* With the decode skipped, guac_rdp_gdi_end_paint() never runs, so
           * nothing marks the display as modified and the queued frames would
-@@ -371,22 +408,29 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+@@ -371,25 +408,33 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
          if (skip_decode)
              rdp_client->gdi_modified = 1;
  
@@ -351,18 +351,23 @@ index 7cf201e7..a987fc37 100644
 +                    cmd->width, cmd->height, cmd->left, cmd->top,
 +                    saved_num_rects[i]);
 +
++            /* guac_display_layer_set_h264() copies both the NAL data and the
++             * region rects, so this view's copies are ours to release. */
 +            free(saved_h264[i]);
++            free(saved_rects[i]);
 +
 +        }
 +
-+    }
-+
-+    /* Any view that was captured but not queued must still be released */
+     }
+ 
+-    free(saved_rects);
++    /* Any view that was captured but never queued must still be released */
 +    else {
 +        for (int i = 0; i < 2; i++) {
 +            free(saved_h264[i]);
 +            free(saved_rects[i]);
 +        }
-     }
++    }
  
-     free(saved_rects);
+     return result;
+ }
