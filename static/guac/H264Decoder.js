@@ -483,6 +483,10 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var interval = (seconds || 5) * 1000;
         var startDecoded = self.framesDecoded;
         var startDropped = self.framesDropped;
+        // lastOutputTime must be reset too, or the first gap recorded is
+        // measured from the last frame BEFORE sampling began -- which for an
+        // idle session is arbitrarily large and skews mean, stdDev and max.
+        lastOutputTime = 0;
         gapCount = 0; gapSum = 0; gapSquares = 0;
         gapMin = Infinity; gapMax = 0; gapsOver100 = 0;
 
