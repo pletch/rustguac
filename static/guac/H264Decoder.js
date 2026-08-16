@@ -112,6 +112,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *
      * @type {number}
      */
+    /* Expose the most recently constructed decoder for console diagnostics.
+     * client.html holds its Guacamole.Client in function scope, so
+     * client._h264Decoder is not reachable from the console. */
+    if (typeof window !== 'undefined')
+        window.__h264 = this;
+
     this.framesDecoded = 0;
 
     /**
@@ -402,6 +408,41 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *
      * @returns {Object} Decoder statistics.
      */
+    /**
+     * Measures the rate at which frames are actually being decoded and drawn,
+     * sampled over the given interval. This is the number to compare against
+     * guacd's flush rate: if guacd reports ~30 flushes/sec and this reports
+     * ~30, the client is keeping up and any choppiness is in compositing or in
+     * the source itself; if this is markedly lower, frames are being lost here.
+     *
+     * Usage: __h264.rate(5).then(console.log)
+     *
+     * @param {number} [seconds=5] - Sampling interval.
+     * @returns {Promise<Object>} Resolves to the measured rates.
+     */
+    this.rate = function(seconds) {
+
+        var interval = (seconds || 5) * 1000;
+        var startDecoded = self.framesDecoded;
+        var startDropped = self.framesDropped;
+
+        return new Promise(function(resolve) {
+            setTimeout(function() {
+                var secs = interval / 1000;
+                resolve({
+                    decodedPerSec : +((self.framesDecoded - startDecoded) / secs).toFixed(1),
+                    droppedPerSec : +((self.framesDropped - startDropped) / secs).toFixed(1),
+                    queueDepth    : decoder ? decoder.decodeQueueSize : 0,
+                    peakQueueDepth: self.peakQueueDepth,
+                    avgLatencyMs  : decodeLatencyCount
+                        ? +(decodeLatencySum / decodeLatencyCount).toFixed(1) : 0,
+                    peakLatencyMs : +self.peakDecodeLatency.toFixed(1)
+                });
+            }, interval);
+        });
+
+    };
+
     this.stats = function() {
         var s = {
             framesDecoded: self.framesDecoded,
