@@ -115,8 +115,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     /* Expose the most recently constructed decoder for console diagnostics.
      * client.html holds its Guacamole.Client in function scope, so
      * client._h264Decoder is not reachable from the console. */
-    if (typeof window !== 'undefined')
+    if (typeof window !== 'undefined') {
         window.__h264 = this;
+        window.__h264Instances = (window.__h264Instances || 0) + 1;
+        this.instanceNumber = window.__h264Instances;
+        if (window.__h264Instances > 1) {
+            console.warn('[rustguac] H.264 decoder instance #'
+                + window.__h264Instances + ' created. Earlier instances still '
+                + 'hold a VideoDecoder; frames in flight on those are never '
+                + 'closed.');
+        }
+    }
 
     /**
      * Counters for the path between the h264 instruction arriving and the
@@ -143,6 +152,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var gapMax = 0;
     var gapsOver100 = 0;
     var gapSquares = 0;
+
+    /**
+     * Frames for which close() was actually reached. If this tracks
+     * framesDecoded exactly, this decoder is not leaking VideoFrames and any
+     * "garbage collected without being closed" warning originates elsewhere --
+     * most likely a second decoder instance left behind by a reconnect.
+     */
+    this.framesClosed = 0;
 
     this.framesDecoded = 0;
 
@@ -285,6 +302,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 } finally {
                     // CRITICAL: always close VideoFrame to release GPU memory
                     frame.close();
+                    self.framesClosed++;
                     pendingDecodes--;
                     resolveIfIdle();
                 }
@@ -509,7 +527,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
     this.stats = function() {
         var s = {
+            instanceNumber: self.instanceNumber,
+            totalInstances: (typeof window !== 'undefined') ? window.__h264Instances : 1,
             framesDecoded: self.framesDecoded,
+            framesClosed: self.framesClosed,
+            leaked: self.framesDecoded - self.framesClosed,
             framesDropped: self.framesDropped,
             syncsGated: self.syncsGated,
             pendingDecodes: pendingDecodes,
