@@ -43,6 +43,16 @@
 .NOTES
     For rustguac - see docs/rdp-video-performance.md
     Tested on: Windows Server 2022, Windows Server 2025, Windows 11
+
+    If PowerShell refuses to run this ("not digitally signed"), the file is
+    carrying the mark-of-the-web from being copied onto the host. Clear it:
+
+        Unblock-File .\setup-rdp-performance.ps1
+
+    Under an AllSigned policy, bypass for a single invocation instead of
+    weakening the machine-wide policy:
+
+        powershell -ExecutionPolicy Bypass -File .\setup-rdp-performance.ps1
 #>
 
 param(
