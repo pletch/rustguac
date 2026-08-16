@@ -79,6 +79,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var SYNC_WAIT_TIMEOUT_MS = 200;
 
     /**
+     * How long a scheduled draw task may wait for its frame before giving up,
+     * in milliseconds. Generous, because it is a stall-breaker rather than a
+     * throttle: a healthy decoder returns frames in single-digit milliseconds.
+     *
+     * @private
+     * @constant
+     * @type {number}
+     */
+    var DECODE_WATCHDOG_MS = 1000;
+
+    /**
      * Timestamp of the last sync-timeout warning, for rate-limiting the log
      * so a struggling decoder cannot flood the console (heavy logging on the
      * main thread itself worsens decode/paint latency).
@@ -192,6 +203,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     this.gcLeaks = 0;
 
+    /**
+     * Number of times a draw task gave up waiting for its frame. Any non-zero
+     * value means frames are being lost between submission and output, which
+     * would otherwise stall the display queue.
+     *
+     * @type {number}
+     */
+    this.watchdogFires = 0;
+
     var frameRegistry = (typeof FinalizationRegistry !== 'undefined')
         ? new FinalizationRegistry(function(state) {
             if (!state.closed) {
@@ -300,6 +320,22 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var self = this;
 
     /**
+     * Marks a pending decode as finished exactly once, whatever its outcome:
+     * drawn, failed, or abandoned. pendingDecodes gates the Guacamole sync
+     * response, so a decode that is never settled leaves the client reporting
+     * a backlog forever and every sync waiting out its timeout.
+     *
+     * @private
+     */
+    function settle(pos) {
+        if (!pos || pos.settled)
+            return;
+        pos.settled = true;
+        pendingDecodes--;
+        resolveIfIdle();
+    }
+
+    /**
      * If pendingDecodes has reached zero, fire and clear all flush resolvers.
      *
      * @private
@@ -393,26 +429,41 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 if (pos) {
                     pos.frame = frame;
                     pos.frameState = frameState;
+                    if (pos.watchdog) {
+                        clearTimeout(pos.watchdog);
+                        pos.watchdog = null;
+                    }
                     if (pos.onReady)
                         pos.onReady();
                 }
 
-                /* No record of this frame: nothing can draw it, so release it
-                 * here rather than leaking it. */
+                /* The draw task already ran and gave up on this frame (its
+                 * watchdog fired). Release it; the decode was settled then, so
+                 * the accounting must not be touched again here. */
                 else {
                     frame.close();
                     frameState.closed = true;
                     self.framesClosed++;
-                    pendingDecodes--;
-                    resolveIfIdle();
                 }
 
             },
             error: function(e) {
+
                 self.framesDropped++;
-                pendingDecodes--;
-                resolveIfIdle();
                 console.error('[rustguac] H.264 decode error:', e.message);
+
+                /* A VideoDecoder error is terminal for everything queued on it:
+                 * those frames will never reach the output callback. Each has a
+                 * blocked task holding the display queue, and the display
+                 * renders frames in order, so leaving them blocked stalls the
+                 * entire display permanently -- the screen freezes on whatever
+                 * was last painted. Unblock them all. */
+                for (var key in pendingPositions) {
+                    var pos = pendingPositions[key];
+                    if (pos && pos.onReady)
+                        pos.onReady();
+                }
+
             }
         });
 
@@ -488,6 +539,21 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             pendingDecodes++;
             timestamp += 33333; // ~30fps in microseconds
 
+            /* Safety net. The scheduled draw task blocks the display queue
+             * until this frame is decoded, so anything that loses a frame
+             * without reporting an error -- a decoder reset, a dropped chunk --
+             * would stall the display indefinitely. Unblocking after a
+             * generous delay costs one skipped frame instead. */
+            (function(rec) {
+                rec.watchdog = setTimeout(function() {
+                    rec.watchdog = null;
+                    if (!rec.frame) {
+                        self.watchdogFires++;
+                        if (rec.onReady) rec.onReady();
+                    }
+                }, DECODE_WATCHDOG_MS);
+            })(pendingPositions[token]);
+
             decoder.decode(chunk);
             self.chunksSubmitted++;
             return token;
@@ -524,9 +590,20 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         delete pendingPositions[token];
 
+        if (pos.watchdog) {
+            clearTimeout(pos.watchdog);
+            pos.watchdog = null;
+        }
+
         var frame = pos.frame;
-        if (!frame)
+
+        /* Nothing decoded for this token -- the watchdog released the task, or
+         * the decoder errored. Settle it so the sync gate does not wait on a
+         * frame that will never arrive. */
+        if (!frame) {
+            settle(pos);
             return;
+        }
 
         try {
             if (pos.layer) {
@@ -556,8 +633,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             if (pos.frameState)
                 pos.frameState.closed = true;
             self.framesClosed++;
-            pendingDecodes--;
-            resolveIfIdle();
+            settle(pos);
         }
 
     };
@@ -629,7 +705,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     if (pos.frameState)
                         pos.frameState.closed = true;
                     self.framesClosed++;
-                } catch (e) {
+                } catch (e2) {
                     /* Already closed */
                 }
             }
@@ -758,6 +834,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * garbage-collected VideoFrames while this stays 0, the frames it
              * is warning about are not ours. */
             gcLeaks: self.gcLeaks,
+            watchdogFires: self.watchdogFires,
             decoderInstances: self.decoderInstances,
 
             /* Main-thread blocking. A freeze with no long tasks is not a
