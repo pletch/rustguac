@@ -221,7 +221,20 @@ if (!freerdp_settings_get_bool(..., FreeRDP_GfxH264) ||
 | true | true | V8/8.1 + V10 with AVC444 |
 | false | any | V8/8.1 + V10 with `AVC_DISABLED` |
 
-The hypothesis — **unconfirmed** — is that Windows 11 declines H.264 when the client offers no V10 caps set, falling back to progressive/clear. xrdp is unaffected because it is content with V8.1.
+**CONFIRMED (2026-08-15)** against a Windows 11 target. With `004`'s default AVC420-only advertisement, the session logged zero AVC surface commands. Setting `GUAC_RDP_H264_AVC444=1` to restore the V10 caps set produced, over the same workload:
+
+| Codec | Count | Share |
+|---|---|---|
+| 9 — CAPROGRESSIVE | 7256 | 50.5% |
+| 15 — AVC444v2 | 3352 | 23.3% |
+| 8 — CLEARCODEC | 2006 | 14.0% |
+| 10 — PLANAR | 1248 | 8.7% |
+| 0 — UNCOMPRESSED | 466 | 3.2% |
+| 11 — AVC420 | 50 | 0.3% |
+
+So Windows 11 declines H.264 entirely unless the client advertises V10. xrdp is unaffected because it is content with V8.1.
+
+**The same data shows Windows mixes codecs heavily** — only ~24% of surface commands are H.264, with Progressive alone accounting for half. Supporting Windows therefore needs *both* AVC444 decoding in the browser (a second `VideoDecoder` for `bitstream[1]` plus a WebGL chroma merge) *and* per-rect operation suppression in `guac_display_plan_apply()` (currently all ops for an H.264 layer are skipped, so mixed frames would lose their Progressive regions). Even then the ceiling is roughly a quarter of the encode work, against the near-total elimination measured on xrdp. Until both exist, H.264 passthrough is an xrdp feature and the H.264 checkbox has no effect on Windows targets.
 
 **Three diagnostics:**
 
