@@ -496,6 +496,31 @@ The mixed-codec test in the same function narrowed to `codecId != AVC420` to mat
 
 **Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
 
+## 026-h264-avc444-luma-only.patch
+
+**Problem:** `025` dropped AVC444 passthrough entirely to stop the green/pink split. That is correct but costly, and on the test Windows 11 host it turned out to be unavoidable rather than optional: setting `AVC444ModePreferred=0` to force AVC420 **stopped NVENC hardware encoding altogether** (Task Manager Video Encode 0%, `nvidia-smi encodersessions` empty). That host only engages its hardware encoder in AVC444 mode, leaving a choice between hardware encoding and passthrough.
+
+Dropping the AVC444 *capability advertisement* is not an escape: `012` established that without `GfxAVC444` FreeRDP never reaches RDPGFX V10 caps and Windows offers no H.264 at all.
+
+**Fix:** AVC444 streams carry an `LC` field (MS-RDPEGFX 2.2.4.5) describing which bitstreams are present:
+
+| LC | Contents | Handling |
+|----|----------|----------|
+| 0 | luma + chroma, for YUV444 reconstruction | decode and re-encode |
+| 1 | **luma only -- a complete YUV420 frame** | **passed through** |
+| 2 | chroma only | decode and re-encode |
+
+Only `LC = 1` is forwarded, and `bitstream[0]` is then an ordinary AVC420 picture needing no reconstruction. So a host can keep `AVC444ModePreferred=1`, keep hardware encoding, and still pass through every luma-only frame. `LC` is logged at `TRACE` per command, so the passthrough fraction is measurable:
+
+```bash
+journalctl -u rustguac-guacd --since '1 min ago' | grep "TRACE:" \
+  | grep -oP 'AVC444 LC=\K[0-9]+' | sort | uniq -c
+```
+
+**Also:** the mixed-codec marking moved after the capture and is now keyed on whether NAL data was actually captured, rather than on the codec ID. An AVC420 command whose capture failed, or an AVC444 command with both bitstreams, reaches the client only as a re-encoded image and must be exempt from suppression -- keying on the codec ID alone got both cases wrong.
+
+**Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:
