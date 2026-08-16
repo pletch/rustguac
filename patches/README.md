@@ -223,7 +223,9 @@ if (!freerdp_settings_get_bool(..., FreeRDP_GfxH264) ||
 
 The hypothesis — **unconfirmed** — is that Windows 11 declines H.264 when the client offers no V10 caps set, falling back to progressive/clear. xrdp is unaffected because it is content with V8.1.
 
-**Two diagnostics:**
+**Three diagnostics:**
+
+- `guac_rdp_push_settings()` logs the graphics flags it actually received at `INFO`: `RDP graphics settings: gfx=enabled, h264=disabled`. Without it there is no way to tell from guacd's logs whether a session that never sees H.264 was never asked for it or asked and declined — rustguac always sends `enable-h264` with an explicit `true`/`false` (`src/guacd.rs:397`), so libguac's `Parameter "..." omitted` DEBUG message never appears for it and cannot be used to check.
 
 - `GUAC_RDP_H264_AVC444=1` advertises AVC444, restoring the V10 caps set. **The display will render incorrectly while this is set** — the passthrough forwards only `bitstream[0]`, giving the split luma/chroma image with green and magenta casts described under `004`. It is for reading logs, not the screen. A `WARNING` is logged whenever it takes effect.
 - Every GFX surface command now logs its codec ID at `TRACE`, not just H.264 ones. Without this a server sending no H.264 is indistinguishable from one mixing H.264 with progressive/clear. MS-RDPEGFX IDs in decimal (`RDPGFX_CODECID_*` in `freerdp/channels/rdpgfx.h`): 0=UNCOMPRESSED, 3=CAVIDEO(RFX), 8=CLEARCODEC, 9=CAPROGRESSIVE, 10=PLANAR, 11=AVC420, 12=ALPHA, 13=CAPROGRESSIVE_V2, 14=AVC444, 15=AVC444v2.

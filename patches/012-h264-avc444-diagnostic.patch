@@ -22,7 +22,7 @@ index b820956b..3b4465d6 100644
       * GDI handler may free or modify cmd->extra data during AVC decoding,
       * so we must copy it while it's still valid. */
 diff --git a/src/protocols/rdp/settings.c b/src/protocols/rdp/settings.c
-index 41475118..efe42fb8 100644
+index 41475118..be63e58d 100644
 --- a/src/protocols/rdp/settings.c
 +++ b/src/protocols/rdp/settings.c
 @@ -1616,6 +1616,41 @@ int guac_rdp_get_depth(freerdp* rdp) {
@@ -67,7 +67,21 @@ index 41475118..efe42fb8 100644
  void guac_rdp_push_settings(guac_client* client,
          guac_rdp_settings* guac_settings, freerdp* rdp) {
  
-@@ -1660,8 +1695,19 @@ void guac_rdp_push_settings(guac_client* client,
+@@ -1654,14 +1689,33 @@ void guac_rdp_push_settings(guac_client* client,
+     freerdp_settings_set_bool(rdp_settings, FreeRDP_FastPathInput, TRUE);
+     freerdp_settings_set_bool(rdp_settings, FreeRDP_FastPathOutput, TRUE);
+ 
++    /* Report the graphics flags actually received from the client. Without
++     * this there is no way to tell, from guacd's logs alone, whether a session
++     * that never sees H.264 was never asked for it or asked and declined. */
++    guac_client_log(client, GUAC_LOG_INFO,
++            "RDP graphics settings: gfx=%s, h264=%s",
++            guac_settings->enable_gfx ? "enabled" : "disabled",
++            guac_settings->enable_h264 ? "enabled" : "disabled");
++
+     /* Enable RemoteFX / Graphics Pipeline */
+     if (guac_settings->enable_gfx) {
+ 
          freerdp_settings_set_bool(rdp_settings, FreeRDP_SupportGraphicsPipeline, TRUE);
          freerdp_settings_set_bool(rdp_settings, FreeRDP_RemoteFxCodec, TRUE);
          if (guac_settings->enable_h264) {
@@ -88,7 +102,20 @@ index 41475118..efe42fb8 100644
          }
  
          if (freerdp_settings_get_uint32(rdp_settings, FreeRDP_ColorDepth) != RDP_GFX_REQUIRED_DEPTH) {
-@@ -1923,8 +1969,19 @@ void guac_rdp_push_settings(guac_client* client,
+@@ -1917,14 +1971,32 @@ void guac_rdp_push_settings(guac_client* client,
+     rdp_settings->FastPathInput = TRUE;
+     rdp_settings->FastPathOutput = TRUE;
+ 
++    /* Report the graphics flags actually received from the client (see the
++     * FreeRDP 3 branch above). */
++    guac_client_log(client, GUAC_LOG_INFO,
++            "RDP graphics settings: gfx=%s, h264=%s",
++            guac_settings->enable_gfx ? "enabled" : "disabled",
++            settings->enable_h264 ? "enabled" : "disabled");
++
+     /* Enable RemoteFX / Graphics Pipeline */
+     if (guac_settings->enable_gfx) {
+ 
          rdp_settings->SupportGraphicsPipeline = TRUE;
          rdp_settings->RemoteFxCodec = TRUE;
          if (settings->enable_h264) {
