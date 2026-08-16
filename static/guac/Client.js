@@ -1473,6 +1473,25 @@ Guacamole.Client = function(tunnel) {
             var width = parseInt(parameters[5]);
             var height = parseInt(parameters[6]);
 
+            // Region rects, if sent. These identify which parts of the decoded
+            // picture are actually valid; the picture is always full-surface
+            // sized, so a server mixing codecs leaves the remainder holding no
+            // meaningful content. A count of zero (or an older guacd that
+            // sends no count at all) means the whole picture is valid.
+            var rects = [];
+            var numRects = parameters.length > 7 ? parseInt(parameters[7]) : 0;
+            for (var r = 0; r < numRects; r++) {
+                var base = 8 + r * 4;
+                if (base + 3 >= parameters.length)
+                    break;
+                rects.push({
+                    x      : parseInt(parameters[base]),
+                    y      : parseInt(parameters[base + 1]),
+                    width  : parseInt(parameters[base + 2]),
+                    height : parseInt(parameters[base + 3])
+                });
+            }
+
             // Create stream to receive H.264 NAL unit data
             var stream = streams[stream_index] = new Guacamole.InputStream(guac_client, stream_index);
 
@@ -1510,7 +1529,7 @@ Guacamole.Client = function(tunnel) {
                     // Feed to H.264 decoder
                     guac_client._h264Decoder.decode(
                         layer, x, y, width, height,
-                        bytes.buffer, isKeyFrame
+                        bytes.buffer, isKeyFrame, rects
                     );
                 } catch (e) {
                     if (typeof console !== 'undefined')

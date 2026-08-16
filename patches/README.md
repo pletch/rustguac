@@ -291,6 +291,45 @@ This is also correct in the `011` skip-decode case: with the decode skipped, no 
 | `src/libguac/display-priv.h` | Replace `h264_active` with `h264_rects[]` + `h264_rect_count`; add `GUAC_DISPLAY_LAYER_MAX_H264_RECTS` |
 | `src/libguac/display-plan.c` | Record each sent frame's region; suppress operations by intersection instead of per-layer |
 
+## 014-h264-region-rects.patch
+
+**Problem:** An H.264 picture is always full-surface sized, but `RDPGFX_AVC420_BITMAP_STREAM` carries a `meta.numRegionRects`/`regionRects` list identifying which parts of it are actually valid. `004` discards `meta` entirely and forwards only `cmd->left/top/width/height`, and the client then blits the whole picture:
+
+```js
+ctx.drawImage(frame, pos.x, pos.y);   /* three-arg form: entire frame */
+```
+
+On xrdp that is correct — it encodes the whole surface as H.264, so the valid region *is* the whole picture. On a server that mixes codecs it is not: Windows encodes only part of the screen as H.264, so every H.264 frame repainted the full surface and destroyed the CAPROGRESSIVE and CLEARCODEC regions delivered moments earlier. FreeRDP itself honours the distinction, unioning only `regionRects` into `surface->invalidRegion`.
+
+This is what produced the corrupted areas on Windows that `013` did not fix — `013` governs what guacd *withholds*, whereas the damage came from the client *overwriting*.
+
+**Fix:** carry the region rects end to end.
+
+- `rdpgfx.c` converts `meta.regionRects` from `RECTANGLE_16` (left/top/right/bottom) to `guac_rect` and passes them to `guac_display_layer_set_h264()`, which copies them onto the queued frame (FreeRDP frees the originals when the surface command returns).
+- The `h264` instruction gains a trailing region list:
+
+  ```
+  h264 <stream> <layer> <keyframe> <x> <y> <width> <height>
+       <numrects> [<x> <y> <width> <height>]...
+  ```
+
+  A count of zero means the whole picture is valid, so servers encoding the full surface are unaffected.
+- `H264Decoder.js` draws once per region with the nine-argument `drawImage`, clipping source and destination alike, and falls back to the whole-picture blit when no regions are given.
+- `013`'s suppression now tracks these precise regions rather than the whole surface bounds, so non-H.264 operations are suppressed far less often.
+
+**Client-side files** (not part of this patch, but required together): `static/guac/Client.js` parses the trailing rects; `static/guac/H264Decoder.js` clips drawing to them. Both are served live, but browsers cache them — force-reload after deploying.
+
+**Files patched:**
+
+| File | Change |
+|------|-----|
+| `src/libguac/display-priv.h` | Add `rects`/`num_rects` to `guac_h264_frame` |
+| `src/libguac/guacamole/display.h` | `guac_display_layer_set_h264()` takes region rects |
+| `src/libguac/display-layer.c` | Copy region rects onto the queued frame; free them |
+| `src/libguac/display-layer-list.c` | Free region rects during layer cleanup |
+| `src/libguac/display-plan.c` | Send the region list; track precise regions for suppression |
+| `src/protocols/rdp/channels/rdpgfx.c` | Convert and forward `meta.regionRects` for AVC420 and AVC444 |
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

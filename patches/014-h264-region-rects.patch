@@ -1,0 +1,342 @@
+diff --git a/src/libguac/display-layer-list.c b/src/libguac/display-layer-list.c
+index d7fd5171..1403cb1f 100644
+--- a/src/libguac/display-layer-list.c
++++ b/src/libguac/display-layer-list.c
+@@ -368,6 +368,7 @@ void guac_display_free_removed_layers(guac_display* display,
+         while (h264_frame != NULL) {
+             struct guac_h264_frame* next = h264_frame->next;
+             guac_mem_free(h264_frame->data);
++            guac_mem_free(h264_frame->rects);
+             guac_mem_free(h264_frame);
+             h264_frame = next;
+         }
+diff --git a/src/libguac/display-layer.c b/src/libguac/display-layer.c
+index 07279bfc..4709beb2 100644
+--- a/src/libguac/display-layer.c
++++ b/src/libguac/display-layer.c
+@@ -338,7 +338,8 @@ void guac_display_layer_close_cairo(guac_display_layer* layer, guac_display_laye
+ 
+ void guac_display_layer_set_h264(guac_display_layer* layer,
+         const unsigned char* data, uint32_t length, int is_keyframe,
+-        int x, int y, int width, int height) {
++        int x, int y, int width, int height,
++        const guac_rect* rects, int num_rects) {
+ 
+     guac_display* display = layer->display;
+     guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
+@@ -352,6 +353,19 @@ void guac_display_layer_set_h264(guac_display_layer* layer,
+     guac_rect_init(&frame->rect, x, y, width, height);
+     frame->next = NULL;
+ 
++    /* Copy the region rects, if any. The caller's array belongs to FreeRDP and
++     * is freed as soon as the surface command returns. */
++    if (rects != NULL && num_rects > 0) {
++        size_t rects_size = guac_mem_ckd_mul_or_die(num_rects, sizeof(guac_rect));
++        frame->rects = guac_mem_alloc(rects_size);
++        memcpy(frame->rects, rects, rects_size);
++        frame->num_rects = num_rects;
++    }
++    else {
++        frame->rects = NULL;
++        frame->num_rects = 0;
++    }
++
+     /* Append to queue */
+     if (layer->h264_queue_tail != NULL)
+         layer->h264_queue_tail->next = frame;
+@@ -368,6 +382,7 @@ void guac_display_layer_set_h264(guac_display_layer* layer,
+         if (layer->h264_queue == NULL)
+             layer->h264_queue_tail = NULL;
+         guac_mem_free(old->data);
++        guac_mem_free(old->rects);
+         guac_mem_free(old);
+         layer->h264_queue_length--;
+     }
+diff --git a/src/libguac/display-plan.c b/src/libguac/display-plan.c
+index 7e6cc8a7..0e442a47 100644
+--- a/src/libguac/display-plan.c
++++ b/src/libguac/display-plan.c
+@@ -391,6 +391,23 @@ void guac_display_plan_free(guac_display_plan* plan) {
+  * Sends a single H.264 frame to all connected clients as a custom "h264"
+  * instruction followed by blob data and an end instruction.
+  */
++/**
++ * Writes a single integer as a length-prefixed argument of the Guacamole
++ * instruction currently being written to the given socket.
++ */
++static void guac_h264_write_arg(guac_socket* socket, int value) {
++
++    char buf[16];
++    char len_buf[8];
++
++    int n = snprintf(buf, sizeof(buf), "%d", value);
++    snprintf(len_buf, sizeof(len_buf), ",%d.", n);
++
++    guac_socket_write_string(socket, len_buf);
++    guac_socket_write_string(socket, buf);
++
++}
++
+ static void guac_display_plan_send_h264_frame(guac_client* client,
+         guac_socket* socket, guac_display_layer* layer,
+         struct guac_h264_frame* frame) {
+@@ -398,9 +415,17 @@ static void guac_display_plan_send_h264_frame(guac_client* client,
+     guac_stream* stream = guac_client_alloc_stream(client);
+ 
+     /* Build h264 instruction:
+-     * h264 <stream> <layer> <keyframe> <x> <y> <width> <height> */
+-    char arg_bufs[7][16];
+-    int vals[] = {
++     *
++     *   h264 <stream> <layer> <keyframe> <x> <y> <width> <height>
++     *        <numrects> [<x> <y> <width> <height>]...
++     *
++     * The trailing region rects identify which parts of the decoded picture
++     * are actually valid. A client MUST draw only those regions; the picture
++     * is full-surface sized, and on a server that mixes codecs the remainder
++     * holds no meaningful content. A count of zero means the whole picture is
++     * valid, which is the case for servers (such as xrdp) that encode the
++     * entire surface as H.264. */
++    int header[] = {
+         stream->index,
+         layer->layer->index,
+         frame->is_keyframe,
+@@ -412,13 +437,20 @@ static void guac_display_plan_send_h264_frame(guac_client* client,
+ 
+     guac_socket_instruction_begin(socket);
+     guac_socket_write_string(socket, "4.h264");
+-    for (int i = 0; i < 7; i++) {
+-        int n = snprintf(arg_bufs[i], sizeof(arg_bufs[i]), "%d", vals[i]);
+-        char len_buf[8];
+-        snprintf(len_buf, sizeof(len_buf), ",%d.", n);
+-        guac_socket_write_string(socket, len_buf);
+-        guac_socket_write_string(socket, arg_bufs[i]);
++
++    for (int i = 0; i < 7; i++)
++        guac_h264_write_arg(socket, header[i]);
++
++    guac_h264_write_arg(socket, frame->num_rects);
++
++    for (int i = 0; i < frame->num_rects; i++) {
++        guac_rect* rect = &frame->rects[i];
++        guac_h264_write_arg(socket, rect->left);
++        guac_h264_write_arg(socket, rect->top);
++        guac_h264_write_arg(socket, guac_rect_width(rect));
++        guac_h264_write_arg(socket, guac_rect_height(rect));
+     }
++
+     guac_socket_write_string(socket, ";");
+     guac_socket_instruction_end(socket);
+ 
+@@ -500,6 +532,7 @@ static int guac_display_plan_flush_h264(guac_client* client,
+                     "H.264: dropping %u byte delta (no keyframe yet)",
+                     frame->length);
+             guac_mem_free(frame->data);
++            guac_mem_free(frame->rects);
+             guac_mem_free(frame);
+             frame = next;
+             continue;
+@@ -507,10 +540,17 @@ static int guac_display_plan_flush_h264(guac_client* client,
+ 
+         guac_display_plan_send_h264_frame(client, socket, layer, frame);
+ 
+-        /* Remember the region this frame covers so that image operations
+-         * overlapping it can be suppressed, while operations elsewhere on the
+-         * layer (other codecs) are still sent */
+-        guac_display_layer_add_h264_rect(layer, &frame->rect);
++        /* Remember the regions this frame covers so that image operations
++         * overlapping them can be suppressed, while operations elsewhere on
++         * the layer (other codecs) are still sent. Prefer the server's precise
++         * region rects; fall back to the whole surface when it supplies
++         * none. */
++        if (frame->num_rects > 0) {
++            for (int i = 0; i < frame->num_rects; i++)
++                guac_display_layer_add_h264_rect(layer, &frame->rects[i]);
++        }
++        else
++            guac_display_layer_add_h264_rect(layer, &frame->rect);
+ 
+         if (frame->is_keyframe)
+             layer->h264_keyframe_sent = 1;
+@@ -523,6 +563,7 @@ static int guac_display_plan_flush_h264(guac_client* client,
+                 guac_rect_height(&frame->rect));
+ 
+         guac_mem_free(frame->data);
++        guac_mem_free(frame->rects);
+         guac_mem_free(frame);
+         frame = next;
+         sent++;
+diff --git a/src/libguac/display-priv.h b/src/libguac/display-priv.h
+index d0a78b7f..736156e5 100644
+--- a/src/libguac/display-priv.h
++++ b/src/libguac/display-priv.h
+@@ -334,7 +334,31 @@ struct guac_h264_frame {
+     unsigned char* data;
+     uint32_t length;
+     int is_keyframe;
++
++    /**
++     * The bounds of the surface this frame decodes to. Retained for logging
++     * and as a fallback when the server supplies no region rects.
++     */
+     guac_rect rect;
++
++    /**
++     * The regions within the decoded picture that this frame actually
++     * updates, in surface coordinates.
++     *
++     * An H.264 picture is always full-surface sized, but a server that mixes
++     * codecs encodes only part of the screen as H.264 -- the remainder of the
++     * picture is not valid content. Clients MUST draw only these regions, or
++     * they will overwrite areas delivered via other codecs. May be NULL, in
++     * which case the whole picture is valid (as with xrdp, which encodes the
++     * entire surface as H.264).
++     */
++    guac_rect* rects;
++
++    /**
++     * The number of entries in rects, or zero if rects is NULL.
++     */
++    int num_rects;
++
+     struct guac_h264_frame* next;
+ };
+ 
+diff --git a/src/libguac/guacamole/display.h b/src/libguac/guacamole/display.h
+index d1a990fe..29f68789 100644
+--- a/src/libguac/guacamole/display.h
++++ b/src/libguac/guacamole/display.h
+@@ -449,10 +449,22 @@ void guac_display_free_layer(guac_display_layer* display_layer);
+  *
+  * @param height
+  *     The height of the region this data covers, in pixels.
++ *
++ * @param rects
++ *     The regions within the decoded picture that this frame actually
++ *     updates, in surface coordinates, or NULL if the entire picture is
++ *     valid. An H.264 picture is always full-surface sized, but a server
++ *     mixing codecs encodes only part of the screen as H.264; clients must
++ *     draw only these regions or they will overwrite content delivered via
++ *     other codecs. The array is copied.
++ *
++ * @param num_rects
++ *     The number of entries in rects, or zero if rects is NULL.
+  */
+ void guac_display_layer_set_h264(guac_display_layer* layer,
+         const unsigned char* data, uint32_t length, int is_keyframe,
+-        int x, int y, int width, int height);
++        int x, int y, int width, int height,
++        const guac_rect* rects, int num_rects);
+ 
+ /**
+  * Returns a layer representing the current mouse cursor icon. Changes to the
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index 3b4465d6..8ebc7e3f 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -30,6 +30,7 @@
+ #include <freerdp/event.h>
+ #include <guacamole/client.h>
+ #include <guacamole/display.h>
++#include <guacamole/rect.h>
+ 
+ #include <stdlib.h>
+ #include <string.h>
+@@ -74,6 +75,51 @@ static int guac_rdp_h264_skip_decode(void) {
+ 
+ }
+ 
++/**
++ * Copies the region rects of an H.264 metablock into a newly allocated array of
++ * guac_rect, converting from FreeRDP's RECTANGLE_16 (left/top/right/bottom) to
++ * the left/top/width/height form taken by guac_rect_init().
++ *
++ * These regions identify which parts of the decoded picture are actually
++ * valid. The picture is always full-surface sized, so a server that encodes
++ * only part of the screen as H.264 -- as Windows does when mixing codecs --
++ * leaves the remainder holding no meaningful content. Forwarding the regions
++ * lets the client draw only those parts instead of blitting the whole picture
++ * over regions delivered by other codecs.
++ *
++ * @param meta
++ *     The metablock whose region rects should be copied.
++ *
++ * @param num_rects
++ *     Pointer to an int that will receive the number of rects copied.
++ *
++ * @return
++ *     A newly allocated array of guac_rect which must be freed by the caller,
++ *     or NULL if the metablock contains no regions.
++ */
++static guac_rect* guac_rdp_h264_copy_rects(const RDPGFX_H264_METABLOCK* meta,
++        int* num_rects) {
++
++    *num_rects = 0;
++
++    if (meta == NULL || meta->numRegionRects == 0 || meta->regionRects == NULL)
++        return NULL;
++
++    guac_rect* rects = malloc(meta->numRegionRects * sizeof(guac_rect));
++    if (rects == NULL)
++        return NULL;
++
++    for (UINT32 i = 0; i < meta->numRegionRects; i++) {
++        const RECTANGLE_16* src = &meta->regionRects[i];
++        guac_rect_init(&rects[i], src->left, src->top,
++                src->right - src->left, src->bottom - src->top);
++    }
++
++    *num_rects = (int) meta->numRegionRects;
++    return rects;
++
++}
++
+ /**
+  * Wrapper for the FreeRDP GDI SurfaceCommand callback. Intercepts AVC420
+  * and AVC444 commands to store raw H.264 NAL units on the display layer
+@@ -111,6 +157,8 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+     unsigned char* saved_h264 = NULL;
+     UINT32 saved_length = 0;
+     int saved_keyframe = 0;
++    guac_rect* saved_rects = NULL;
++    int saved_num_rects = 0;
+ 
+     if (cmd->codecId == RDPGFX_CODECID_AVC420 && cmd->extra != NULL) {
+         RDPGFX_AVC420_BITMAP_STREAM* avc420 =
+@@ -122,6 +170,8 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+                 memcpy(saved_h264, avc420->data, saved_length);
+                 saved_keyframe = guac_rdp_h264_is_keyframe(
+                         saved_h264, saved_length);
++                saved_rects = guac_rdp_h264_copy_rects(&avc420->meta,
++                        &saved_num_rects);
+             }
+         }
+     }
+@@ -138,6 +188,8 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+                 memcpy(saved_h264, avc444->bitstream[0].data, saved_length);
+                 saved_keyframe = guac_rdp_h264_is_keyframe(
+                         saved_h264, saved_length);
++                saved_rects = guac_rdp_h264_copy_rects(
++                        &avc444->bitstream[0].meta, &saved_num_rects);
+             }
+         }
+     }
+@@ -175,7 +227,8 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+                 guac_display_default_layer(rdp_client->display);
+         guac_display_layer_set_h264(default_layer,
+                 saved_h264, saved_length, saved_keyframe,
+-                cmd->left, cmd->top, cmd->width, cmd->height);
++                cmd->left, cmd->top, cmd->width, cmd->height,
++                saved_rects, saved_num_rects);
+ 
+         /* With the decode skipped, guac_rdp_gdi_end_paint() never runs, so
+          * nothing marks the display as modified and the queued frames would
+@@ -198,6 +251,8 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+         free(saved_h264);
+     }
+ 
++    free(saved_rects);
++
+     return result;
+ }
+ 

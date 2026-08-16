@@ -218,7 +218,24 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     if (pos && pos.layer) {
                         var canvas = pos.layer.getCanvas();
                         var ctx = canvas.getContext('2d');
-                        ctx.drawImage(frame, pos.x, pos.y);
+
+                        // Draw only the regions the server marked valid. The
+                        // decoded picture spans the whole surface, so blitting
+                        // all of it would overwrite areas delivered via other
+                        // codecs (CAPROGRESSIVE, CLEARCODEC) on servers that
+                        // mix them within a frame.
+                        if (pos.rects) {
+                            for (var r = 0; r < pos.rects.length; r++) {
+                                var rect = pos.rects[r];
+                                ctx.drawImage(frame,
+                                        rect.x, rect.y, rect.width, rect.height,
+                                        rect.x, rect.y, rect.width, rect.height);
+                            }
+                        }
+
+                        // No regions given: the entire picture is valid
+                        else
+                            ctx.drawImage(frame, pos.x, pos.y);
                     }
                 } finally {
                     // CRITICAL: always close VideoFrame to release GPU memory
@@ -258,8 +275,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @param {number} height - Frame height.
      * @param {!ArrayBuffer} nalData - Raw H.264 NAL unit data (Annex B format).
      * @param {boolean} isKeyFrame - Whether this contains an IDR/keyframe.
+     * @param {Array} [rects]
+     *     The regions of the decoded picture that are actually valid, each
+     *     {x, y, width, height} in surface coordinates. An H.264 picture is
+     *     always full-surface sized, but a server that mixes codecs encodes
+     *     only part of the screen as H.264, leaving the rest of the picture
+     *     holding no meaningful content. Drawing the whole picture in that
+     *     case overwrites regions delivered via other codecs. Omit or leave
+     *     empty when the entire picture is valid, as with servers that encode
+     *     the full surface.
      */
-    this.decode = function(layer, x, y, width, height, nalData, isKeyFrame) {
+    this.decode = function(layer, x, y, width, height, nalData, isKeyFrame, rects) {
 
         ensureDecoder(width, height);
 
@@ -279,7 +305,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
             // Store per-frame position (and submit time, for decode-latency
             // measurement) before submitting to decoder
-            pendingPositions[timestamp] = {layer: layer, x: x, y: y, t: performance.now()};
+            pendingPositions[timestamp] = {
+                layer: layer,
+                x: x,
+                y: y,
+                rects: (rects && rects.length) ? rects : null,
+                t: performance.now()
+            };
             pendingDecodes++;
             timestamp += 33333; // ~30fps in microseconds
 
