@@ -571,6 +571,29 @@ Neither gives both. Real passthrough on such a host needs full AVC444 support: f
 
 **Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
 
+## 029-h264-avc420-thinclient.patch
+
+**Problem:** `028` concluded that hardware encoding and passthrough were mutually exclusive on a Windows host where `AVC444ModePreferred` gates the hardware encoder -- advertise AVC444 and get AVC444 (unforwardable), or set the registry to 0 and lose NVENC. That conclusion was premature: it treated the AVC444 *capability* and the AVC444 *stream* as inseparable, and they are not.
+
+MS-RDPEGFX defines `RDPGFX_CAPS_FLAG_AVC_THINCLIENT` (0x40, caps 10.3+), which declares that the client supports AVC420 but **not** AVC444. FreeRDP emits it from `GfxThinClient`, and only when AVC is not disabled:
+
+```c
+if (GfxThinClient) {
+    if ((caps10Flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) == 0)
+        caps10Flags |= RDPGFX_CAPS_FLAG_AVC_THINCLIENT;
+}
+```
+
+**Fix:** advertise AVC444 *and* AVC_THINCLIENT together. The AVC444 capability is what gets FreeRDP to emit the V10 capability sets at all -- which Windows requires before offering any H.264, and which on some hosts is also what engages the hardware encoder -- while AVC_THINCLIENT asks that host to actually send AVC420, which passthrough can forward.
+
+Enabled by default whenever `GUAC_RDP_H264_AVC444` is set; `GUAC_RDP_H264_AVC420_ONLY=0` suppresses it for comparison. Logged at `INFO` so the advertised combination is visible per connection.
+
+**Caveat:** the flag first appears in caps 10.3. FreeRDP builds `caps10Flags` for V10, V10.1 and V10.2 *before* adding it, so if a server confirms one of those three versions the flag was never sent. Check which version was confirmed if the server still sends AVC444.
+
+If AVC444 arrives regardless, the server is ignoring the flag, and `028` applies -- those frames are decoded and re-encoded rather than corrupting the display.
+
+**Files patched:** `src/protocols/rdp/settings.c`
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

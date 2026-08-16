@@ -1,0 +1,111 @@
+diff --git a/src/protocols/rdp/settings.c b/src/protocols/rdp/settings.c
+index be63e58d..4dadb3bc 100644
+--- a/src/protocols/rdp/settings.c
++++ b/src/protocols/rdp/settings.c
+@@ -1616,6 +1616,39 @@ int guac_rdp_get_depth(freerdp* rdp) {
+ #endif
+ }
+ 
++/**
++ * Returns non-zero if the RDPGFX AVC_THINCLIENT capability flag should be
++ * advertised, which tells the server this client supports AVC420 but not
++ * AVC444. Defaults to enabled; set GUAC_RDP_H264_AVC420_ONLY=0 to suppress it.
++ *
++ * This exists because AVC444 cannot be passed through at all: its two
++ * bitstreams are a single H.264 sequence whose pictures alternate between the
++ * main and auxiliary views, so no subset of it stands alone (see patch 028).
++ * Yet the AVC444 capability must still be advertised, because FreeRDP reaches
++ * the RDPGFX V10 capability set only via GfxAVC444, and Windows offers no
++ * H.264 at all below V10.
++ *
++ * AVC_THINCLIENT (0x40, caps 10.3+) resolves the contradiction: advertise
++ * AVC444 to reach V10, then declare AVC420-only so the server sends a stream
++ * that can actually be forwarded. FreeRDP emits the flag from GfxThinClient,
++ * and only when AVC is not disabled.
++ *
++ * @return
++ *     Non-zero if AVC_THINCLIENT should be advertised, zero otherwise.
++ */
++static int guac_rdp_h264_avc420_only(void) {
++
++    static int cached = -1;
++
++    if (cached == -1) {
++        const char* value = getenv("GUAC_RDP_H264_AVC420_ONLY");
++        cached = !(value != NULL && strcmp(value, "0") == 0);
++    }
++
++    return cached;
++
++}
++
+ /**
+  * DIAGNOSTIC ONLY. Returns non-zero if GfxAVC444 should be advertised to the
+  * RDP server despite the H.264 passthrough being unable to render it, as
+@@ -1706,15 +1739,30 @@ void guac_rdp_push_settings(guac_client* client,
+ 
+             int avc444 = guac_rdp_h264_avc444_diagnostic();
+ 
++            int avc420_only = guac_rdp_h264_avc420_only();
++
+             freerdp_settings_set_bool(rdp_settings, FreeRDP_GfxH264, TRUE);
+             freerdp_settings_set_bool(rdp_settings, FreeRDP_GfxAVC444, avc444);
+ 
+-            if (avc444)
+-                guac_client_log(client, GUAC_LOG_WARNING, "GUAC_RDP_H264_AVC444 "
+-                        "is set: advertising AVC444 so that the RDPGFX V10 "
+-                        "capability set is offered. THE DISPLAY WILL RENDER "
+-                        "INCORRECTLY. This is a diagnostic for servers that "
+-                        "decline H.264 when only V8.1 is advertised.");
++            /* Declare AVC420-only at caps 10.3+. Advertising AVC444 is the
++             * only way to reach the V10 capability set, but AVC444 streams
++             * cannot be passed through, so ask the server for AVC420. */
++            freerdp_settings_set_bool(rdp_settings, FreeRDP_GfxThinClient,
++                    avc444 && avc420_only);
++
++            if (avc444 && avc420_only)
++                guac_client_log(client, GUAC_LOG_INFO,
++                        "Advertising AVC444 to reach the RDPGFX V10 capability "
++                        "set, with AVC_THINCLIENT set to request AVC420. If "
++                        "the server sends AVC444 anyway, it is ignoring that "
++                        "flag and those frames cannot be passed through.");
++
++            else if (avc444)
++                guac_client_log(client, GUAC_LOG_WARNING,
++                        "GUAC_RDP_H264_AVC420_ONLY=0: advertising AVC444 "
++                        "without the AVC_THINCLIENT flag. A server that sends "
++                        "AVC444 will have those frames decoded and re-encoded "
++                        "rather than passed through.");
+ 
+         }
+ 
+@@ -1987,15 +2035,23 @@ void guac_rdp_push_settings(guac_client* client,
+ 
+             int avc444 = guac_rdp_h264_avc444_diagnostic();
+ 
++            int avc420_only = guac_rdp_h264_avc420_only();
++
+             rdp_settings->GfxH264 = TRUE;
+             rdp_settings->GfxAVC444 = avc444;
+ 
+-            if (avc444)
+-                guac_client_log(client, GUAC_LOG_WARNING, "GUAC_RDP_H264_AVC444 "
+-                        "is set: advertising AVC444 so that the RDPGFX V10 "
+-                        "capability set is offered. THE DISPLAY WILL RENDER "
+-                        "INCORRECTLY. This is a diagnostic for servers that "
+-                        "decline H.264 when only V8.1 is advertised.");
++            /* Declare AVC420-only at caps 10.3+. See the FreeRDP 3 path. */
++            rdp_settings->GfxThinClient = (avc444 && avc420_only);
++
++            if (avc444 && avc420_only)
++                guac_client_log(client, GUAC_LOG_INFO,
++                        "Advertising AVC444 to reach the RDPGFX V10 capability "
++                        "set, with AVC_THINCLIENT set to request AVC420.");
++
++            else if (avc444)
++                guac_client_log(client, GUAC_LOG_WARNING,
++                        "GUAC_RDP_H264_AVC420_ONLY=0: advertising AVC444 "
++                        "without the AVC_THINCLIENT flag.");
+ 
+         }
+ 
