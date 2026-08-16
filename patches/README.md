@@ -270,6 +270,27 @@ AVC420 is fully supported by `004`'s passthrough, so no browser-side AVC444 work
 | `src/protocols/rdp/settings.c` | Add `guac_rdp_h264_avc444_diagnostic()`; drive `GfxAVC444` from it at both the FreeRDP 3 and FreeRDP 2 sites |
 | `src/protocols/rdp/channels/rdpgfx.c` | Log `cmd->codecId` for every surface command at `TRACE` |
 
+## 013-h264-per-rect-suppression.patch
+
+**Problem:** `004` suppresses **every** image operation for a layer that had H.264 sent this frame:
+
+```c
+if (display_layer->h264_active) { op++; continue; }
+```
+
+That is correct only when the server encodes the whole surface as H.264, as xrdp does. Windows mixes codecs heavily within a frame — a Windows 11 host was measured at 21% AVC420 against 62% CAPROGRESSIVE, 12% CLEARCODEC and 5% UNCOMPRESSED (see `012`). Every progressive/clear region arriving in a frame that also carried H.264 was discarded, producing visibly stale and corrupted areas of the desktop.
+
+**Fix:** track the regions actually covered by the H.264 frames sent for a layer, and suppress only operations that intersect them. Regions are recorded in `guac_display_plan_flush_h264()` as each frame is sent, deduplicated (servers commonly send many frames covering the same rect), and capped at `GUAC_DISPLAY_LAYER_MAX_H264_RECTS` (32) with any excess merged into the last slot — over-suppressing slightly rather than losing track of a covered region.
+
+This is also correct in the `011` skip-decode case: with the decode skipped, no pixels are written for H.264 regions, so no operations are generated for them and nothing is suppressed unnecessarily.
+
+**Files patched:**
+
+| File | Change |
+|------|-----|
+| `src/libguac/display-priv.h` | Replace `h264_active` with `h264_rects[]` + `h264_rect_count`; add `GUAC_DISPLAY_LAYER_MAX_H264_RECTS` |
+| `src/libguac/display-plan.c` | Record each sent frame's region; suppress operations by intersection instead of per-layer |
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:
