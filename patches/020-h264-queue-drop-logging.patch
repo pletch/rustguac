@@ -1,0 +1,32 @@
+diff --git a/src/libguac/display-layer.c b/src/libguac/display-layer.c
+index 9e1d1c57..8727ebc4 100644
+--- a/src/libguac/display-layer.c
++++ b/src/libguac/display-layer.c
+@@ -20,6 +20,7 @@
+ #include "display-priv.h"
+ #include "guacamole/assert.h"
+ #include "guacamole/display.h"
++#include <guacamole/client.h>
+ #include "guacamole/mem.h"
+ #include "guacamole/rect.h"
+ #include "guacamole/rwlock.h"
+@@ -386,7 +387,18 @@ void guac_display_layer_set_h264(guac_display_layer* layer,
+     layer->h264_queue_length++;
+ 
+     /* Cap queue at 120 frames (~2 seconds at 60fps) to prevent unbounded
+-     * growth if frame flushes are stalled. Drop oldest frame from head. */
++     * growth if frame flushes are stalled. Drop oldest frame from head.
++     *
++     * Dropping a frame breaks the H.264 reference chain: every subsequent
++     * inter-coded frame references data the client's decoder never received,
++     * so it discards queued work until the next IDR. That is invisible in the
++     * client's own accounting -- frames the decoder allocates and then drops
++     * never reach its output callback -- so it must be reported here. */
++    if (layer->h264_queue_length > 120)
++        guac_client_log(layer->display->client, GUAC_LOG_WARNING,
++                "H.264 queue exceeded 120 frames; dropping oldest. The "
++                "reference chain is broken until the next keyframe.");
++
+     while (layer->h264_queue_length > 120 && layer->h264_queue != NULL) {
+         struct guac_h264_frame* old = layer->h264_queue;
+         layer->h264_queue = old->next;
