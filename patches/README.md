@@ -200,6 +200,43 @@ The decode is software: Debian's libfreerdp3 is built `WITH_VAAPI=OFF` (VAAPI de
 | `src/libguac/display-flush.c` | Call the flush before `plan_apply()`, outside the `plan != NULL` guard |
 | `src/protocols/rdp/channels/rdpgfx.c` | Add `guac_rdp_h264_skip_decode()`; conditionally skip the GDI decode; notify the render thread |
 
+## 012-h264-avc444-diagnostic.patch
+
+**Status: diagnostic only — not a fix.** Requires `004`. Independent of `011`.
+
+**Problem:** A Windows 11 target negotiated the RDPGFX channel successfully but never sent a single AVC surface command, leaving guacd on the full decode→re-encode path (measured: `display-wrk` encoder threads at 63% of session CPU, versus ~0.2% on a working xrdp session).
+
+**Suspected cause:** FreeRDP cannot advertise the `RDPGFX_CAPVERSION_10` capability set with AVC420 only. In `rdpgfx_send_caps_advertise_pdu()` the V10 caps set is emitted only when `GfxH264` is unset or `GfxAVC444` is set:
+
+```c
+if (!freerdp_settings_get_bool(..., FreeRDP_GfxH264) ||
+    freerdp_settings_get_bool(..., FreeRDP_GfxAVC444))
+```
+
+`004` sets `GfxH264 = TRUE` and `GfxAVC444 = FALSE` (see its AVC420-only note), so that condition is false and only V8/V8.1 is advertised. The three reachable states are:
+
+| `GfxH264` | `GfxAVC444` | Advertised |
+|---|---|---|
+| true | false ← `004` | V8/8.1 with AVC420 only, **no V10** |
+| true | true | V8/8.1 + V10 with AVC444 |
+| false | any | V8/8.1 + V10 with `AVC_DISABLED` |
+
+The hypothesis — **unconfirmed** — is that Windows 11 declines H.264 when the client offers no V10 caps set, falling back to progressive/clear. xrdp is unaffected because it is content with V8.1.
+
+**Two diagnostics:**
+
+- `GUAC_RDP_H264_AVC444=1` advertises AVC444, restoring the V10 caps set. **The display will render incorrectly while this is set** — the passthrough forwards only `bitstream[0]`, giving the split luma/chroma image with green and magenta casts described under `004`. It is for reading logs, not the screen. A `WARNING` is logged whenever it takes effect.
+- Every GFX surface command now logs its codec ID at `TRACE`, not just H.264 ones. Without this a server sending no H.264 is indistinguishable from one mixing H.264 with progressive/clear. Relevant MS-RDPEGFX IDs: 8=CAVIDEO(RFX), 9=CLEARCODEC, 10=PLANAR, 11=AVC420, 13=AVC444, 15=AVC444v2, 16=PROGRESSIVE, 17=PROGRESSIVE_V2.
+
+**If the hypothesis is confirmed,** there is no cheap fix: carrying AVC444 through the passthrough requires decoding both bitstreams and recombining the chroma planes in the browser (a second `VideoDecoder` plus a WebGL merge shader). Until then H.264 passthrough is effectively an xrdp feature.
+
+**Files patched:**
+
+| File | Change |
+|------|-----|
+| `src/protocols/rdp/settings.c` | Add `guac_rdp_h264_avc444_diagnostic()`; drive `GfxAVC444` from it at both the FreeRDP 3 and FreeRDP 2 sites |
+| `src/protocols/rdp/channels/rdpgfx.c` | Log `cmd->codecId` for every surface command at `TRACE` |
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:
