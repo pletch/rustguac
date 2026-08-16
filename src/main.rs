@@ -25,6 +25,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::session::SessionManager;
 use axum::extract::{DefaultBodyLimit, Request};
+use axum::http::{header, HeaderValue};
 use axum::response::Html;
 use axum::response::Response;
 use axum::routing::{delete, get, post, put};
@@ -36,6 +37,8 @@ use tower_governor::{
     governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
 };
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower::ServiceBuilder;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -1218,7 +1221,21 @@ async fn run_server(config: Config, database: Db) {
         .layer(Extension(theme_data))
         .layer(Extension(trusted_proxies))
         .layer(Extension(branded_pages))
-        .fallback_service(ServeDir::new(&static_path));
+        .fallback_service(
+            // Static assets carry no Cache-Control by default, so browsers
+            // fall back to heuristic caching based on Last-Modified -- roughly
+            // 10% of the file's age. For long-lived files such as
+            // static/guac/*.js that means edits can go unseen for days, with
+            // the browser silently running old code against a new guacd.
+            // "no-cache" still permits conditional requests, so unchanged
+            // files continue to cost only a 304.
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("no-cache"),
+                ))
+                .service(ServeDir::new(&static_path)),
+        );
 
     let scheme = if server_tls.is_some() {
         "https"
