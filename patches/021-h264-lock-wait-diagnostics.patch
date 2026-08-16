@@ -1,0 +1,37 @@
+diff --git a/src/libguac/display-layer.c b/src/libguac/display-layer.c
+index 8727ebc4..51328002 100644
+--- a/src/libguac/display-layer.c
++++ b/src/libguac/display-layer.c
+@@ -21,6 +21,7 @@
+ #include "guacamole/assert.h"
+ #include "guacamole/display.h"
+ #include <guacamole/client.h>
++#include <guacamole/timestamp.h>
+ #include "guacamole/mem.h"
+ #include "guacamole/rect.h"
+ #include "guacamole/rwlock.h"
+@@ -354,7 +355,24 @@ void guac_display_layer_set_h264(guac_display_layer* layer,
+         const guac_rect* rects, int num_rects) {
+ 
+     guac_display* display = layer->display;
++
++    /* Time the lock acquisition. The render thread holds this lock for the
++     * whole frame flush, including the dispatch of image encoding, so a slow
++     * acquisition here means the caller's thread is blocked behind that work.
++     *
++     * For the RDP client that caller is the thread processing EGFX PDUs and
++     * sending RDPGFX_FRAME_ACKNOWLEDGE. Delaying those acknowledgements makes
++     * the server's flow control throttle the frame rate -- a stall here shows
++     * up as a low frame rate from the server, not as a stall in guacd. */
++    guac_timestamp lock_start = guac_timestamp_current();
+     guac_rwlock_acquire_write_lock(&display->pending_frame.lock);
++    int lock_wait = (int) (guac_timestamp_current() - lock_start);
++
++    if (lock_wait >= 10)
++        guac_client_log(display->client, GUAC_LOG_DEBUG,
++                "H.264 set blocked %ims acquiring the pending frame lock. "
++                "The RDP thread cannot acknowledge frames while blocked here.",
++                lock_wait);
+ 
+     /* Allocate a new queue entry and copy NAL unit data */
+     struct guac_h264_frame* frame = guac_mem_alloc(sizeof(struct guac_h264_frame));
