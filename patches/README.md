@@ -364,6 +364,33 @@ The flag is set without holding the pending frame lock. It only ever transitions
 | `src/libguac/display-plan.c` | Consume the flag per frame; gate suppression on it |
 | `src/protocols/rdp/channels/rdpgfx.c` | Mark the layer for every non-H.264 surface command |
 
+## 019-h264-keyframe-idr-only.patch
+
+**Problem:** `004` treated an access unit as a keyframe if it contained NAL type 5 **or type 7**:
+
+```c
+if (nal_type == 5 || nal_type == 7)
+    return 1;
+```
+
+Type 5 is an IDR slice — genuinely independently decodable. Type 7 is an SPS, a parameter set that encoders routinely repeat alongside ordinary inter-coded frames. Any such frame was therefore flagged as a keyframe, and that flag becomes the WebCodecs chunk type on the client:
+
+```js
+type: isKeyFrame ? 'key' : 'delta'
+```
+
+Handing a decoder a delta frame labelled `'key'` is a specification violation. Chrome responds by discarding queued work — which drops already-allocated `VideoFrame`s before they ever reach the output callback and its `frame.close()`. That produces both the console warning
+
+> A VideoFrame was garbage collected without being closed. Applications should call close() on frames when done with them to prevent stalls.
+
+and a visible stall until a genuine sync point arrives. The two were reported as reliably co-occurring, which generic GC pressure would not explain.
+
+**Fix:** require an actual IDR slice. `guac_rdp_h264_is_keyframe()` now returns non-zero only for type 5, and additionally reports a bitmask of every NAL type encountered, logged at `TRACE` as `nal_types=0x...`, so the stream's real structure is visible. Bit 5 set means IDR, bit 7 SPS, bit 8 PPS, bit 1 non-IDR slice.
+
+**If nothing renders after this**, the server is not sending IDRs at all and is relying on recovery points instead; the `nal_types` mask will show it (bit 5 never set), and the keyframe gate in `004` would then need rethinking rather than reverting to the old test.
+
+**Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

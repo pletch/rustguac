@@ -1,0 +1,104 @@
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index 0fdb0533..74356f47 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -36,9 +36,38 @@
+ #include <string.h>
+ 
+ /**
+- * Check if a H.264 NAL unit buffer contains a keyframe (IDR slice or SPS).
++ * Checks whether an H.264 access unit contains an IDR slice, and optionally
++ * reports the set of NAL unit types present.
++ *
++ * Only an IDR slice (type 5) makes a frame independently decodable. An SPS
++ * (type 7) is a parameter set that encoders commonly repeat alongside ordinary
++ * inter-coded frames, so treating it as sufficient marks delta frames as
++ * keyframes. That flag becomes the WebCodecs EncodedVideoChunk type on the
++ * client, and handing a decoder a delta frame labelled "key" makes it discard
++ * queued work -- dropping already-allocated VideoFrames before they reach
++ * close(), and stalling playback until a genuine sync point arrives.
++ *
++ * @param data
++ *     The Annex B access unit to inspect.
++ *
++ * @param length
++ *     The length of data, in bytes.
++ *
++ * @param types_seen
++ *     If non-NULL, receives a bitmask of the NAL unit types encountered, where
++ *     bit N corresponds to type N. Types above 31 are not represented.
++ *
++ * @return
++ *     Non-zero if an IDR slice is present, zero otherwise.
+  */
+-static int guac_rdp_h264_is_keyframe(const BYTE* data, UINT32 length) {
++static int guac_rdp_h264_is_keyframe(const BYTE* data, UINT32 length,
++        UINT32* types_seen) {
++
++    int has_idr = 0;
++
++    if (types_seen != NULL)
++        *types_seen = 0;
++
+     for (UINT32 i = 0; i + 3 < length; i++) {
+         if (data[i] == 0 && data[i+1] == 0) {
+             int offset = -1;
+@@ -48,12 +77,16 @@ static int guac_rdp_h264_is_keyframe(const BYTE* data, UINT32 length) {
+                 offset = i + 4;
+             if (offset >= 0 && (UINT32) offset < length) {
+                 int nal_type = data[offset] & 0x1F;
+-                if (nal_type == 5 || nal_type == 7)
+-                    return 1;
++                if (types_seen != NULL && nal_type < 32)
++                    *types_seen |= (1u << nal_type);
++                if (nal_type == 5)
++                    has_idr = 1;
+             }
+         }
+     }
+-    return 0;
++
++    return has_idr;
++
+ }
+ 
+ /**
+@@ -173,6 +206,7 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+     int saved_keyframe = 0;
+     guac_rect* saved_rects = NULL;
+     int saved_num_rects = 0;
++    UINT32 saved_nal_types = 0;
+ 
+     if (cmd->codecId == RDPGFX_CODECID_AVC420 && cmd->extra != NULL) {
+         RDPGFX_AVC420_BITMAP_STREAM* avc420 =
+@@ -183,7 +217,7 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+             if (saved_h264 != NULL) {
+                 memcpy(saved_h264, avc420->data, saved_length);
+                 saved_keyframe = guac_rdp_h264_is_keyframe(
+-                        saved_h264, saved_length);
++                        saved_h264, saved_length, &saved_nal_types);
+                 saved_rects = guac_rdp_h264_copy_rects(&avc420->meta,
+                         &saved_num_rects);
+             }
+@@ -201,7 +235,7 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+             if (saved_h264 != NULL) {
+                 memcpy(saved_h264, avc444->bitstream[0].data, saved_length);
+                 saved_keyframe = guac_rdp_h264_is_keyframe(
+-                        saved_h264, saved_length);
++                        saved_h264, saved_length, &saved_nal_types);
+                 saved_rects = guac_rdp_h264_copy_rects(
+                         &avc444->bitstream[0].meta, &saved_num_rects);
+             }
+@@ -258,9 +292,11 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+             rdp_client->gdi_modified = 1;
+ 
+         guac_client_log(client, GUAC_LOG_TRACE,
+-                "H.264 passthrough: %u bytes, %s, %ux%u at %u,%u, rects=%i",
++                "H.264 passthrough: %u bytes, %s, nal_types=0x%08x, "
++                "%ux%u at %u,%u, rects=%i",
+                 saved_length,
+                 saved_keyframe ? "keyframe" : "delta",
++                saved_nal_types,
+                 cmd->width, cmd->height, cmd->left, cmd->top,
+                 saved_num_rects);
+ 
