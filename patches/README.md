@@ -344,6 +344,8 @@ Two distinct causes, both fixed by `017`:
 
 ## 018-h264-suppress-mixed-frames.patch
 
+**Superseded by `022`, which narrows this to the regions the other codec actually painted.** The whole-layer disable described below now applies only when a frame exceeds the region tracking limit.
+
 **Problem:** suppression assumes the H.264 stream is the sole source of truth for the regions it covers. That holds for a server encoding the whole surface as H.264 (xrdp), but not for one painting other content over the same area. Opening the Windows Start menu across a video region produced stale rectangles: the menu arrives as CAPROGRESSIVE, lands inside an H.264 region, and its image operations were suppressed. `017` cannot address this — the overlap is genuine rather than an artefact of accumulation.
 
 **Fix:** disable suppression for any frame that also carried non-H.264 content. `rdpgfx.c` calls `guac_display_layer_mark_mixed_codec()` for every surface command whose codec is not AVC420/AVC444/AVC444v2; the flush transfers that flag into the frame being built and clears the accumulator.
@@ -390,6 +392,52 @@ and a visible stall until a genuine sync point arrives. The two were reported as
 **If nothing renders after this**, the server is not sending IDRs at all and is relying on recovery points instead; the `nal_types` mask will show it (bit 5 never set), and the keyframe gate in `004` would then need rethinking rather than reverting to the old test.
 
 **Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
+
+## 020-h264-queue-drop-logging.patch
+
+**Diagnostic.** The H.264 frame queue is capped at 120 frames and silently discarded the oldest beyond that. Since dropping any frame breaks the reference chain until the next keyframe, a drop is a plausible cause of a visible freeze — but there was no way to tell whether it was happening. Logs at `DEBUG` when a frame is dropped and how deep the queue was.
+
+**Files patched:** `src/libguac/display-layer.c`
+
+## 021-h264-lock-wait-diagnostics.patch
+
+**Diagnostic.** `guac_display_layer_set_h264()` acquires the display's `pending_frame.lock` write lock, which the render thread holds for the whole flush — including `guac_display_plan_apply()`, which dispatches image encoding. The RDP thread therefore blocks inside `set_h264`, and that is the same thread that sends `RDPGFX_FRAME_ACKNOWLEDGE`; late acknowledgements cause the server's MS-RDPEGFX flow control to throttle, which presents as a low source frame rate rather than as a stall in guacd.
+
+Times the acquisition and logs at `DEBUG` when it exceeds 10ms. Read with:
+
+```bash
+journalctl -u rustguac-guacd --since '2 min ago' | grep "DEBUG:" \
+  | grep -oP 'H.264 set blocked \K[0-9]+' | sort -n | uniq -c | tail
+```
+
+Note that guacd messages are journalled three times; filter on the level prefix before counting anything.
+
+**Files patched:** `src/libguac/display-layer.c`
+
+## 022-h264-mixed-codec-regions.patch
+
+**Problem:** `018` disables suppression for the entire layer whenever a frame carries any non-H.264 content. That is far broader than the defect it fixed. xrdp's `gfx.toml` commonly lists `order = ["H.264", "RFX"]`, so an xrdp session emitting even one RFX or uncompressed command per frame loses suppression on every frame — restoring the full JPEG/WebP encoding cost that `011` exists to eliminate. This was observed as guacd CPU returning to pre-`011` levels on an otherwise unchanged xrdp session.
+
+The actual requirement is only that non-H.264 content not be suppressed **where it lands**. `013`/`014` already track regions per frame, so the same machinery answers the narrower question.
+
+**Fix:** record the region of every non-H.264 surface command instead of a bare flag. `guac_display_layer_mark_mixed_codec()` now takes a `guac_rect` and appends it (de-duplicated) to a per-layer pending array; the flush drains that array into the frame being built; `guac_display_plan_apply()` suppresses an IMG operation only if it falls within an H.264 region **and** intersects none of the mixed regions.
+
+A Windows Start menu opened over a video still renders — its CAPROGRESSIVE region is exempt — while the video area around it stays suppressed. An xrdp session with a small RFX region per frame keeps suppression everywhere else.
+
+**Locking.** The regions are written by the protocol thread and read by the render thread, so unlike `018`'s single flag they need real mutual exclusion; a torn read would yield a bogus rectangle and, if it under-covered, a permanently stale region — exactly the class of bug this exists to prevent. The lock is a new per-layer `mixed_rect_lock`, deliberately **not** the display's `pending_frame.lock`: the render thread holds that one across the whole flush, so taking it per surface command would block the RDP thread and delay EGFX frame acknowledgement (see `021`). `mixed_rect_lock` is held only for the few instructions needed to append or drain.
+
+**Overflow.** Beyond 32 distinct regions in a frame, suppression is disabled for the whole layer for that frame — i.e. it degrades to `018`'s behaviour. A frame painting that many distinct regions with another codec has little left for H.264 to cover, so there is scant saving to protect.
+
+**Files patched:**
+
+| File | Change |
+|------|-----|
+| `src/libguac/display-priv.h` | Replace `h264_mixed_pending` with `mixed_rects_pending` / count / overflow; add `mixed_rects`, `mixed_rect_count`, `mixed_rect_lock` |
+| `src/libguac/guacamole/display.h` | `guac_display_layer_mark_mixed_codec()` gains a `guac_rect` parameter |
+| `src/libguac/display-layer.c` | Record regions under the new lock; de-duplicate; flag overflow |
+| `src/libguac/display-layer-list.c` | Init/destroy `mixed_rect_lock` |
+| `src/libguac/display-plan.c` | Drain regions per frame; add `guac_display_layer_mixed_covers()`; extend the suppression test |
+| `src/protocols/rdp/channels/rdpgfx.c` | Pass the surface command's rect when marking |
 
 ## Applying patches
 
