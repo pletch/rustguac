@@ -1478,10 +1478,19 @@ Guacamole.Client = function(tunnel) {
             // sized, so a server mixing codecs leaves the remainder holding no
             // meaningful content. A count of zero (or an older guacd that
             // sends no count at all) means the whole picture is valid.
+            // Which view this access unit carries. 0 is a displayable picture
+            // (AVC420, or the main view of AVC444); 1 and 2 are the auxiliary
+            // chroma views of AVC444 in its v1 and v2 layouts. An auxiliary
+            // view is not an image and must not be drawn, but it must still be
+            // decoded: both views belong to one H.264 sequence, and skipping
+            // either leaves later pictures referencing data the decoder never
+            // received.
+            var view = parameters.length > 7 ? parseInt(parameters[7]) : 0;
+
             var rects = [];
-            var numRects = parameters.length > 7 ? parseInt(parameters[7]) : 0;
+            var numRects = parameters.length > 8 ? parseInt(parameters[8]) : 0;
             for (var r = 0; r < numRects; r++) {
-                var base = 8 + r * 4;
+                var base = 9 + r * 4;
                 if (base + 3 >= parameters.length)
                     break;
                 rects.push({
@@ -1562,7 +1571,7 @@ Guacamole.Client = function(tunnel) {
                     display.drawH264(
                         layer, guac_client._h264Decoder,
                         x, y, width, height,
-                        bytes.buffer, isKeyFrame, rects
+                        bytes.buffer, isKeyFrame, rects, view
                     );
                 } catch (e) {
                     if (typeof console !== 'undefined')

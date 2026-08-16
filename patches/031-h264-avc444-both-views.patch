@@ -1,0 +1,368 @@
+diff --git a/src/libguac/display-layer.c b/src/libguac/display-layer.c
+index 08b0337c..b19f80eb 100644
+--- a/src/libguac/display-layer.c
++++ b/src/libguac/display-layer.c
+@@ -377,7 +377,7 @@ void guac_display_layer_mark_mixed_codec(guac_display_layer* layer,
+ void guac_display_layer_set_h264(guac_display_layer* layer,
+         const unsigned char* data, uint32_t length, int is_keyframe,
+         int x, int y, int width, int height,
+-        const guac_rect* rects, int num_rects) {
++        const guac_rect* rects, int num_rects, int view) {
+ 
+     int dropped = 0;
+ 
+@@ -390,6 +390,7 @@ void guac_display_layer_set_h264(guac_display_layer* layer,
+     memcpy(frame->data, data, length);
+     frame->length = length;
+     frame->is_keyframe = is_keyframe;
++    frame->view = view;
+     guac_rect_init(&frame->rect, x, y, width, height);
+     frame->next = NULL;
+ 
+diff --git a/src/libguac/display-plan.c b/src/libguac/display-plan.c
+index 554d8d86..b6bb8036 100644
+--- a/src/libguac/display-plan.c
++++ b/src/libguac/display-plan.c
+@@ -418,7 +418,14 @@ static void guac_display_plan_send_h264_frame(guac_client* client,
+     /* Build h264 instruction:
+      *
+      *   h264 <stream> <layer> <keyframe> <x> <y> <width> <height>
+-     *        <numrects> [<x> <y> <width> <height>]...
++     *        <view> <numrects> [<x> <y> <width> <height>]...
++     *
++     * <view> identifies what the access unit carries: 0 is a displayable
++     * picture (AVC420, or the main view of AVC444), 1 and 2 are the auxiliary
++     * chroma views of AVC444 in its v1 and v2 layouts. An auxiliary view is
++     * not an image and MUST NOT be drawn, but it MUST still be decoded: both
++     * views belong to one H.264 sequence, and skipping either leaves later
++     * pictures referencing data the decoder never received.
+      *
+      * The trailing region rects identify which parts of the decoded picture
+      * are actually valid. A client MUST draw only those regions; the picture
+@@ -442,6 +449,7 @@ static void guac_display_plan_send_h264_frame(guac_client* client,
+     for (int i = 0; i < 7; i++)
+         guac_h264_write_arg(socket, header[i]);
+ 
++    guac_h264_write_arg(socket, frame->view);
+     guac_h264_write_arg(socket, frame->num_rects);
+ 
+     for (int i = 0; i < frame->num_rects; i++) {
+@@ -606,6 +614,13 @@ static int guac_display_plan_flush_h264(guac_client* client,
+          * only the last one determines the final state of the H.264 area;
+          * regions covered solely by earlier frames must still receive their
+          * image updates. */
++        /* Only a displayable view establishes what the H.264 stream covers.
++         * An auxiliary view paints nothing on its own, so suppressing image
++         * operations against its regions would discard content nothing else
++         * replaces. */
++        if (frame->view != GUAC_H264_VIEW_MAIN)
++            goto sent;
++
+         layer->h264_rect_count = 0;
+ 
+         if (frame->num_rects > 0) {
+@@ -615,6 +630,8 @@ static int guac_display_plan_flush_h264(guac_client* client,
+         else
+             guac_display_layer_add_h264_rect(layer, &frame->rect);
+ 
++sent:
++
+         if (frame->is_keyframe)
+             layer->h264_keyframe_sent = 1;
+ 
+diff --git a/src/libguac/display-priv.h b/src/libguac/display-priv.h
+index 449aebf3..f9dfa2ba 100644
+--- a/src/libguac/display-priv.h
++++ b/src/libguac/display-priv.h
+@@ -343,6 +343,15 @@ struct guac_h264_frame {
+     uint32_t length;
+     int is_keyframe;
+ 
++    /**
++     * Which view of the H.264 stream this access unit carries, as one of the
++     * GUAC_H264_VIEW_* constants. AVC444 encodes a picture as two views within
++     * a single H.264 sequence, and both must reach the client's decoder in
++     * order or its reference chain breaks -- but only the main view is a
++     * displayable image.
++     */
++    int view;
++
+     /**
+      * The bounds of the surface this frame decodes to. Retained for logging
+      * and as a fallback when the server supplies no region rects.
+diff --git a/src/libguac/guacamole/display.h b/src/libguac/guacamole/display.h
+index d3bf7839..0ac4676a 100644
+--- a/src/libguac/guacamole/display.h
++++ b/src/libguac/guacamole/display.h
+@@ -461,6 +461,25 @@ void guac_display_free_layer(guac_display_layer* display_layer);
+  * @param num_rects
+  *     The number of entries in rects, or zero if rects is NULL.
+  */
++/**
++ * An ordinary AVC420 access unit, or the main view of an AVC444 stream. A
++ * complete YUV420 picture, displayable as-is.
++ */
++#define GUAC_H264_VIEW_MAIN 0
++
++/**
++ * The auxiliary view of an AVC444 stream, in the v1 chroma layout. Not an
++ * image: its planes carry chroma samples that refine the main view to 4:4:4.
++ * It must still be decoded, since it is part of the same H.264 sequence and
++ * later pictures reference it.
++ */
++#define GUAC_H264_VIEW_CHROMA_V1 1
++
++/**
++ * The auxiliary view of an AVC444 stream, in the v2 chroma layout.
++ */
++#define GUAC_H264_VIEW_CHROMA_V2 2
++
+ /**
+  * Records a region of the given layer that received content encoded with a
+  * codec other than H.264 during the frame currently being accumulated. Image
+@@ -485,7 +504,7 @@ void guac_display_layer_mark_mixed_codec(guac_display_layer* layer,
+ void guac_display_layer_set_h264(guac_display_layer* layer,
+         const unsigned char* data, uint32_t length, int is_keyframe,
+         int x, int y, int width, int height,
+-        const guac_rect* rects, int num_rects);
++        const guac_rect* rects, int num_rects, int view);
+ 
+ /**
+  * Returns a layer representing the current mouse cursor icon. Changes to the
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index 7cf201e7..a987fc37 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -211,51 +211,51 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+     /* Save H.264 NAL data BEFORE calling the original handler. The original
+      * GDI handler may free or modify cmd->extra data during AVC decoding,
+      * so we must copy it while it's still valid. */
+-    unsigned char* saved_h264 = NULL;
+-    UINT32 saved_length = 0;
+-    int saved_keyframe = 0;
+-    guac_rect* saved_rects = NULL;
+-    int saved_num_rects = 0;
++    /* An AVC444 command carries two views in one H.264 sequence, so a single
++     * surface command can yield two access units that must both reach the
++     * client, in order. */
++    unsigned char* saved_h264[2] = { NULL, NULL };
++    UINT32 saved_length[2] = { 0, 0 };
++    int saved_keyframe[2] = { 0, 0 };
++    guac_rect* saved_rects[2] = { NULL, NULL };
++    int saved_num_rects[2] = { 0, 0 };
++    int saved_view[2] = { GUAC_H264_VIEW_MAIN, GUAC_H264_VIEW_MAIN };
++    int saved_count = 0;
+     UINT32 saved_nal_types = 0;
+ 
+     if (cmd->codecId == RDPGFX_CODECID_AVC420 && cmd->extra != NULL) {
+         RDPGFX_AVC420_BITMAP_STREAM* avc420 =
+                 (RDPGFX_AVC420_BITMAP_STREAM*) cmd->extra;
+         if (avc420->data != NULL && avc420->length > 0) {
+-            saved_length = avc420->length;
+-            saved_h264 = malloc(saved_length);
+-            if (saved_h264 != NULL) {
+-                memcpy(saved_h264, avc420->data, saved_length);
+-                saved_keyframe = guac_rdp_h264_is_keyframe(
+-                        saved_h264, saved_length, &saved_nal_types);
+-                saved_rects = guac_rdp_h264_copy_rects(&avc420->meta,
+-                        &saved_num_rects);
++            saved_length[0] = avc420->length;
++            saved_h264[0] = malloc(saved_length[0]);
++            if (saved_h264[0] != NULL) {
++                memcpy(saved_h264[0], avc420->data, saved_length[0]);
++                saved_keyframe[0] = guac_rdp_h264_is_keyframe(
++                        saved_h264[0], saved_length[0], &saved_nal_types);
++                saved_rects[0] = guac_rdp_h264_copy_rects(&avc420->meta,
++                        &saved_num_rects[0]);
++                saved_view[0] = GUAC_H264_VIEW_MAIN;
++                saved_count = 1;
+             }
+         }
+     }
+-    /* AVC444 is never passed through, whatever its LC field says.
++    /* AVC444 encodes a picture as two views inside ONE H.264 sequence, and
++     * FreeRDP decodes both through the same H264_CONTEXT. Both must therefore
++     * reach the client's decoder, in order: dropping either leaves later
++     * pictures referencing data it never received, which renders as blocky
++     * wrongly-coloured macroblocks and reports no decode error, because the
++     * bitstream that does arrive is well formed.
+      *
+-     * The two bitstreams are not independent streams. FreeRDP decodes both
+-     * through the SAME H264_CONTEXT (avc444_process_rects() calls
+-     * h264->subsystem->Decompress() on each in turn), because they are one
+-     * H.264 sequence whose pictures alternate between the main view and the
+-     * auxiliary view. Forwarding only bitstream[0] therefore removes every
+-     * auxiliary picture from the middle of that sequence, and the client
+-     * decodes subsequent pictures against references it never received. The
+-     * result is blocky, wrongly coloured macroblocks -- not an error the
+-     * decoder reports, since the bitstream it receives is well formed.
++     * Only the main view is a displayable image. The auxiliary view carries
++     * chroma samples that refine it to 4:4:4; it is tagged so the client
++     * decodes it for its references and either merges or discards it.
+      *
+-     * Earlier revisions tried forwarding luma-only (LC=1) frames and then
+-     * luma for both LC=0 and LC=1. Both corrupt the display for the same
+-     * reason: there is no subset of this sequence that stands alone.
+-     *
+-     * Passing AVC444 through would require forwarding both bitstreams,
+-     * decoding them in order through one decoder, and reconstructing YUV444
+-     * from the two views in the browser (MS-RDPEGFX 3.3.8.3.2). That is not
+-     * implemented, so these commands take the normal decode path and are
+-     * re-encoded as images: correct, at the cost of the passthrough.
+-     *
+-     * LC is logged at TRACE purely as a diagnostic. */
++     * LC (FreeRDP's op) says which bitstreams are present:
++     *   0  main view in bitstream[0], chroma in bitstream[1]
++     *   1  main view in bitstream[0]
++     *   2  chroma in bitstream[0]
++     */
+     else if ((cmd->codecId == RDPGFX_CODECID_AVC444
+            || cmd->codecId == RDPGFX_CODECID_AVC444v2)
+            && cmd->extra != NULL) {
+@@ -263,18 +263,51 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+         RDPGFX_AVC444_BITMAP_STREAM* avc444 =
+                 (RDPGFX_AVC444_BITMAP_STREAM*) cmd->extra;
+ 
++        int chroma_view = (cmd->codecId == RDPGFX_CODECID_AVC444)
++                ? GUAC_H264_VIEW_CHROMA_V1 : GUAC_H264_VIEW_CHROMA_V2;
++
+         guac_client_log(client, GUAC_LOG_TRACE, "AVC444 LC=%u", avc444->LC);
+ 
+-        static int warned = 0;
+-        if (!warned) {
+-            warned = 1;
+-            guac_client_log(client, GUAC_LOG_WARNING,
+-                    "Server is sending AVC444; H.264 passthrough is not "
+-                    "possible for it and those commands are decoded and "
+-                    "re-encoded instead. Set AVC444ModePreferred to 0 on the "
+-                    "RDP host for AVC420 -- but note that some hosts only "
+-                    "engage their hardware H.264 encoder in AVC444 mode, so "
+-                    "check that encoding is still accelerated afterwards.");
++        /* bitstream[0]: main view for LC 0 and 1, chroma for LC 2 */
++        if (avc444->bitstream[0].data != NULL
++                && avc444->bitstream[0].length > 0) {
++
++            saved_length[0] = avc444->bitstream[0].length;
++            saved_h264[0] = malloc(saved_length[0]);
++
++            if (saved_h264[0] != NULL) {
++                memcpy(saved_h264[0], avc444->bitstream[0].data,
++                        saved_length[0]);
++                saved_keyframe[0] = guac_rdp_h264_is_keyframe(
++                        saved_h264[0], saved_length[0], &saved_nal_types);
++                saved_rects[0] = guac_rdp_h264_copy_rects(
++                        &avc444->bitstream[0].meta, &saved_num_rects[0]);
++                saved_view[0] = (avc444->LC == 2)
++                        ? chroma_view : GUAC_H264_VIEW_MAIN;
++                saved_count = 1;
++            }
++
++        }
++
++        /* bitstream[1]: the chroma view, present only for LC 0 */
++        if (avc444->LC == 0 && saved_count == 1
++                && avc444->bitstream[1].data != NULL
++                && avc444->bitstream[1].length > 0) {
++
++            saved_length[1] = avc444->bitstream[1].length;
++            saved_h264[1] = malloc(saved_length[1]);
++
++            if (saved_h264[1] != NULL) {
++                memcpy(saved_h264[1], avc444->bitstream[1].data,
++                        saved_length[1]);
++                saved_keyframe[1] = guac_rdp_h264_is_keyframe(
++                        saved_h264[1], saved_length[1], NULL);
++                saved_rects[1] = guac_rdp_h264_copy_rects(
++                        &avc444->bitstream[1].meta, &saved_num_rects[1]);
++                saved_view[1] = chroma_view;
++                saved_count = 2;
++            }
++
+         }
+ 
+     }
+@@ -290,7 +323,7 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+      * ID: an AVC420 command whose capture failed, or an AVC444 command with
+      * both bitstreams, reaches the client only as a re-encoded image, and
+      * suppression must not discard it. */
+-    if (saved_h264 == NULL) {
++    if (saved_count == 0) {
+ 
+         guac_rect mixed;
+         guac_rect_init(&mixed, cmd->left, cmd->top,
+@@ -317,7 +350,7 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+      * Otherwise, run the normal GDI decode — this calls BeginPaint/EndPaint
+      * internally, updates the pixel buffer, and marks the dirty region. Must
+      * happen after we've saved the H.264 data above. */
+-    int skip_decode = (saved_h264 != NULL) && guac_rdp_h264_skip_decode();
++    int skip_decode = (saved_count > 0) && guac_rdp_h264_skip_decode();
+ 
+     if (!skip_decode) {
+         pcRdpgfxSurfaceCommand orig =
+@@ -350,13 +383,17 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+     /* Store saved H.264 data on the display layer for passthrough.
+      * guac_display_layer_set_h264 acquires pending_frame.lock internally,
+      * which is safe since EndPaint has already released it above. */
+-    if (saved_h264 != NULL) {
++    if (saved_count > 0) {
+         guac_display_layer* default_layer =
+                 guac_display_default_layer(rdp_client->display);
+-        guac_display_layer_set_h264(default_layer,
+-                saved_h264, saved_length, saved_keyframe,
+-                cmd->left, cmd->top, cmd->width, cmd->height,
+-                saved_rects, saved_num_rects);
++
++        /* Queued in capture order, which is the order the views occupy in the
++         * H.264 sequence. The queue preserves it through to the wire. */
++        for (int i = 0; i < saved_count; i++)
++            guac_display_layer_set_h264(default_layer,
++                    saved_h264[i], saved_length[i], saved_keyframe[i],
++                    cmd->left, cmd->top, cmd->width, cmd->height,
++                    saved_rects[i], saved_num_rects[i], saved_view[i]);
+ 
+         /* With the decode skipped, guac_rdp_gdi_end_paint() never runs, so
+          * nothing marks the display as modified and the queued frames would
+@@ -371,22 +408,29 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+         if (skip_decode)
+             rdp_client->gdi_modified = 1;
+ 
+-        guac_client_log(client, GUAC_LOG_TRACE,
+-                "H.264 passthrough: %u bytes, %s, nal_types=0x%08x, "
+-                "%ux%u at %u,%u, rects=%i",
+-                saved_length,
+-                saved_keyframe ? "keyframe" : "delta",
+-                saved_nal_types,
+-                cmd->width, cmd->height, cmd->left, cmd->top,
+-                saved_num_rects);
++        for (int i = 0; i < saved_count; i++) {
+ 
+-        if (saved_num_rects > 0)
+             guac_client_log(client, GUAC_LOG_TRACE,
+-                    "H.264 first region: %ix%i at %i,%i",
+-                    guac_rect_width(&saved_rects[0]),
+-                    guac_rect_height(&saved_rects[0]),
+-                    saved_rects[0].left, saved_rects[0].top);
+-        free(saved_h264);
++                    "H.264 passthrough: view=%i, %u bytes, %s, "
++                    "nal_types=0x%08x, %ux%u at %u,%u, rects=%i",
++                    saved_view[i], saved_length[i],
++                    saved_keyframe[i] ? "keyframe" : "delta",
++                    saved_nal_types,
++                    cmd->width, cmd->height, cmd->left, cmd->top,
++                    saved_num_rects[i]);
++
++            free(saved_h264[i]);
++
++        }
++
++    }
++
++    /* Any view that was captured but not queued must still be released */
++    else {
++        for (int i = 0; i < 2; i++) {
++            free(saved_h264[i]);
++            free(saved_rects[i]);
++        }
+     }
+ 
+     free(saved_rects);

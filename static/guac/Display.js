@@ -1028,7 +1028,7 @@ Guacamole.Display = function() {
      *     supplied them.
      */
     this.drawH264 = function(layer, decoder, x, y, width, height, nalData,
-            isKeyFrame, rects) {
+            isKeyFrame, rects, view) {
 
         var token = null;
 
@@ -1041,7 +1041,7 @@ Guacamole.Display = function() {
          * required either way, or this frame and every frame behind it stalls
          * in the queue. */
         token = decoder.decode(layer, x, y, width, height, nalData,
-                isKeyFrame, rects, task.unblock);
+                isKeyFrame, rects, task.unblock, view);
 
     };
 

@@ -220,6 +220,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     this.bitmapFailures = 0;
 
+    /**
+     * Auxiliary AVC444 views decoded for their references but not drawn. On a
+     * server sending AVC444 this tracks roughly the main-view count; on one
+     * sending AVC420 it stays at zero.
+     *
+     * @type {number}
+     */
+    this.auxViewsDecoded = 0;
+
     var frameRegistry = (typeof FinalizationRegistry !== 'undefined')
         ? new FinalizationRegistry(function(state) {
             if (!state.closed) {
@@ -442,7 +451,27 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                  * An ImageBitmap is an ordinary GPU-backed resource with no
                  * such pool, so any number can be held while ordering is
                  * preserved. The cost is one copy per frame. */
-                if (pos) {
+                /* An auxiliary AVC444 view is not an image. It had to be
+                 * decoded to keep the sequence's reference chain intact, but
+                 * drawing it would paint packed chroma data over the screen.
+                 * Release it and let its task through. */
+                if (pos && pos.view !== 0) {
+
+                    frame.close();
+                    frameState.closed = true;
+                    self.framesClosed++;
+                    self.auxViewsDecoded++;
+
+                    if (pos.watchdog) {
+                        clearTimeout(pos.watchdog);
+                        pos.watchdog = null;
+                    }
+                    if (pos.onReady)
+                        pos.onReady();
+
+                }
+
+                else if (pos) {
 
                     createImageBitmap(frame).then(function(bitmap) {
 
@@ -545,7 +574,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *     the full surface.
      */
     this.decode = function(layer, x, y, width, height, nalData, isKeyFrame,
-            rects, onReady) {
+            rects, onReady, view) {
 
         ensureDecoder(width, height);
 
@@ -578,6 +607,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 rects: (rects && rects.length) ? rects : null,
                 t: performance.now(),
                 onReady: onReady,
+                view: view || 0,
                 bitmap: null
             };
             pendingDecodes++;
@@ -873,6 +903,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             gcLeaks: self.gcLeaks,
             watchdogFires: self.watchdogFires,
             bitmapFailures: self.bitmapFailures,
+            auxViewsDecoded: self.auxViewsDecoded,
             decoderInstances: self.decoderInstances,
 
             /* Main-thread blocking. A freeze with no long tasks is not a

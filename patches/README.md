@@ -610,6 +610,33 @@ Filter bit order follows `rdpgfx_is_capability_filtered()`: `V8, V8.1, V10, V10.
 
 **Files patched:** `src/protocols/rdp/channels/rdpgfx.c`, `src/protocols/rdp/rdp.h`, `src/protocols/rdp/settings.c`
 
+## 031-h264-avc444-both-views.patch
+
+**Step 1 of AVC444 passthrough.** `028` established that AVC444 cannot be forwarded by sending the main view alone, because both views are one H.264 sequence and dropping pictures breaks references. `030` then established that Windows ignores the `AVC_THINCLIENT` request and sends AVC444 anyway (caps V10.7 confirmed with flag `0x40` set), so on a host where `AVC444ModePreferred=1` is what enables the hardware encoder, AVC444 is what we get.
+
+The way through is to forward **every** picture and let the client decode all of them, drawing only the displayable one.
+
+**Wire format** gains a view field:
+
+```
+h264 <stream> <layer> <keyframe> <x> <y> <width> <height>
+     <view> <numrects> [<x> <y> <width> <height>]...
+```
+
+| view | meaning |
+|------|---------|
+| 0 | displayable picture -- AVC420, or the main view of AVC444 |
+| 1 | AVC444 auxiliary chroma view, v1 layout |
+| 2 | AVC444 auxiliary chroma view, v2 layout |
+
+**Server:** a single AVC444 surface command now yields up to two queued access units, in sequence order -- `LC=0` sends the main view then the chroma view, `LC=1` sends the main view, `LC=2` sends the chroma view. Only a main-view frame establishes the regions that image operations may be suppressed against; an auxiliary view paints nothing, so suppressing against it would discard content nothing replaces.
+
+**Client:** decodes every view, and for a non-zero view closes the frame without drawing, counted as `auxViewsDecoded`. The reference chain stays whole and the picture is correct, with chroma at 4:2:0 because the auxiliary view's contribution is discarded rather than merged.
+
+**Step 2 (not in this patch)** is the 4:4:4 merge: take the raw I420 planes of both decoded frames via `VideoFrame.copyTo()` and combine them per MS-RDPEGFX 3.3.8.3.2 (`general_ChromaV1ToYUV444` / `general_ChromaV2ToYUV444` in FreeRDP's `prim_YUV.c`). It must operate on planes -- the auxiliary view is not an image, so letting the browser convert it to RGB destroys the chroma samples it carries.
+
+**Files patched:** `src/libguac/guacamole/display.h`, `src/libguac/display-priv.h`, `src/libguac/display-layer.c`, `src/libguac/display-plan.c`, `src/protocols/rdp/channels/rdpgfx.c`
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:
