@@ -1,8 +1,8 @@
 diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
-index 43948b42..252d431d 100644
+index 43948b42..7cf201e7 100644
 --- a/src/protocols/rdp/channels/rdpgfx.c
 +++ b/src/protocols/rdp/channels/rdpgfx.c
-@@ -394,6 +394,57 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+@@ -394,6 +394,59 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
      return result;
  }
  
@@ -57,10 +57,12 @@ index 43948b42..252d431d 100644
 +
 +    return CHANNEL_RC_OK;
 +
++}
++
  /**
   * Callback which associates handlers specific to Guacamole with the
   * RdpgfxClientContext instance allocated by FreeRDP to deal with received
-@@ -440,12 +491,17 @@ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
+@@ -440,6 +493,9 @@ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
          rdp_client->orig_surface_command = (void*) rdpgfx->SurfaceCommand;
          rdpgfx->SurfaceCommand = guac_rdp_gfx_surface_command;
  
@@ -70,14 +72,6 @@ index 43948b42..252d431d 100644
          guac_client_log(client, GUAC_LOG_INFO,
                  "H.264 passthrough enabled for RDPGFX channel.");
      }
- 
- }
- 
-+}
-+
- /**
-  * Callback which handles any RDPGFX cleanup specific to Guacamole.
-  *
 diff --git a/src/protocols/rdp/rdp.h b/src/protocols/rdp/rdp.h
 index a0893ffb..82ca5a1d 100644
 --- a/src/protocols/rdp/rdp.h
@@ -98,7 +92,7 @@ index a0893ffb..82ca5a1d 100644
       * Queue of mouse, keyboard, and touch events. These events are accumulated
       * and flushed within the RDP client thread to avoid spending excessive
 diff --git a/src/protocols/rdp/settings.c b/src/protocols/rdp/settings.c
-index 4dadb3bc..ff4c4f2f 100644
+index 4dadb3bc..7abf484f 100644
 --- a/src/protocols/rdp/settings.c
 +++ b/src/protocols/rdp/settings.c
 @@ -1616,6 +1616,39 @@ int guac_rdp_get_depth(freerdp* rdp) {
@@ -161,3 +155,20 @@ index 4dadb3bc..ff4c4f2f 100644
              if (avc444 && avc420_only)
                  guac_client_log(client, GUAC_LOG_INFO,
                          "Advertising AVC444 to reach the RDPGFX V10 capability "
+@@ -2024,14 +2070,14 @@ void guac_rdp_push_settings(guac_client* client,
+     guac_client_log(client, GUAC_LOG_INFO,
+             "RDP graphics settings: gfx=%s, h264=%s",
+             guac_settings->enable_gfx ? "enabled" : "disabled",
+-            settings->enable_h264 ? "enabled" : "disabled");
++            guac_settings->enable_h264 ? "enabled" : "disabled");
+ 
+     /* Enable RemoteFX / Graphics Pipeline */
+     if (guac_settings->enable_gfx) {
+ 
+         rdp_settings->SupportGraphicsPipeline = TRUE;
+         rdp_settings->RemoteFxCodec = TRUE;
+-        if (settings->enable_h264) {
++        if (guac_settings->enable_h264) {
+ 
+             int avc444 = guac_rdp_h264_avc444_diagnostic();
+ 
