@@ -1511,28 +1511,46 @@ Guacamole.Client = function(tunnel) {
 
             guac_client._h264Decoder.instructionsReceived++;
 
-            // Collect base64 blob data
-            var base64Data = '';
-            stream.onblob = function(data) {
-                base64Data += data;
+            // Collect NAL unit data. Guacamole.ArrayBufferReader decodes each
+            // blob to an ArrayBuffer as it arrives, so the chunks can simply be
+            // concatenated at the end.
+            //
+            // The obvious implementation -- accumulating a base64 string and
+            // running atob() plus a charCodeAt() loop at the end -- allocates
+            // repeatedly while the string grows, then a second full-size
+            // string, then walks it one character at a time. At 30fps with
+            // frames of tens of kilobytes that is a large, sustained garbage
+            // rate, and the resulting GC pauses show up as decode-latency
+            // spikes and dropped frames.
+            var chunks = [];
+            var totalLength = 0;
+
+            var reader = new Guacamole.ArrayBufferReader(stream);
+
+            reader.ondata = function(buffer) {
+                chunks.push(new Uint8Array(buffer));
+                totalLength += buffer.byteLength;
             };
 
-            stream.onend = function() {
+            reader.onend = function() {
 
                 guac_client._h264Decoder.streamsEnded++;
 
-                if (!base64Data) {
+                if (!totalLength) {
                     guac_client._h264Decoder.emptyStreams++;
                     return;
                 }
 
-                // Decode base64 to ArrayBuffer
                 try {
-                    var binaryString = atob(base64Data);
-                    var bytes = new Uint8Array(binaryString.length);
-                    for (var i = 0; i < binaryString.length; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
+
+                    // Single allocation, then a bulk copy per chunk
+                    var bytes = new Uint8Array(totalLength);
+                    var offset = 0;
+                    for (var i = 0; i < chunks.length; i++) {
+                        bytes.set(chunks[i], offset);
+                        offset += chunks[i].length;
                     }
+                    chunks = null;
 
                     // Feed to H.264 decoder
                     guac_client._h264Decoder.decode(
@@ -1541,7 +1559,7 @@ Guacamole.Client = function(tunnel) {
                     );
                 } catch (e) {
                     if (typeof console !== 'undefined')
-                        console.error('[rustguac] H.264 base64 decode error:', e);
+                        console.error('[rustguac] H.264 stream decode error:', e);
                 }
             };
 
