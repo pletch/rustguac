@@ -462,6 +462,28 @@ For RDP that protocol thread is the one processing EGFX PDUs, and FreeRDP sends 
 | `src/libguac/display-plan.c` | Detach the queue under the lock, send outside it; drop the unlocked empty-queue pre-check |
 | `src/libguac/display-layer-list.c` | Init/destroy `h264_queue_lock` |
 
+## 024-h264-stall-location.patch
+
+**Diagnostic.** Sessions against Windows freeze for ~6 seconds at a time. Measurement narrowed it considerably: the browser is idle and loses nothing (`gcLeaks` 0, one 105ms long task in a whole session, 1.6ms decodes), no socket is backpressured (`Send-Q` 0 on both the guacd->rustguac and rustguac->browser legs), and guacd's flush sizes stay at 1-2 frames throughout -- so no frames were queued during a stall. guacd was idle, not busy: nothing arrived to send.
+
+That leaves two possibilities, needing opposite fixes: the server stopped sending, or guacd's RDP thread stopped taking commands off the wire. This patch separates them.
+
+- **Inter-arrival gap.** Logs at `DEBUG` when 500ms or more passes between surface commands, measured as each is taken off the wire. A gap here means the server sent nothing.
+- **GDI decode duration.** Logs at `DEBUG` when the original FreeRDP handler takes 50ms or more. That handler calls `BeginPaint`/`EndPaint`, which take the display's `pending_frame` write lock -- the lock the render thread holds across a flush. `023` removed that dependency from the H.264 queueing path, but every **non-H.264** surface command still passes through here, and on Windows that is ~62% of them (CAPROGRESSIVE). This thread also sends `RDPGFX_FRAME_ACKNOWLEDGE`, so time spent blocked here throttles the server.
+
+xrdp never enters the second path, which is consistent with it being unaffected.
+
+**Reading it:**
+
+```bash
+journalctl -u rustguac-guacd --since '3 min ago' | grep "DEBUG:" \
+  | grep -E "since the previous surface command|GDI decode of codec"
+```
+
+Long GDI decodes immediately before each arrival gap mean guacd stalled the server. Arrival gaps with no long decode mean the server paused on its own.
+
+**Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

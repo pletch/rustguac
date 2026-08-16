@@ -1,0 +1,65 @@
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index 77aa3f92..ca0cb8a4 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -204,6 +204,29 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+             cmd->surfaceId, cmd->codecId,
+             cmd->width, cmd->height, cmd->left, cmd->top);
+ 
++    /* Time since the previous surface command on this connection. The freeze
++     * has two possible locations and they call for opposite fixes: either the
++     * server stopped sending, or guacd stopped processing what it sent. A gap
++     * logged here is measured at the moment a command is taken off the wire,
++     * so a large one means nothing arrived -- guacd was idle, not busy.
++     *
++     * Static rather than per-connection: guacd forks a process per connection,
++     * so this is already private to this session. */
++    {
++        static guac_timestamp last_command = 0;
++        guac_timestamp now = guac_timestamp_current();
++
++        if (last_command != 0) {
++            int gap = (int) (now - last_command);
++            if (gap >= 500)
++                guac_client_log(client, GUAC_LOG_DEBUG,
++                        "GFX: %ims since the previous surface command. The "
++                        "server sent nothing during that time.", gap);
++        }
++
++        last_command = now;
++    }
++
+     /* Save H.264 NAL data BEFORE calling the original handler. The original
+      * GDI handler may free or modify cmd->extra data during AVC decoding,
+      * so we must copy it while it's still valid. */
+@@ -269,8 +292,29 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+     if (!skip_decode) {
+         pcRdpgfxSurfaceCommand orig =
+                 (pcRdpgfxSurfaceCommand) rdp_client->orig_surface_command;
+-        if (orig != NULL)
++        if (orig != NULL) {
++
++            /* Time the GDI decode. It calls BeginPaint/EndPaint, which take
++             * the display's pending frame write lock -- the same lock the
++             * render thread holds for the duration of a flush, including the
++             * dispatch of image encoding. Patch 023 removed this dependency
++             * from the H.264 queueing path, but every non-H.264 surface
++             * command still passes through here, and on a server that mixes
++             * codecs that is most of them.
++             *
++             * This thread is the one that sends RDPGFX_FRAME_ACKNOWLEDGE, so
++             * time spent blocked here throttles the server. */
++            guac_timestamp decode_start = guac_timestamp_current();
+             result = orig(context, cmd);
++            int decode_time = (int) (guac_timestamp_current() - decode_start);
++
++            if (decode_time >= 50)
++                guac_client_log(client, GUAC_LOG_DEBUG,
++                        "GFX: GDI decode of codec %u took %ims. The RDP thread "
++                        "cannot acknowledge frames while inside it.",
++                        cmd->codecId, decode_time);
++
++        }
+     }
+ 
+     /* Store saved H.264 data on the display layer for passthrough.
