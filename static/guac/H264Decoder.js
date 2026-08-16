@@ -373,47 +373,40 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 }
                 lastOutputTime = now;
 
-                try {
-                    var pos = pendingPositions[frame.timestamp];
-                    delete pendingPositions[frame.timestamp];
-                    if (pos && pos.t !== undefined) {
-                        var latency = performance.now() - pos.t;
-                        self.lastDecodeLatency = latency;
-                        if (latency > self.peakDecodeLatency)
-                            self.peakDecodeLatency = latency;
-                        decodeLatencySum += latency;
-                        decodeLatencyCount++;
-                    }
-                    if (pos && pos.layer) {
-                        var canvas = pos.layer.getCanvas();
-                        var ctx = canvas.getContext('2d');
+                var pos = pendingPositions[frame.timestamp];
 
-                        // Draw only the regions the server marked valid. The
-                        // decoded picture spans the whole surface, so blitting
-                        // all of it would overwrite areas delivered via other
-                        // codecs (CAPROGRESSIVE, CLEARCODEC) on servers that
-                        // mix them within a frame.
-                        if (pos.rects) {
-                            for (var r = 0; r < pos.rects.length; r++) {
-                                var rect = pos.rects[r];
-                                ctx.drawImage(frame,
-                                        rect.x, rect.y, rect.width, rect.height,
-                                        rect.x, rect.y, rect.width, rect.height);
-                            }
-                        }
+                if (pos && pos.t !== undefined) {
+                    var latency = performance.now() - pos.t;
+                    self.lastDecodeLatency = latency;
+                    if (latency > self.peakDecodeLatency)
+                        self.peakDecodeLatency = latency;
+                    decodeLatencySum += latency;
+                    decodeLatencyCount++;
+                }
 
-                        // No regions given: the entire picture is valid
-                        else
-                            ctx.drawImage(frame, pos.x, pos.y);
-                    }
-                } finally {
-                    // CRITICAL: always close VideoFrame to release GPU memory
+                /* Hold the frame for the scheduled draw task rather than
+                 * painting it here. Painting from this callback puts the frame
+                 * on the canvas whenever decode finishes, which may be after
+                 * the operations that followed it in the instruction stream --
+                 * stale video over newer content. drawDecoded() is called from
+                 * the display's task queue, in stream order. */
+                if (pos) {
+                    pos.frame = frame;
+                    pos.frameState = frameState;
+                    if (pos.onReady)
+                        pos.onReady();
+                }
+
+                /* No record of this frame: nothing can draw it, so release it
+                 * here rather than leaking it. */
+                else {
                     frame.close();
                     frameState.closed = true;
                     self.framesClosed++;
                     pendingDecodes--;
                     resolveIfIdle();
                 }
+
             },
             error: function(e) {
                 self.framesDropped++;
@@ -456,12 +449,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *     empty when the entire picture is valid, as with servers that encode
      *     the full surface.
      */
-    this.decode = function(layer, x, y, width, height, nalData, isKeyFrame, rects) {
+    this.decode = function(layer, x, y, width, height, nalData, isKeyFrame,
+            rects, onReady) {
 
         ensureDecoder(width, height);
 
-        if (!decoder || decoder.state === 'closed')
-            return;
+        /* No decoder at all: the caller's task must still be unblocked, or the
+         * display queue stalls behind a frame that will never arrive. */
+        if (!decoder || decoder.state === 'closed') {
+            if (onReady) onReady();
+            return null;
+        }
 
         // Track peak queue depth for diagnostics
         if (decoder.decodeQueueSize > self.peakQueueDepth)
@@ -476,22 +474,92 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
             // Store per-frame position (and submit time, for decode-latency
             // measurement) before submitting to decoder
-            pendingPositions[timestamp] = {
+            var token = timestamp;
+
+            pendingPositions[token] = {
                 layer: layer,
                 x: x,
                 y: y,
                 rects: (rects && rects.length) ? rects : null,
-                t: performance.now()
+                t: performance.now(),
+                onReady: onReady,
+                frame: null
             };
             pendingDecodes++;
             timestamp += 33333; // ~30fps in microseconds
 
             decoder.decode(chunk);
             self.chunksSubmitted++;
+            return token;
+
         } catch (e) {
             self.framesDropped++;
             console.error('[rustguac] H.264 chunk error:', e.message);
+            if (onReady) onReady();
+            return null;
         }
+    };
+
+    /**
+     * Draws the frame decoded for the given token, then releases it. Called
+     * from the display's task queue so that the frame is painted in the same
+     * order the instruction stream specified, rather than whenever decode
+     * finished.
+     *
+     * Safe to call with a token that has no decoded frame -- the decode may
+     * have failed, or the decoder may have been reset -- in which case nothing
+     * is drawn.
+     *
+     * @param {number} token
+     *     The token returned by decode().
+     */
+    this.drawDecoded = function(token) {
+
+        if (token === null || token === undefined)
+            return;
+
+        var pos = pendingPositions[token];
+        if (!pos)
+            return;
+
+        delete pendingPositions[token];
+
+        var frame = pos.frame;
+        if (!frame)
+            return;
+
+        try {
+            if (pos.layer) {
+                var canvas = pos.layer.getCanvas();
+                var ctx = canvas.getContext('2d');
+
+                // Draw only the regions the server marked valid. The decoded
+                // picture spans the whole surface, so blitting all of it would
+                // overwrite areas delivered via other codecs (CAPROGRESSIVE,
+                // CLEARCODEC) on servers that mix them within a frame.
+                if (pos.rects) {
+                    for (var r = 0; r < pos.rects.length; r++) {
+                        var rect = pos.rects[r];
+                        ctx.drawImage(frame,
+                                rect.x, rect.y, rect.width, rect.height,
+                                rect.x, rect.y, rect.width, rect.height);
+                    }
+                }
+
+                // No regions given: the entire picture is valid
+                else
+                    ctx.drawImage(frame, pos.x, pos.y);
+            }
+        } finally {
+            // CRITICAL: always close VideoFrame to release GPU memory
+            frame.close();
+            if (pos.frameState)
+                pos.frameState.closed = true;
+            self.framesClosed++;
+            pendingDecodes--;
+            resolveIfIdle();
+        }
+
     };
 
     /**
@@ -545,6 +613,31 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     };
 
     /**
+     * Closes any decoded frames still held awaiting their draw task. Frames
+     * now live in pendingPositions between decode and draw, so discarding that
+     * map without closing them leaks GPU memory -- the exact condition
+     * gcLeaks exists to detect.
+     *
+     * @private
+     */
+    function releaseHeldFrames() {
+        for (var key in pendingPositions) {
+            var pos = pendingPositions[key];
+            if (pos && pos.frame) {
+                try {
+                    pos.frame.close();
+                    if (pos.frameState)
+                        pos.frameState.closed = true;
+                    self.framesClosed++;
+                } catch (e) {
+                    /* Already closed */
+                }
+            }
+        }
+        pendingPositions = {};
+    }
+
+    /**
      * Reset the decoder (e.g. after reconnection or error recovery).
      * The next frame must be a keyframe.
      */
@@ -560,7 +653,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             }
         }
         pendingDecodes = 0;
-        pendingPositions = {};
+        releaseHeldFrames();
         var resolvers = flushResolvers;
         flushResolvers = [];
         for (var i = 0; i < resolvers.length; i++)
@@ -701,7 +794,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         decoder = null;
         configured = false;
         pendingDecodes = 0;
-        pendingPositions = {};
+        releaseHeldFrames();
         var resolvers = flushResolvers;
         flushResolvers = [];
         for (var i = 0; i < resolvers.length; i++)

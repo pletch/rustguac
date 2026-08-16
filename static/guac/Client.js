@@ -1552,9 +1552,16 @@ Guacamole.Client = function(tunnel) {
                     }
                     chunks = null;
 
-                    // Feed to H.264 decoder
-                    guac_client._h264Decoder.decode(
-                        layer, x, y, width, height,
+                    // Feed to the H.264 decoder via the display, so the
+                    // decoded frame is painted in stream order rather than
+                    // whenever decode finishes. Drawing straight from the
+                    // decoder's output callback lets a frame land after the
+                    // img/copy/rect operations that followed it, repainting
+                    // stale video over newer content -- visible as ghosting
+                    // wherever a server interleaves H.264 with other codecs.
+                    display.drawH264(
+                        layer, guac_client._h264Decoder,
+                        x, y, width, height,
                         bytes.buffer, isKeyFrame, rects
                     );
                 } catch (e) {
