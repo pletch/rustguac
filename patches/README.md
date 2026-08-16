@@ -243,7 +243,25 @@ So Windows 11 declines H.264 entirely unless the client advertises V10. xrdp is 
 - `GUAC_RDP_H264_AVC444=1` advertises AVC444, restoring the V10 caps set. **The display will render incorrectly while this is set** — the passthrough forwards only `bitstream[0]`, giving the split luma/chroma image with green and magenta casts described under `004`. It is for reading logs, not the screen. A `WARNING` is logged whenever it takes effect.
 - Every GFX surface command now logs its codec ID at `TRACE`, not just H.264 ones. Without this a server sending no H.264 is indistinguishable from one mixing H.264 with progressive/clear. MS-RDPEGFX IDs in decimal (`RDPGFX_CODECID_*` in `freerdp/channels/rdpgfx.h`): 0=UNCOMPRESSED, 3=CAVIDEO(RFX), 8=CLEARCODEC, 9=CAPROGRESSIVE, 10=PLANAR, 11=AVC420, 12=ALPHA, 13=CAPROGRESSIVE_V2, 14=AVC444, 15=AVC444v2.
 
-**If the hypothesis is confirmed,** there is no cheap fix: carrying AVC444 through the passthrough requires decoding both bitstreams and recombining the chroma planes in the browser (a second `VideoDecoder` plus a WebGL merge shader). Until then H.264 passthrough is effectively an xrdp feature.
+**RESOLVED — Windows 11 can be made to send AVC420.** The two required settings pull in opposite directions, which is why this is not obvious:
+
+1. **guacd must advertise AVC444** (`GUAC_RDP_H264_AVC444=1`). Without the V10 caps set Windows offers no H.264 at all, and FreeRDP can only reach V10 via `GfxAVC444`.
+2. **Windows must not *prefer* AVC444** — set `AVC444ModePreferred = 0` under `HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services` and reboot. Note `contrib/setup-rdp-performance.ps1` sets this to **1**, which is what causes Windows to pick AVC444v2.
+
+Advertise the capability; decline the preference. Measured on the same Windows 11 target and workload:
+
+| Codec | 444 preferred (=1) | 444 not preferred (=0) |
+|---|---|---|
+| 9 — CAPROGRESSIVE | 7256 | 4094 |
+| 15 — AVC444v2 | 3352 | **0** |
+| 11 — AVC420 | 50 | **1404** |
+| 8 — CLEARCODEC | 2006 | 766 |
+| 10 — PLANAR | 1248 | 0 |
+| 0 — UNCOMPRESSED | 466 | 318 |
+
+AVC420 is fully supported by `004`'s passthrough, so no browser-side AVC444 work is needed.
+
+**Remaining caveat:** only ~21% of surface commands are AVC420; CAPROGRESSIVE is still 62%. So the CPU saving on Windows is far smaller than on xrdp, and the mixed-codec hazard described under `011` becomes live rather than theoretical — frames carrying both AVC420 and Progressive will lose their Progressive regions, because `guac_display_plan_apply()` skips all operations for a layer that had H.264 sent. Per-rect operation suppression is required before this is safe to enable on Windows.
 
 **Files patched:**
 
