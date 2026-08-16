@@ -525,6 +525,31 @@ journalctl -u rustguac-guacd --since '1 min ago' | grep "TRACE:" \
 
 **Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
 
+## 027-h264-avc444-whole-stream.patch
+
+**Problem:** `026` forwarded only `LC=1` (luma-only) AVC444 frames and let `LC=0` frames be decoded server-side. That is wrong, and it corrupted the display.
+
+From FreeRDP's `avc444_decompress()`, `LC` (its `op`) means:
+
+| LC | bitstream[0] | bitstream[1] |
+|----|--------------|--------------|
+| 0 | YUV420 (luma view) | Chroma420 |
+| 1 | YUV420 (luma view) | -- |
+| 2 | Chroma420 | -- |
+
+`bitstream[0]` of an `LC=0` frame is **the same continuous luma stream** as an `LC=1` frame; the auxiliary view is additional, not a replacement. Forwarding only `LC=1` therefore removed frames from the middle of an H.264 stream, and every later P-frame referenced data the client's decoder never received -- garbage until the next IDR. On the test host the split was 887 `LC=1`, 20 `LC=0`, 2 `LC=2`, so 20 holes were enough to corrupt the picture continuously.
+
+A second fault compounded it: guacd decoding those `LC=0` frames wrote into a pixel buffer left stale by every frame that *was* passed through, so any image emitted from it was wrong too.
+
+**Fix:** a passed-through stream is passed through in its entirety.
+
+- `LC=0` and `LC=1` both forward `bitstream[0]`, keeping the reference chain intact. The auxiliary view is discarded, so chroma renders 4:2:0 rather than 4:4:4 -- a loss of colour detail, not corruption, and the price of passthrough against a server that insists on AVC444.
+- `LC=2` is chroma-only: unusable by a YUV420 decoder, and unsafe to decode server-side against the stale buffer. Those commands are dropped entirely while passthrough is active, costing one chroma refresh (2 commands in 909 on the test host).
+
+**General rule this establishes:** never selectively skip frames of a stream that is being passed through. Either every frame goes to the client decoder or none does. The same reasoning applies to any future filtering by region, keyframe, or codec sub-mode.
+
+**Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

@@ -1,0 +1,118 @@
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index f82e981b..d5730b0a 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -216,6 +216,7 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+     int saved_keyframe = 0;
+     guac_rect* saved_rects = NULL;
+     int saved_num_rects = 0;
++    int drop_command = 0;
+     UINT32 saved_nal_types = 0;
+ 
+     if (cmd->codecId == RDPGFX_CODECID_AVC420 && cmd->extra != NULL) {
+@@ -233,26 +234,30 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+             }
+         }
+     }
+-    /* AVC444 carries an LC field describing which bitstreams are present:
++    /* AVC444 carries an LC field (FreeRDP calls it op) describing which
++     * bitstreams are present. From avc444_decompress():
+      *
+-     *   LC = 0  luma and chroma both present -- two bitstreams, from which
+-     *           the client is expected to reconstruct YUV444
+-     *   LC = 1  luma only, which is a complete YUV420 frame
+-     *   LC = 2  chroma only
++     *   LC = 0  YUV420 in bitstream[0], Chroma420 in bitstream[1]
++     *   LC = 1  YUV420 in bitstream[0]
++     *   LC = 2  Chroma420 in bitstream[0]
+      *
+-     * Only LC = 1 is safe to pass through: bitstream[0] is then an ordinary
+-     * AVC420 picture and needs no reconstruction. Forwarding bitstream[0] of
+-     * an LC = 0 stream discards the auxiliary chroma view and renders half the
+-     * screen green and half pink, which is what 004 did unconditionally.
++     * bitstream[0] of an LC=0 frame is the SAME continuous luma stream as an
++     * LC=1 frame -- the auxiliary chroma view is additional, not a
++     * replacement. So both are forwarded. Doing otherwise breaks the H.264
++     * reference chain: an earlier revision forwarded only LC=1 and let LC=0 be
++     * decoded server-side, which removed frames from the middle of the stream
++     * and left the client decoding garbage until the next IDR.
+      *
+-     * The distinction matters because some hosts only engage their hardware
+-     * H.264 encoder when AVC444 mode is preferred -- on a Windows 11 host with
+-     * an RTX 3070, setting AVC444ModePreferred to 0 stopped NVENC entirely.
+-     * Handling LC = 1 lets such a host keep hardware encoding while still
+-     * passing through the frames that need no reconstruction.
++     * Forwarding bitstream[0] of an LC=0 frame discards the auxiliary view, so
++     * chroma renders at 4:2:0 rather than 4:4:4. That is a quality reduction
++     * confined to colour detail, not corruption, and it is the price of
++     * passthrough on a server that insists on AVC444.
+      *
+-     * LC = 0 and LC = 2 fall through with saved_h264 unset and are decoded and
+-     * re-encoded normally, so they render correctly at CPU cost. */
++     * LC=2 carries chroma only. A YUV420 decoder cannot use it, and it cannot
++     * be decoded server-side either: guacd's pixel buffer is stale for every
++     * frame that was passed through, so decoding a chroma refresh against it
++     * produces a wrong image. Such commands are dropped entirely while
++     * passthrough is active, costing one chroma refresh. */
+     else if ((cmd->codecId == RDPGFX_CODECID_AVC444
+            || cmd->codecId == RDPGFX_CODECID_AVC444v2)
+            && cmd->extra != NULL) {
+@@ -260,12 +265,10 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+         RDPGFX_AVC444_BITMAP_STREAM* avc444 =
+                 (RDPGFX_AVC444_BITMAP_STREAM*) cmd->extra;
+ 
+-        /* Logged per command so the LC mix can be counted: the proportion of
+-         * LC=1 frames is exactly the proportion of an AVC444 stream that can
+-         * still be passed through. */
++        /* Logged per command so the LC mix can be counted */
+         guac_client_log(client, GUAC_LOG_TRACE, "AVC444 LC=%u", avc444->LC);
+ 
+-        if (avc444->LC == 1
++        if (avc444->LC <= 1
+                 && avc444->bitstream[0].data != NULL
+                 && avc444->bitstream[0].length > 0) {
+             saved_length = avc444->bitstream[0].length;
+@@ -279,21 +282,9 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+             }
+         }
+ 
+-        else {
+-            static int warned = 0;
+-            if (!warned) {
+-                warned = 1;
+-                guac_client_log(client, GUAC_LOG_INFO,
+-                        "Server is sending AVC444 with both luma and chroma "
+-                        "bitstreams (LC=%u). Those frames are decoded and "
+-                        "re-encoded rather than passed through, as "
+-                        "reconstructing YUV444 in the browser is not "
+-                        "implemented. Set AVC444ModePreferred to 0 on the RDP "
+-                        "host for pure AVC420 -- but check that hardware "
+-                        "encoding still engages there, as some hosts only use "
+-                        "it in AVC444 mode.", avc444->LC);
+-            }
+-        }
++        /* Chroma-only: unusable by the client and unsafe to decode here */
++        else if (avc444->LC == 2)
++            drop_command = 1;
+ 
+     }
+ 
+@@ -308,7 +299,7 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+      * ID: an AVC420 command whose capture failed, or an AVC444 command with
+      * both bitstreams, reaches the client only as a re-encoded image, and
+      * suppression must not discard it. */
+-    if (saved_h264 == NULL) {
++    if (saved_h264 == NULL && !drop_command) {
+ 
+         guac_rect mixed;
+         guac_rect_init(&mixed, cmd->left, cmd->top,
+@@ -335,7 +326,8 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+      * Otherwise, run the normal GDI decode — this calls BeginPaint/EndPaint
+      * internally, updates the pixel buffer, and marks the dirty region. Must
+      * happen after we've saved the H.264 data above. */
+-    int skip_decode = (saved_h264 != NULL) && guac_rdp_h264_skip_decode();
++    int skip_decode = (saved_h264 != NULL || drop_command)
++            && guac_rdp_h264_skip_decode();
+ 
+     if (!skip_decode) {
+         pcRdpgfxSurfaceCommand orig =
