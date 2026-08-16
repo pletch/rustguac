@@ -164,6 +164,74 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     this.framesDecoded = 0;
 
     /**
+     * VideoFrames that this decoder received and that were garbage collected
+     * while still open. framesDecoded and framesClosed agreeing proves only
+     * that every frame reaching the end of the output callback was closed; it
+     * cannot prove a frame was never dropped on some other path. This counts
+     * the actual condition Chrome warns about, so the warning can be
+     * attributed rather than inferred.
+     *
+     * A FinalizationRegistry is the only way to observe this: any container
+     * holding the frames to check them later would itself keep them alive.
+     * The held value must not reference the frame, so it carries only a small
+     * record of the frame's identity and whether close() was reached.
+     *
+     * @type {number}
+     */
+    this.gcLeaks = 0;
+
+    var frameRegistry = (typeof FinalizationRegistry !== 'undefined')
+        ? new FinalizationRegistry(function(state) {
+            if (!state.closed) {
+                self.gcLeaks++;
+                console.warn('[rustguac] LEAK: VideoFrame ts=' + state.ts
+                        + ' was garbage collected without close(). This frame '
+                        + 'came from the rustguac H.264 decoder. Total leaked: '
+                        + self.gcLeaks);
+            }
+        })
+        : null;
+
+    /**
+     * Long main-thread tasks observed during this session. A freeze has two
+     * possible causes that look identical to the viewer: the browser is busy
+     * and cannot paint, or nothing is arriving to paint. These separate them.
+     * If a freeze coincides with a long task, it is this machine; if the main
+     * thread stays idle through the freeze, the frames are not being sent.
+     *
+     * @type {number}
+     */
+    this.longTasks = 0;
+    this.longTaskMs = 0;
+    this.maxLongTaskMs = 0;
+
+    if (typeof PerformanceObserver !== 'undefined') {
+        try {
+            new PerformanceObserver(function(list) {
+                var entries = list.getEntries();
+                for (var i = 0; i < entries.length; i++) {
+                    self.longTasks++;
+                    self.longTaskMs += entries[i].duration;
+                    if (entries[i].duration > self.maxLongTaskMs)
+                        self.maxLongTaskMs = entries[i].duration;
+                }
+            }).observe({ entryTypes: ['longtask'] });
+        } catch (e) {
+            /* longtask is not observable in every browser; not fatal */
+        }
+    }
+
+    /**
+     * Number of VideoDecoder objects created. Should be exactly 1 for the
+     * lifetime of a session -- more means decoders are being replaced, and a
+     * replaced decoder that was not closed holds GPU resources and may still
+     * deliver frames to this callback.
+     *
+     * @type {number}
+     */
+    this.decoderInstances = 0;
+
+    /**
      * Total frames dropped or errored.
      *
      * @type {number}
@@ -250,9 +318,35 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             return;
         }
 
+        /* Release any decoder being replaced. reset() clears the configured
+         * flag, so a later decode() reaches this point with a live decoder
+         * still assigned; overwriting it without closing leaks its GPU
+         * resources and leaves a second decoder able to deliver frames into
+         * this same callback. Nothing calls reset() today, which is why the
+         * counters have stayed clean, but the path exists. */
+        if (decoder && decoder.state !== 'closed') {
+            try {
+                decoder.close();
+                console.warn('[rustguac] Replacing an open H.264 decoder; '
+                        + 'closing the previous one.');
+            } catch (e) {
+                /* Already in an error state */
+            }
+        }
+
+        self.decoderInstances++;
+
         decoder = new VideoDecoder({
             output: function(frame) {
                 self.framesDecoded++;
+
+                /* Registered before anything else can throw. The state object
+                 * is what the registry hands back after the frame is
+                 * collected; it deliberately holds no reference to the frame
+                 * itself, which would prevent the collection being observed. */
+                var frameState = { closed: false, ts: frame.timestamp };
+                if (frameRegistry)
+                    frameRegistry.register(frame, frameState);
 
                 var now = performance.now();
                 if (lastOutputTime) {
@@ -302,6 +396,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 } finally {
                     // CRITICAL: always close VideoFrame to release GPU memory
                     frame.close();
+                    frameState.closed = true;
                     self.framesClosed++;
                     pendingDecodes--;
                     resolveIfIdle();
@@ -536,6 +631,18 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             framesDecoded: self.framesDecoded,
             framesClosed: self.framesClosed,
             leaked: self.framesDecoded - self.framesClosed,
+
+            /* Frames proven collected while open. If Chrome warns about
+             * garbage-collected VideoFrames while this stays 0, the frames it
+             * is warning about are not ours. */
+            gcLeaks: self.gcLeaks,
+            decoderInstances: self.decoderInstances,
+
+            /* Main-thread blocking. A freeze with no long tasks is not a
+             * rendering problem on this machine. */
+            longTasks: self.longTasks,
+            longTaskMs: +self.longTaskMs.toFixed(0),
+            maxLongTaskMs: +self.maxLongTaskMs.toFixed(0),
             framesDropped: self.framesDropped,
             syncsGated: self.syncsGated,
             pendingDecodes: pendingDecodes,
