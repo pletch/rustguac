@@ -212,6 +212,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     this.watchdogFires = 0;
 
+    /**
+     * Number of decoded frames that could not be snapshotted to an
+     * ImageBitmap. Non-zero means frames are being lost at the copy step.
+     *
+     * @type {number}
+     */
+    this.bitmapFailures = 0;
+
     var frameRegistry = (typeof FinalizationRegistry !== 'undefined')
         ? new FinalizationRegistry(function(state) {
             if (!state.closed) {
@@ -420,21 +428,57 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     decodeLatencyCount++;
                 }
 
-                /* Hold the frame for the scheduled draw task rather than
-                 * painting it here. Painting from this callback puts the frame
-                 * on the canvas whenever decode finishes, which may be after
-                 * the operations that followed it in the instruction stream --
-                 * stale video over newer content. drawDecoded() is called from
-                 * the display's task queue, in stream order. */
+                /* Snapshot to an ImageBitmap and release the VideoFrame at
+                 * once, rather than holding it until the draw task runs.
+                 *
+                 * A hardware decoder has a small pool of output surfaces, and
+                 * an open VideoFrame holds one. Holding frames until their
+                 * scheduled draw exhausts that pool as soon as the display
+                 * queue falls even slightly behind, which stalls the decoder,
+                 * which delays the draws, which holds more frames -- decode
+                 * latency measured 437ms average against 1.6ms before, with 56
+                 * frames pinned and a main thread that was completely idle.
+                 *
+                 * An ImageBitmap is an ordinary GPU-backed resource with no
+                 * such pool, so any number can be held while ordering is
+                 * preserved. The cost is one copy per frame. */
                 if (pos) {
-                    pos.frame = frame;
-                    pos.frameState = frameState;
-                    if (pos.watchdog) {
-                        clearTimeout(pos.watchdog);
-                        pos.watchdog = null;
-                    }
-                    if (pos.onReady)
-                        pos.onReady();
+
+                    createImageBitmap(frame).then(function(bitmap) {
+
+                        frame.close();
+                        frameState.closed = true;
+                        self.framesClosed++;
+
+                        if (pos.watchdog) {
+                            clearTimeout(pos.watchdog);
+                            pos.watchdog = null;
+                        }
+
+                        /* The draw task already gave up on this frame */
+                        if (pos.settled) {
+                            bitmap.close();
+                            return;
+                        }
+
+                        pos.bitmap = bitmap;
+                        if (pos.onReady)
+                            pos.onReady();
+
+                    }).catch(function(e) {
+
+                        try {
+                            frame.close();
+                            frameState.closed = true;
+                            self.framesClosed++;
+                        } catch (e2) { /* already closed */ }
+
+                        self.bitmapFailures++;
+                        if (pos.onReady)
+                            pos.onReady();
+
+                    });
+
                 }
 
                 /* The draw task already ran and gave up on this frame (its
@@ -534,7 +578,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 rects: (rects && rects.length) ? rects : null,
                 t: performance.now(),
                 onReady: onReady,
-                frame: null
+                bitmap: null
             };
             pendingDecodes++;
             timestamp += 33333; // ~30fps in microseconds
@@ -547,7 +591,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             (function(rec) {
                 rec.watchdog = setTimeout(function() {
                     rec.watchdog = null;
-                    if (!rec.frame) {
+                    if (!rec.bitmap) {
                         self.watchdogFires++;
                         if (rec.onReady) rec.onReady();
                     }
@@ -595,12 +639,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             pos.watchdog = null;
         }
 
-        var frame = pos.frame;
+        var bitmap = pos.bitmap;
 
         /* Nothing decoded for this token -- the watchdog released the task, or
          * the decoder errored. Settle it so the sync gate does not wait on a
          * frame that will never arrive. */
-        if (!frame) {
+        if (!bitmap) {
             settle(pos);
             return;
         }
@@ -617,7 +661,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 if (pos.rects) {
                     for (var r = 0; r < pos.rects.length; r++) {
                         var rect = pos.rects[r];
-                        ctx.drawImage(frame,
+                        ctx.drawImage(bitmap,
                                 rect.x, rect.y, rect.width, rect.height,
                                 rect.x, rect.y, rect.width, rect.height);
                     }
@@ -625,14 +669,10 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
                 // No regions given: the entire picture is valid
                 else
-                    ctx.drawImage(frame, pos.x, pos.y);
+                    ctx.drawImage(bitmap, pos.x, pos.y);
             }
         } finally {
-            // CRITICAL: always close VideoFrame to release GPU memory
-            frame.close();
-            if (pos.frameState)
-                pos.frameState.closed = true;
-            self.framesClosed++;
+            bitmap.close();
             settle(pos);
         }
 
@@ -699,12 +739,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     function releaseHeldFrames() {
         for (var key in pendingPositions) {
             var pos = pendingPositions[key];
-            if (pos && pos.frame) {
+            if (pos && pos.bitmap) {
                 try {
-                    pos.frame.close();
-                    if (pos.frameState)
-                        pos.frameState.closed = true;
-                    self.framesClosed++;
+                    pos.bitmap.close();
                 } catch (e2) {
                     /* Already closed */
                 }
@@ -835,6 +872,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * is warning about are not ours. */
             gcLeaks: self.gcLeaks,
             watchdogFires: self.watchdogFires,
+            bitmapFailures: self.bitmapFailures,
             decoderInstances: self.decoderInstances,
 
             /* Main-thread blocking. A freeze with no long tasks is not a
