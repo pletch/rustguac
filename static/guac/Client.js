@@ -1518,8 +1518,6 @@ Guacamole.Client = function(tunnel) {
                 guac_client._h264Decoder = new Guacamole.H264Decoder(display);
             }
 
-            guac_client._h264Decoder.instructionsReceived++;
-
             // Collect NAL unit data. Guacamole.ArrayBufferReader decodes each
             // blob to an ArrayBuffer as it arrives, so the chunks can simply be
             // concatenated at the end.
@@ -1543,12 +1541,8 @@ Guacamole.Client = function(tunnel) {
 
             reader.onend = function() {
 
-                guac_client._h264Decoder.streamsEnded++;
-
-                if (!totalLength) {
-                    guac_client._h264Decoder.emptyStreams++;
+                if (!totalLength)
                     return;
-                }
 
                 try {
 
