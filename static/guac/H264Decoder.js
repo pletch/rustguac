@@ -118,6 +118,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     if (typeof window !== 'undefined')
         window.__h264 = this;
 
+    /**
+     * Counters for the path between the h264 instruction arriving and the
+     * chunk reaching the decoder. Incremented by Client.js. guacd's flush rate
+     * and framesDecoded disagreed by roughly 2x, and framesDropped was zero,
+     * so frames are being lost before the decoder rather than by it.
+     */
+    this.instructionsReceived = 0;
+    this.streamsEnded = 0;
+    this.emptyStreams = 0;
+    this.chunksSubmitted = 0;
+
     this.framesDecoded = 0;
 
     /**
@@ -322,6 +333,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             timestamp += 33333; // ~30fps in microseconds
 
             decoder.decode(chunk);
+            self.chunksSubmitted++;
         } catch (e) {
             self.framesDropped++;
             console.error('[rustguac] H.264 chunk error:', e.message);
@@ -425,13 +437,20 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var interval = (seconds || 5) * 1000;
         var startDecoded = self.framesDecoded;
         var startDropped = self.framesDropped;
+        var startInstr = self.instructionsReceived;
+        var startEnded = self.streamsEnded;
+        var startSubmitted = self.chunksSubmitted;
 
         return new Promise(function(resolve) {
             setTimeout(function() {
                 var secs = interval / 1000;
                 resolve({
+                    instrPerSec   : +((self.instructionsReceived - startInstr) / secs).toFixed(1),
+                    endedPerSec   : +((self.streamsEnded - startEnded) / secs).toFixed(1),
+                    submittedPerSec: +((self.chunksSubmitted - startSubmitted) / secs).toFixed(1),
                     decodedPerSec : +((self.framesDecoded - startDecoded) / secs).toFixed(1),
                     droppedPerSec : +((self.framesDropped - startDropped) / secs).toFixed(1),
+                    emptyStreams  : self.emptyStreams,
                     queueDepth    : decoder ? decoder.decodeQueueSize : 0,
                     peakQueueDepth: self.peakQueueDepth,
                     avgLatencyMs  : decodeLatencyCount

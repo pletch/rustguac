@@ -1509,6 +1509,8 @@ Guacamole.Client = function(tunnel) {
                 guac_client._h264Decoder = new Guacamole.H264Decoder(display);
             }
 
+            guac_client._h264Decoder.instructionsReceived++;
+
             // Collect base64 blob data
             var base64Data = '';
             stream.onblob = function(data) {
@@ -1516,7 +1518,13 @@ Guacamole.Client = function(tunnel) {
             };
 
             stream.onend = function() {
-                if (!base64Data) return;
+
+                guac_client._h264Decoder.streamsEnded++;
+
+                if (!base64Data) {
+                    guac_client._h264Decoder.emptyStreams++;
+                    return;
+                }
 
                 // Decode base64 to ArrayBuffer
                 try {
