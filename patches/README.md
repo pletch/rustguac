@@ -270,7 +270,9 @@ AVC420 is fully supported by `004`'s passthrough, so no browser-side AVC444 work
 | `src/protocols/rdp/settings.c` | Add `guac_rdp_h264_avc444_diagnostic()`; drive `GfxAVC444` from it at both the FreeRDP 3 and FreeRDP 2 sites |
 | `src/protocols/rdp/channels/rdpgfx.c` | Log `cmd->codecId` for every surface command at `TRACE` |
 
-**Caveat (2026-08-16):** the claim that Windows sends no H.264 without `GfxAVC444` is **unverified**. FreeRDP advertises AVC420 in the V8.1 caps regardless (`RDPGFX_CAPS_FLAG_AVC420_ENABLED`); only the V10+ caps sets depend on `GfxAVC444`. The original measurement was taken before the host's WDDM driver, hardware encoding and AVC444 priority policy were configured correctly, so it may have been an artefact of that. Retest with `GUAC_RDP_H264_AVC444` unset and count codec 11.
+**Confirmed 2026-08-16 under controlled conditions.** The requirement was re-tested with the Windows host fully configured (hardware encoding active, AVC444 priority policy disabled, WDDM RD display driver disabled) and with a stale systemd drop-in removed that had been forcing `GUAC_RDP_H264_AVC444=1` throughout the earlier work. With the variable genuinely unset, Windows sent **no H.264 whatsoever** -- 4050 CLEARCODEC, 1447 CAPROGRESSIVE, 15 uncompressed, zero AVC420 and zero AVC444.
+
+So FreeRDP's V8.1 `RDPGFX_CAPS_FLAG_AVC420_ENABLED` is not sufficient for Windows 11: it requires the V10 caps set before offering H.264 at all, and FreeRDP emits that only when `GfxAVC444` is set (`rdpgfx_send_caps_advertise_pdu` gates the V10 block on `!GfxH264 || GfxAVC444`). Advertising AVC444 is therefore mandatory for any H.264 from Windows, which is why `025` and `026` handle AVC444 arriving rather than trying to prevent it.
 
 ## 013-h264-per-rect-suppression.patch
 
@@ -502,7 +504,7 @@ The mixed-codec test in the same function narrowed to `codecId != AVC420` to mat
 
 **Problem:** `025` dropped AVC444 passthrough entirely to stop the green/pink split. That is correct but costly, and on the test Windows 11 host it turned out to be unavoidable rather than optional: setting `AVC444ModePreferred=0` to force AVC420 **stopped NVENC hardware encoding altogether** (Task Manager Video Encode 0%, `nvidia-smi encodersessions` empty). That host only engages its hardware encoder in AVC444 mode, leaving a choice between hardware encoding and passthrough.
 
-Dropping the AVC444 *capability advertisement* may or may not be an escape. Without `GfxAVC444`, FreeRDP emits no V10+ caps set at all (`rdpgfx_send_caps_advertise_pdu`: the V10 block is gated on `!GfxH264 || GfxAVC444`) -- but it still advertises AVC420 through `RDPGFX_CAPS_FLAG_AVC420_ENABLED` in the V8.1 caps. The `012` measurement showing no H.264 without `GfxAVC444` was taken on a host with the WDDM RD display driver enabled, no hardware encoding, and the AVC444 priority policy unconfigured, so it does not isolate the advertisement. Retest before treating this as a constraint.
+Dropping the AVC444 *capability advertisement* is not an escape, confirmed by controlled retest (see `012`): with `GfxAVC444` unset Windows sends no H.264 at all, only CLEARCODEC and CAPROGRESSIVE. The advertisement is mandatory, so AVC444 streams must be handled rather than avoided.
 
 **Fix:** AVC444 streams carry an `LC` field (MS-RDPEGFX 2.2.4.5) describing which bitstreams are present:
 
