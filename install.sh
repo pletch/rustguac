@@ -541,6 +541,22 @@ Environment=RUST_LOG=info
 WantedBy=multi-user.target
 EOF
 
+    # Warn about systemd drop-ins. They merge with the unit written above and
+    # win, but live in a separate directory this script never touches, so a
+    # forgotten "systemctl edit" silently overrides everything here -- including
+    # ExecStart, which discards the log-level wrapper and any flags set above.
+    local dropin_dir="/etc/systemd/system/rustguac-guacd.service.d"
+    if compgen -G "$dropin_dir/*.conf" > /dev/null; then
+        warn "Systemd drop-in overrides exist and take precedence over the unit"
+        warn "just written. They are NOT managed by this installer:"
+        for f in "$dropin_dir"/*.conf; do
+            warn "  $f"
+            sed 's/^/      /' "$f" | while read -r line; do warn "$line"; done
+        done
+        warn "Review with: systemctl cat rustguac-guacd"
+        warn "Settings belong in $PREFIX/guacd.env instead, which persists."
+    fi
+
     systemctl daemon-reload
     systemctl enable rustguac-guacd.service
     systemctl enable rustguac.service
