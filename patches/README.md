@@ -439,6 +439,29 @@ A Windows Start menu opened over a video still renders — its CAPROGRESSIVE reg
 | `src/libguac/display-plan.c` | Drain regions per frame; add `guac_display_layer_mixed_covers()`; extend the suppression test |
 | `src/protocols/rdp/channels/rdpgfx.c` | Pass the surface command's rect when marking |
 
+## 023-h264-queue-lock-decouple.patch
+
+**Problem:** `guac_display_layer_set_h264()` took the display's `pending_frame.lock` write lock to append a frame to the queue. The render thread holds that same lock for the entire flush, including `guac_display_plan_apply()`, which dispatches image encoding to the worker threads. The protocol thread therefore blocked inside `set_h264` for as long as the flush took.
+
+For RDP that protocol thread is the one processing EGFX PDUs, and FreeRDP sends `RDPGFX_FRAME_ACKNOWLEDGE` synchronously from `rdpgfx_recv_end_frame_pdu()` **after** `context->EndFrame` returns. Blocking it therefore delays frame acknowledgement, and MS-RDPEGFX flow control limits how many unacknowledged frames a server will have outstanding. The result presents as a low frame rate *from the server* — which is why measurement kept showing a clean, lossless pipeline carrying only ~21fps, and why the same client and browser were flawless against xrdp: on xrdp the flush has almost nothing to encode, so the lock is barely held.
+
+**Fix:** give the queue its own lock. The queued fields (`h264_queue`, `h264_queue_tail`, `h264_queue_length`) need no coordination with the rest of the pending frame — the queue is a separate list, appended by the protocol thread and consumed at flush.
+
+- `set_h264` allocates and copies the NAL data *before* taking any lock, then holds `h264_queue_lock` only long enough to append and enforce the 120-frame cap.
+- The cap-drop warning moved outside the lock; logging can block on I/O and this lock is on the path of every surface command.
+- The flush detaches the whole queue under the lock and sends outside it, so socket writes never block the protocol thread either.
+
+**This supersedes the diagnostic in `021`** — there is no longer a pending-frame-lock acquisition in `set_h264` to time. `021` remains in the series only because later patches build on its context lines.
+
+**Files patched:**
+
+| File | Change |
+|------|-----|
+| `src/libguac/display-priv.h` | Add `h264_queue_lock`; document why it is not `pending_frame.lock` |
+| `src/libguac/display-layer.c` | Build the frame outside any lock; append under the queue lock; log drops after unlocking |
+| `src/libguac/display-plan.c` | Detach the queue under the lock, send outside it; drop the unlocked empty-queue pre-check |
+| `src/libguac/display-layer-list.c` | Init/destroy `h264_queue_lock` |
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:
