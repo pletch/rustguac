@@ -342,6 +342,28 @@ Two distinct causes, both fixed by `017`:
 
 `GUAC_H264_SUPPRESS=0` is retained as a diagnostic. With suppression off the display is still correct — image operations are drawn after the H.264 frames of the same guacd frame, so they win — merely more expensive, which forfeits the entire benefit of the passthrough on mixed-codec servers.
 
+## 018-h264-suppress-mixed-frames.patch
+
+**Problem:** suppression assumes the H.264 stream is the sole source of truth for the regions it covers. That holds for a server encoding the whole surface as H.264 (xrdp), but not for one painting other content over the same area. Opening the Windows Start menu across a video region produced stale rectangles: the menu arrives as CAPROGRESSIVE, lands inside an H.264 region, and its image operations were suppressed. `017` cannot address this — the overlap is genuine rather than an artefact of accumulation.
+
+**Fix:** disable suppression for any frame that also carried non-H.264 content. `rdpgfx.c` calls `guac_display_layer_mark_mixed_codec()` for every surface command whose codec is not AVC420/AVC444/AVC444v2; the flush transfers that flag into the frame being built and clears the accumulator.
+
+The test is **per frame, not per session**, deliberately. A per-session flag would be simpler, but `gfx.toml` commonly lists `order = ["H.264", "RFX"]`, so a single RFX command would permanently forfeit suppression on an otherwise all-H.264 xrdp session — the configuration where suppression delivers its largest benefit. Per frame, such a session keeps suppression on every frame that is purely H.264.
+
+The flag is set without holding the pending frame lock. It only ever transitions 0 → 1 within a frame and is reset under the lock during the flush, so the worst outcome of a race is suppression being disabled one frame later than it might have been; taking the write lock for every non-H.264 surface command would cost far more.
+
+**Practical effect on Windows:** with CAPROGRESSIVE at ~62% of surface commands, most frames are mixed, so suppression will rarely engage there and the encode saving is correspondingly small. That is the correct trade — suppression on Windows could only ever save ~21% of the encode work, and had by this point produced four separate correctness defects.
+
+**Files patched:**
+
+| File | Change |
+|------|-----|
+| `src/libguac/display-priv.h` | Add `h264_mixed_pending` / `h264_mixed_frame` to the layer |
+| `src/libguac/guacamole/display.h` | Add `guac_display_layer_mark_mixed_codec()` |
+| `src/libguac/display-layer.c` | Implement the marker |
+| `src/libguac/display-plan.c` | Consume the flag per frame; gate suppression on it |
+| `src/protocols/rdp/channels/rdpgfx.c` | Mark the layer for every non-H.264 surface command |
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

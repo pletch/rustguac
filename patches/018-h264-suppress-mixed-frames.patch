@@ -1,0 +1,133 @@
+diff --git a/src/libguac/display-layer.c b/src/libguac/display-layer.c
+index 4709beb2..9e1d1c57 100644
+--- a/src/libguac/display-layer.c
++++ b/src/libguac/display-layer.c
+@@ -336,6 +336,17 @@ void guac_display_layer_close_cairo(guac_display_layer* layer, guac_display_laye
+ 
+ }
+ 
++void guac_display_layer_mark_mixed_codec(guac_display_layer* layer) {
++
++    /* Deliberately unlocked. This flag only ever transitions 0 -> 1 within a
++     * frame and is reset under the pending frame lock during the flush, so the
++     * worst outcome of a race is that suppression is disabled one frame later
++     * than it might have been. Taking the write lock here instead would mean
++     * doing so for every non-H.264 surface command. */
++    layer->h264_mixed_pending = 1;
++
++}
++
+ void guac_display_layer_set_h264(guac_display_layer* layer,
+         const unsigned char* data, uint32_t length, int is_keyframe,
+         int x, int y, int width, int height,
+diff --git a/src/libguac/display-plan.c b/src/libguac/display-plan.c
+index ba60dfea..35cdc4ae 100644
+--- a/src/libguac/display-plan.c
++++ b/src/libguac/display-plan.c
+@@ -628,6 +628,10 @@ int PFW_guac_display_flush_h264(guac_display* display) {
+         /* Clear the previous frame's regions before recording this frame's */
+         layer->h264_rect_count = 0;
+ 
++        /* Take this frame's mixed-codec state and reset the accumulator */
++        layer->h264_mixed_frame = layer->h264_mixed_pending;
++        layer->h264_mixed_pending = 0;
++
+         if (layer->h264_queue == NULL)
+             continue;
+ 
+@@ -673,6 +677,7 @@ void guac_display_plan_apply(guac_display_plan* plan) {
+          * or those regions go stale. */
+         if (op->type == GUAC_DISPLAY_PLAN_OPERATION_IMG
+                 && guac_h264_suppress_enabled()
++                && !display_layer->h264_mixed_frame
+                 && display_layer->h264_rect_count > 0
+                 && guac_display_layer_h264_covers(display_layer, &op->dest)) {
+             op++;
+diff --git a/src/libguac/display-priv.h b/src/libguac/display-priv.h
+index 736156e5..ff2eb526 100644
+--- a/src/libguac/display-priv.h
++++ b/src/libguac/display-priv.h
+@@ -734,6 +734,32 @@ struct guac_display_layer {
+      */
+     int h264_rect_count;
+ 
++    /**
++     * Non-zero if a non-H.264 surface command has been received for this layer
++     * since the last frame flush. Set by
++     * guac_display_layer_mark_mixed_codec() and consumed by
++     * PFW_guac_display_flush_h264(), which transfers it to h264_mixed_frame.
++     */
++    int h264_mixed_pending;
++
++    /**
++     * Non-zero if the frame currently being flushed also carried content
++     * encoded with a codec other than H.264. Suppression of image operations
++     * is disabled for such frames.
++     *
++     * Suppression assumes the H.264 stream is the sole source of truth for the
++     * regions it covers. That holds for a server encoding the whole surface as
++     * H.264, but not for one that paints other content over the same area --
++     * Windows drawing a menu across a video region, for instance. The
++     * overlaying content arrives via CAPROGRESSIVE or CLEARCODEC, lands inside
++     * an H.264 region, and would be suppressed, leaving the region stale.
++     *
++     * The test is per frame rather than per session so that a server which
++     * mixes only occasionally keeps the benefit of suppression on its
++     * H.264-only frames.
++     */
++    int h264_mixed_frame;
++
+ };
+ 
+ typedef struct guac_display_state {
+diff --git a/src/libguac/guacamole/display.h b/src/libguac/guacamole/display.h
+index 29f68789..1ecec814 100644
+--- a/src/libguac/guacamole/display.h
++++ b/src/libguac/guacamole/display.h
+@@ -461,6 +461,22 @@ void guac_display_free_layer(guac_display_layer* display_layer);
+  * @param num_rects
+  *     The number of entries in rects, or zero if rects is NULL.
+  */
++/**
++ * Marks the given layer as having received content encoded with a codec other
++ * than H.264 during the frame currently being accumulated. Image operations
++ * will not be suppressed for that frame, even where they overlap regions
++ * carried by the H.264 stream.
++ *
++ * Suppression assumes the H.264 stream is the sole source of truth for the
++ * regions it covers, which is false whenever another codec paints over the
++ * same area. Callers should invoke this for every surface command that is not
++ * H.264.
++ *
++ * @param layer
++ *     The layer that received non-H.264 content.
++ */
++void guac_display_layer_mark_mixed_codec(guac_display_layer* layer);
++
+ void guac_display_layer_set_h264(guac_display_layer* layer,
+         const unsigned char* data, uint32_t length, int is_keyframe,
+         int x, int y, int width, int height,
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index 2d9cfba4..0fdb0533 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -139,6 +139,19 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+     guac_client* client = ((rdp_freerdp_context*) rdp_context)->client;
+     guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
+ 
++    /* Any surface command that is not H.264 paints content the H.264 stream
++     * does not carry. Suppression of image operations assumes the opposite, so
++     * flag the layer and let the display disable suppression for this frame.
++     * Checked against the codec ID rather than against whether NAL data was
++     * captured, so that an H.264 command whose capture failed is not
++     * misreported as another codec. */
++    if (cmd->codecId != RDPGFX_CODECID_AVC420
++            && cmd->codecId != RDPGFX_CODECID_AVC444
++            && cmd->codecId != RDPGFX_CODECID_AVC444v2) {
++        guac_display_layer_mark_mixed_codec(
++                guac_display_default_layer(rdp_client->display));
++    }
++
+     /* Log the codec of every surface command, not just H.264 ones. Without
+      * this there is no way to tell a server that is sending no H.264 from one
+      * that is mixing H.264 with progressive/clear/planar commands -- both look
