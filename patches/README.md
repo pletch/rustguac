@@ -550,6 +550,27 @@ A second fault compounded it: guacd decoding those `LC=0` frames wrote into a pi
 
 **Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
 
+## 028-h264-avc444-never-passthrough.patch
+
+**Problem:** `026` and `027` both tried to salvage passthrough from an AVC444 stream, and both corrupted the display. The root assumption was wrong.
+
+The two AVC444 bitstreams are **not independent streams**. FreeRDP decodes both through the same `H264_CONTEXT` -- `avc444_process_rects()` calls `h264->subsystem->Decompress()` on each in turn -- because they form one H.264 sequence whose pictures alternate between the main view and the auxiliary view. Forwarding only `bitstream[0]` removes every auxiliary picture from the middle of that sequence, so the client decodes later pictures against references it never received. The visible result is blocky, wrongly coloured macroblocks.
+
+This does not surface as a decode error: `framesDropped` stayed at 0 throughout, because the bitstream the client receives is well formed. It is simply missing pictures its references point at.
+
+**Fix:** never pass AVC444 through, whatever `LC` says. There is no subset of the sequence that stands alone. Those commands take the normal decode path and are re-encoded as images -- correct, at the cost of the passthrough. `LC` is still logged at `TRACE` as a diagnostic.
+
+**Consequence for Windows hosts.** Windows only offers H.264 when guacd advertises AVC444 (see `012`), and it then sends AVC444 unless `AVC444ModePreferred=0`. On hardware where that registry value is also what enables the hardware encoder -- as on the Windows 11 test host -- there is a genuine conflict:
+
+| `AVC444ModePreferred` | Encoder | Codec sent | Passthrough |
+|---|---|---|---|
+| 1 | hardware (NVENC) | AVC444v2 | no -- decoded and re-encoded |
+| 0 | software | AVC420 | yes |
+
+Neither gives both. Real passthrough on such a host needs full AVC444 support: forward both bitstreams, decode them in order through one decoder, and reconstruct YUV444 from the two views in the browser (MS-RDPEGFX 3.3.8.3.2). Until then, Windows gets a correct display and a fast hardware-encoded source, but guacd pays the decode and re-encode. xrdp is unaffected -- it sends AVC420 and passthrough works fully there.
+
+**Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

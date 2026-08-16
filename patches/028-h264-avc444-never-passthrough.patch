@@ -1,0 +1,119 @@
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index d5730b0a..43948b42 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -216,7 +216,6 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+     int saved_keyframe = 0;
+     guac_rect* saved_rects = NULL;
+     int saved_num_rects = 0;
+-    int drop_command = 0;
+     UINT32 saved_nal_types = 0;
+ 
+     if (cmd->codecId == RDPGFX_CODECID_AVC420 && cmd->extra != NULL) {
+@@ -234,30 +233,29 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+             }
+         }
+     }
+-    /* AVC444 carries an LC field (FreeRDP calls it op) describing which
+-     * bitstreams are present. From avc444_decompress():
++    /* AVC444 is never passed through, whatever its LC field says.
+      *
+-     *   LC = 0  YUV420 in bitstream[0], Chroma420 in bitstream[1]
+-     *   LC = 1  YUV420 in bitstream[0]
+-     *   LC = 2  Chroma420 in bitstream[0]
++     * The two bitstreams are not independent streams. FreeRDP decodes both
++     * through the SAME H264_CONTEXT (avc444_process_rects() calls
++     * h264->subsystem->Decompress() on each in turn), because they are one
++     * H.264 sequence whose pictures alternate between the main view and the
++     * auxiliary view. Forwarding only bitstream[0] therefore removes every
++     * auxiliary picture from the middle of that sequence, and the client
++     * decodes subsequent pictures against references it never received. The
++     * result is blocky, wrongly coloured macroblocks -- not an error the
++     * decoder reports, since the bitstream it receives is well formed.
+      *
+-     * bitstream[0] of an LC=0 frame is the SAME continuous luma stream as an
+-     * LC=1 frame -- the auxiliary chroma view is additional, not a
+-     * replacement. So both are forwarded. Doing otherwise breaks the H.264
+-     * reference chain: an earlier revision forwarded only LC=1 and let LC=0 be
+-     * decoded server-side, which removed frames from the middle of the stream
+-     * and left the client decoding garbage until the next IDR.
++     * Earlier revisions tried forwarding luma-only (LC=1) frames and then
++     * luma for both LC=0 and LC=1. Both corrupt the display for the same
++     * reason: there is no subset of this sequence that stands alone.
+      *
+-     * Forwarding bitstream[0] of an LC=0 frame discards the auxiliary view, so
+-     * chroma renders at 4:2:0 rather than 4:4:4. That is a quality reduction
+-     * confined to colour detail, not corruption, and it is the price of
+-     * passthrough on a server that insists on AVC444.
++     * Passing AVC444 through would require forwarding both bitstreams,
++     * decoding them in order through one decoder, and reconstructing YUV444
++     * from the two views in the browser (MS-RDPEGFX 3.3.8.3.2). That is not
++     * implemented, so these commands take the normal decode path and are
++     * re-encoded as images: correct, at the cost of the passthrough.
+      *
+-     * LC=2 carries chroma only. A YUV420 decoder cannot use it, and it cannot
+-     * be decoded server-side either: guacd's pixel buffer is stale for every
+-     * frame that was passed through, so decoding a chroma refresh against it
+-     * produces a wrong image. Such commands are dropped entirely while
+-     * passthrough is active, costing one chroma refresh. */
++     * LC is logged at TRACE purely as a diagnostic. */
+     else if ((cmd->codecId == RDPGFX_CODECID_AVC444
+            || cmd->codecId == RDPGFX_CODECID_AVC444v2)
+            && cmd->extra != NULL) {
+@@ -265,27 +263,20 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+         RDPGFX_AVC444_BITMAP_STREAM* avc444 =
+                 (RDPGFX_AVC444_BITMAP_STREAM*) cmd->extra;
+ 
+-        /* Logged per command so the LC mix can be counted */
+         guac_client_log(client, GUAC_LOG_TRACE, "AVC444 LC=%u", avc444->LC);
+ 
+-        if (avc444->LC <= 1
+-                && avc444->bitstream[0].data != NULL
+-                && avc444->bitstream[0].length > 0) {
+-            saved_length = avc444->bitstream[0].length;
+-            saved_h264 = malloc(saved_length);
+-            if (saved_h264 != NULL) {
+-                memcpy(saved_h264, avc444->bitstream[0].data, saved_length);
+-                saved_keyframe = guac_rdp_h264_is_keyframe(
+-                        saved_h264, saved_length, &saved_nal_types);
+-                saved_rects = guac_rdp_h264_copy_rects(
+-                        &avc444->bitstream[0].meta, &saved_num_rects);
+-            }
++        static int warned = 0;
++        if (!warned) {
++            warned = 1;
++            guac_client_log(client, GUAC_LOG_WARNING,
++                    "Server is sending AVC444; H.264 passthrough is not "
++                    "possible for it and those commands are decoded and "
++                    "re-encoded instead. Set AVC444ModePreferred to 0 on the "
++                    "RDP host for AVC420 -- but note that some hosts only "
++                    "engage their hardware H.264 encoder in AVC444 mode, so "
++                    "check that encoding is still accelerated afterwards.");
+         }
+ 
+-        /* Chroma-only: unusable by the client and unsafe to decode here */
+-        else if (avc444->LC == 2)
+-            drop_command = 1;
+-
+     }
+ 
+     /* Any surface command not passed through as H.264 paints content the
+@@ -299,7 +290,7 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+      * ID: an AVC420 command whose capture failed, or an AVC444 command with
+      * both bitstreams, reaches the client only as a re-encoded image, and
+      * suppression must not discard it. */
+-    if (saved_h264 == NULL && !drop_command) {
++    if (saved_h264 == NULL) {
+ 
+         guac_rect mixed;
+         guac_rect_init(&mixed, cmd->left, cmd->top,
+@@ -326,8 +317,7 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+      * Otherwise, run the normal GDI decode — this calls BeginPaint/EndPaint
+      * internally, updates the pixel buffer, and marks the dirty region. Must
+      * happen after we've saved the H.264 data above. */
+-    int skip_decode = (saved_h264 != NULL || drop_command)
+-            && guac_rdp_h264_skip_decode();
++    int skip_decode = (saved_h264 != NULL) && guac_rdp_h264_skip_decode();
+ 
+     if (!skip_decode) {
+         pcRdpgfxSurfaceCommand orig =
