@@ -226,7 +226,7 @@ The hypothesis — **unconfirmed** — is that Windows 11 declines H.264 when th
 **Two diagnostics:**
 
 - `GUAC_RDP_H264_AVC444=1` advertises AVC444, restoring the V10 caps set. **The display will render incorrectly while this is set** — the passthrough forwards only `bitstream[0]`, giving the split luma/chroma image with green and magenta casts described under `004`. It is for reading logs, not the screen. A `WARNING` is logged whenever it takes effect.
-- Every GFX surface command now logs its codec ID at `TRACE`, not just H.264 ones. Without this a server sending no H.264 is indistinguishable from one mixing H.264 with progressive/clear. Relevant MS-RDPEGFX IDs: 8=CAVIDEO(RFX), 9=CLEARCODEC, 10=PLANAR, 11=AVC420, 13=AVC444, 15=AVC444v2, 16=PROGRESSIVE, 17=PROGRESSIVE_V2.
+- Every GFX surface command now logs its codec ID at `TRACE`, not just H.264 ones. Without this a server sending no H.264 is indistinguishable from one mixing H.264 with progressive/clear. MS-RDPEGFX IDs in decimal (`RDPGFX_CODECID_*` in `freerdp/channels/rdpgfx.h`): 0=UNCOMPRESSED, 3=CAVIDEO(RFX), 8=CLEARCODEC, 9=CAPROGRESSIVE, 10=PLANAR, 11=AVC420, 12=ALPHA, 13=CAPROGRESSIVE_V2, 14=AVC444, 15=AVC444v2.
 
 **If the hypothesis is confirmed,** there is no cheap fix: carrying AVC444 through the passthrough requires decoding both bitstreams and recombining the chroma planes in the browser (a second `VideoDecoder` plus a WebGL merge shader). Until then H.264 passthrough is effectively an xrdp feature.
 

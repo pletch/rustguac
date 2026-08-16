@@ -1,8 +1,8 @@
 diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
-index b820956b..b3308423 100644
+index b820956b..3b4465d6 100644
 --- a/src/protocols/rdp/channels/rdpgfx.c
 +++ b/src/protocols/rdp/channels/rdpgfx.c
-@@ -93,6 +93,17 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+@@ -93,6 +93,18 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
      guac_client* client = ((rdp_freerdp_context*) rdp_context)->client;
      guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
  
@@ -10,9 +10,10 @@ index b820956b..b3308423 100644
 +     * this there is no way to tell a server that is sending no H.264 from one
 +     * that is mixing H.264 with progressive/clear/planar commands -- both look
 +     * identical from the H.264-only trace output. Codec IDs are those of
-+     * MS-RDPEGFX: 3=UNCOMPRESSED, 8=CAVIDEO(RFX), 9=CLEARCODEC, 10=PLANAR,
-+     * 11=AVC420, 12=ALPHA, 13=AVC444, 15=AVC444v2, 16=PROGRESSIVE,
-+     * 17=PROGRESSIVE_V2. */
++     * MS-RDPEGFX (see RDPGFX_CODECID_* in freerdp/channels/rdpgfx.h), in
++     * decimal: 0=UNCOMPRESSED, 3=CAVIDEO(RFX), 8=CLEARCODEC, 9=CAPROGRESSIVE,
++     * 10=PLANAR, 11=AVC420, 12=ALPHA, 13=CAPROGRESSIVE_V2, 14=AVC444,
++     * 15=AVC444v2. */
 +    guac_client_log(client, GUAC_LOG_TRACE,
 +            "GFX surface command: codec=%u, %ux%u at %u,%u",
 +            cmd->codecId, cmd->width, cmd->height, cmd->left, cmd->top);
