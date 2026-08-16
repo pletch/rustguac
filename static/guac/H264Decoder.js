@@ -129,6 +129,21 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     this.emptyStreams = 0;
     this.chunksSubmitted = 0;
 
+    /**
+     * Inter-frame arrival timing. A steady 21fps and a bursty 21fps produce
+     * identical frame counts but look very different: frames painted at uneven
+     * intervals judder regardless of the average rate. Deltas are measured
+     * between successive decoder outputs, which is the point at which a frame
+     * is painted.
+     */
+    var lastOutputTime = 0;
+    var gapCount = 0;
+    var gapSum = 0;
+    var gapMin = Infinity;
+    var gapMax = 0;
+    var gapsOver100 = 0;
+    var gapSquares = 0;
+
     this.framesDecoded = 0;
 
     /**
@@ -221,6 +236,19 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         decoder = new VideoDecoder({
             output: function(frame) {
                 self.framesDecoded++;
+
+                var now = performance.now();
+                if (lastOutputTime) {
+                    var gap = now - lastOutputTime;
+                    gapCount++;
+                    gapSum += gap;
+                    gapSquares += gap * gap;
+                    if (gap < gapMin) gapMin = gap;
+                    if (gap > gapMax) gapMax = gap;
+                    if (gap > 100) gapsOver100++;
+                }
+                lastOutputTime = now;
+
                 try {
                     var pos = pendingPositions[frame.timestamp];
                     delete pendingPositions[frame.timestamp];
@@ -437,6 +465,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var interval = (seconds || 5) * 1000;
         var startDecoded = self.framesDecoded;
         var startDropped = self.framesDropped;
+        gapCount = 0; gapSum = 0; gapSquares = 0;
+        gapMin = Infinity; gapMax = 0; gapsOver100 = 0;
+
         var startInstr = self.instructionsReceived;
         var startEnded = self.streamsEnded;
         var startSubmitted = self.chunksSubmitted;
@@ -455,7 +486,21 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     peakQueueDepth: self.peakQueueDepth,
                     avgLatencyMs  : decodeLatencyCount
                         ? +(decodeLatencySum / decodeLatencyCount).toFixed(1) : 0,
-                    peakLatencyMs : +self.peakDecodeLatency.toFixed(1)
+                    peakLatencyMs : +self.peakDecodeLatency.toFixed(1),
+
+                    // Arrival regularity. meanGapMs should equal
+                    // 1000/decodedPerSec; a stdDev approaching or exceeding
+                    // the mean means frames arrive in bursts, which judders
+                    // regardless of the average rate.
+                    meanGapMs     : gapCount ? +(gapSum / gapCount).toFixed(1) : 0,
+                    stdDevGapMs   : gapCount
+                        ? +Math.sqrt(Math.max(0,
+                            gapSquares / gapCount
+                            - (gapSum / gapCount) * (gapSum / gapCount))).toFixed(1)
+                        : 0,
+                    minGapMs      : gapMin === Infinity ? 0 : +gapMin.toFixed(1),
+                    maxGapMs      : +gapMax.toFixed(1),
+                    gapsOver100ms : gapsOver100
                 });
             }, interval);
         });
