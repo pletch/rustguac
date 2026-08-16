@@ -468,6 +468,36 @@ setup_ldconfig
 install_systemd() {
     info "Installing systemd services..."
 
+    # guacd environment file. Created only if absent -- the unit files below
+    # are rewritten on every run, so anything set directly in them (or via
+    # "systemctl edit") is lost on the next install. Local settings belong
+    # here instead, and this file is never overwritten.
+    if [[ ! -f "$PREFIX/guacd.env" ]]; then
+        cat > "$PREFIX/guacd.env" <<'EOF'
+# Environment for rustguac-guacd. Preserved across reinstalls.
+# Uncomment to enable; restart rustguac-guacd after changing.
+
+# Pass H.264 through to the client without decoding it in guacd. Requires a
+# server that sends AVC420 (xrdp with a GFX codec order listing H.264, or
+# Windows with GUAC_RDP_H264_AVC444=1 below plus AVC444ModePreferred=0 on the
+# host). Large CPU saving when it applies.
+#GUAC_RDP_H264_SKIP_DECODE=1
+
+# Advertise AVC444 capability so Windows offers RDPGFX V10 caps at all. The
+# passthrough still wants AVC420, which Windows sends only when its
+# AVC444ModePreferred registry value is 0.
+#GUAC_RDP_H264_AVC444=1
+
+# Set to 0 to stop suppressing image operations that overlap H.264 regions.
+# Correct either way; off costs the re-encode the passthrough exists to avoid.
+#GUAC_H264_SUPPRESS=0
+EOF
+        chown rustguac:rustguac "$PREFIX/guacd.env" 2>/dev/null || true
+        info "Created $PREFIX/guacd.env (edit to set guacd environment)."
+    else
+        info "Keeping existing $PREFIX/guacd.env"
+    fi
+
     # guacd service
     cat > /etc/systemd/system/rustguac-guacd.service <<EOF
 [Unit]
@@ -481,6 +511,7 @@ ExecStart=$PREFIX/sbin/guacd -b 127.0.0.1 -l 4822 -L info -f -C $PREFIX/tls/cert
 Restart=on-failure
 RestartSec=5
 Environment=LD_LIBRARY_PATH=$PREFIX/lib
+EnvironmentFile=-$PREFIX/guacd.env
 
 [Install]
 WantedBy=multi-user.target
