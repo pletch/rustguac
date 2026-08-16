@@ -1,0 +1,50 @@
+diff --git a/src/libguac/display-plan.c b/src/libguac/display-plan.c
+index 0e442a47..bf992e6d 100644
+--- a/src/libguac/display-plan.c
++++ b/src/libguac/display-plan.c
+@@ -32,6 +32,7 @@
+ #include "guacamole/timestamp.h"
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <cairo/cairo.h>
+ 
+@@ -461,6 +462,27 @@ static void guac_display_plan_send_h264_frame(guac_client* client,
+ 
+ }
+ 
++/**
++ * Returns non-zero if image operations overlapping H.264 regions should be
++ * suppressed. Suppression is an optimization -- it avoids re-encoding regions
++ * the H.264 stream already carries -- and setting GUAC_H264_SUPPRESS=0 turns
++ * it off so that a suspected over-suppression can be confirmed. With it off
++ * the display is still correct (image operations are drawn after the H.264
++ * frames of the same guacd frame, so they win), merely more expensive.
++ */
++static int guac_h264_suppress_enabled(void) {
++
++    static int cached = -1;
++
++    if (cached == -1) {
++        const char* value = getenv("GUAC_H264_SUPPRESS");
++        cached = !(value != NULL && strcmp(value, "0") == 0);
++    }
++
++    return cached;
++
++}
++
+ /**
+  * Records a region covered by an H.264 frame sent for the given layer during
+  * the current frame, so that guac_display_plan_apply() can suppress image
+@@ -632,7 +654,8 @@ void guac_display_plan_apply(guac_display_plan* plan) {
+          * encoding. Operations elsewhere on the layer carry updates encoded
+          * with other codecs (CAPROGRESSIVE, CLEARCODEC, PLANAR) and must still
+          * be sent, or those regions go stale. */
+-        if (display_layer->h264_rect_count > 0
++        if (guac_h264_suppress_enabled()
++                && display_layer->h264_rect_count > 0
+                 && guac_display_layer_h264_covers(display_layer, &op->dest)) {
+             op++;
+             continue;
