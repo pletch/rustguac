@@ -468,6 +468,25 @@ setup_ldconfig
 install_systemd() {
     info "Installing systemd services..."
 
+    # guacd environment file. Created only if absent -- the unit files below
+    # are rewritten on every run, so anything set directly in them (or via
+    # "systemctl edit") is lost on the next install. Local settings belong
+    # here instead, and this file is never overwritten.
+    if [[ ! -f "$PREFIX/guacd.env" ]]; then
+        cat > "$PREFIX/guacd.env" <<'EOF'
+# Environment for rustguac-guacd. Preserved across reinstalls.
+# Uncomment to enable; restart rustguac-guacd after changing.
+
+# guacd log level: trace, debug, info, warning, error. H.264 passthrough logs
+# per-surface-command codec detail at trace and per-frame detail at debug.
+#GUACD_LOG_LEVEL=debug
+EOF
+        chown rustguac:rustguac "$PREFIX/guacd.env" 2>/dev/null || true
+        info "Created $PREFIX/guacd.env (edit to set guacd environment)."
+    else
+        info "Keeping existing $PREFIX/guacd.env"
+    fi
+
     # guacd service
     cat > /etc/systemd/system/rustguac-guacd.service <<EOF
 [Unit]
@@ -477,10 +496,11 @@ After=network.target
 [Service]
 Type=simple
 User=rustguac
-ExecStart=$PREFIX/sbin/guacd -b 127.0.0.1 -l 4822 -L info -f -C $PREFIX/tls/cert.pem -K $PREFIX/tls/key.pem
+ExecStart=/bin/sh -c 'exec $PREFIX/sbin/guacd -b 127.0.0.1 -l 4822 -L \${GUACD_LOG_LEVEL:-info} -f -C $PREFIX/tls/cert.pem -K $PREFIX/tls/key.pem'
 Restart=on-failure
 RestartSec=5
 Environment=LD_LIBRARY_PATH=$PREFIX/lib
+EnvironmentFile=-$PREFIX/guacd.env
 
 [Install]
 WantedBy=multi-user.target
@@ -505,6 +525,22 @@ Environment=RUST_LOG=info
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    # Warn about systemd drop-ins. They merge with the unit written above and
+    # win, but live in a separate directory this script never touches, so a
+    # forgotten "systemctl edit" silently overrides everything here -- including
+    # ExecStart, which discards the log-level wrapper and any flags set above.
+    local dropin_dir="/etc/systemd/system/rustguac-guacd.service.d"
+    if compgen -G "$dropin_dir/*.conf" > /dev/null; then
+        warn "Systemd drop-in overrides exist and take precedence over the unit"
+        warn "just written. They are NOT managed by this installer:"
+        for f in "$dropin_dir"/*.conf; do
+            warn "  $f"
+            sed 's/^/      /' "$f" | while read -r line; do warn "$line"; done
+        done
+        warn "Review with: systemctl cat rustguac-guacd"
+        warn "Settings belong in $PREFIX/guacd.env instead, which persists."
+    fi
 
     systemctl daemon-reload
     systemctl enable rustguac-guacd.service
