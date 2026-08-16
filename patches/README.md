@@ -594,6 +594,22 @@ If AVC444 arrives regardless, the server is ignoring the flag, and `028` applies
 
 **Files patched:** `src/protocols/rdp/settings.c`
 
+## 030-h264-caps-version-diagnostics.patch
+
+**Problem:** with `029` deployed the server still sent AVC444, and there was no way to tell why. Two explanations need opposite responses: the server saw `AVC_THINCLIENT` and ignored it, or it confirmed a capability version that never carried the flag. FreeRDP appends the V10, V10.1 and V10.2 capability sets *before* adding `AVC_THINCLIENT` to its working flags, so any of those three arrives without the request.
+
+**Fix, part 1 -- see what was negotiated.** Wrap the RDPGFX `CapsConfirm` callback (the same technique `004` uses for `SurfaceCommand`) and log the confirmed version and flags, decoding `AVC420_ENABLED`, `AVC_DISABLED` and `AVC_THINCLIENT`. Warns explicitly when the confirmed version is below 10.3.
+
+```bash
+journalctl -u rustguac-guacd --since '2 min ago' | grep "RDPGFX capability version"
+```
+
+**Fix, part 2 -- force a version that carries the flag.** `GUAC_RDP_H264_CAPS_FILTER=1` sets FreeRDP's `GfxCapsFilter` to `0x1F`, suppressing V8, V8.1, V10, V10.1 and V10.2 and leaving only 10.3 and later. Off by default: it narrows what can be negotiated, and a server supporting nothing above 10.2 would end up with no graphics pipeline at all.
+
+Filter bit order follows `rdpgfx_is_capability_filtered()`: `V8, V8.1, V10, V10.1, V10.2, V10.3, V10.4, V10.5, V10.6, V10.6_ERR, V10.7`.
+
+**Files patched:** `src/protocols/rdp/channels/rdpgfx.c`, `src/protocols/rdp/rdp.h`, `src/protocols/rdp/settings.c`
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

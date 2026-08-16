@@ -1,0 +1,156 @@
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index 43948b42..609c4a20 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -440,12 +440,68 @@ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
+         rdp_client->orig_surface_command = (void*) rdpgfx->SurfaceCommand;
+         rdpgfx->SurfaceCommand = guac_rdp_gfx_surface_command;
+ 
++        rdp_client->orig_caps_confirm = (void*) rdpgfx->CapsConfirm;
++        rdpgfx->CapsConfirm = guac_rdp_gfx_caps_confirm;
++
+         guac_client_log(client, GUAC_LOG_INFO,
+                 "H.264 passthrough enabled for RDPGFX channel.");
+     }
+ 
+ }
+ 
++/**
++ * Wrapper for the RDPGFX CapsConfirm callback. Logs the capability version the
++ * server selected, which is otherwise invisible and determines how the session
++ * will behave.
++ *
++ * The AVC_THINCLIENT flag that requests AVC420 instead of AVC444 is only
++ * attached to capability sets from version 10.3 onward -- FreeRDP builds the
++ * V10, V10.1 and V10.2 sets before adding it. So a server that confirms one of
++ * those three never saw the request, and will send AVC444 regardless of what
++ * was intended. Without this log, that case is indistinguishable from a server
++ * that saw the flag and ignored it.
++ */
++static UINT guac_rdp_gfx_caps_confirm(RdpgfxClientContext* context,
++        const RDPGFX_CAPS_CONFIRM_PDU* capsConfirm) {
++
++    rdpGdi* gdi = (rdpGdi*) context->custom;
++    guac_client* client = ((rdp_freerdp_context*) gdi->context)->client;
++    guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
++
++    if (capsConfirm != NULL && capsConfirm->capsSet != NULL) {
++
++        UINT32 version = capsConfirm->capsSet->version;
++        UINT32 flags = capsConfirm->capsSet->flags;
++
++        guac_client_log(client, GUAC_LOG_INFO,
++                "RDPGFX capability version 0x%08X confirmed by server "
++                "(flags 0x%08X). AVC420_ENABLED=%s AVC_DISABLED=%s "
++                "AVC_THINCLIENT=%s", version, flags,
++                (flags & 0x00000010) ? "yes" : "no",
++                (flags & 0x00000020) ? "yes" : "no",
++                (flags & 0x00000040) ? "yes" : "no");
++
++        /* 0x000A0003 is RDPGFX_CAPVERSION_103 */
++        if (version < 0x000A0003)
++            guac_client_log(client, GUAC_LOG_WARNING,
++                    "Server confirmed an RDPGFX capability version below 10.3, "
++                    "which predates the AVC_THINCLIENT flag. The request for "
++                    "AVC420 was never sent, so the server may send AVC444. Set "
++                    "GUAC_RDP_H264_CAPS_FILTER=1 to advertise only 10.3 and "
++                    "later.");
++
++    }
++
++    pcRdpgfxCapsConfirm orig =
++            (pcRdpgfxCapsConfirm) rdp_client->orig_caps_confirm;
++
++    if (orig != NULL)
++        return orig(context, capsConfirm);
++
++    return CHANNEL_RC_OK;
++
++}
++
+ /**
+  * Callback which handles any RDPGFX cleanup specific to Guacamole.
+  *
+diff --git a/src/protocols/rdp/rdp.h b/src/protocols/rdp/rdp.h
+index a0893ffb..82ca5a1d 100644
+--- a/src/protocols/rdp/rdp.h
++++ b/src/protocols/rdp/rdp.h
+@@ -139,6 +139,14 @@ typedef struct guac_rdp_client {
+      */
+     void* orig_surface_command;
+ 
++    /**
++     * The original RDPGFX CapsConfirm callback, wrapped so that the capability
++     * version the server actually selected can be logged. Which version is
++     * confirmed determines whether the AVC_THINCLIENT flag was ever sent: it
++     * is only present from caps 10.3 onward.
++     */
++    void* orig_caps_confirm;
++
+     /**
+      * Queue of mouse, keyboard, and touch events. These events are accumulated
+      * and flushed within the RDP client thread to avoid spending excessive
+diff --git a/src/protocols/rdp/settings.c b/src/protocols/rdp/settings.c
+index 4dadb3bc..ff4c4f2f 100644
+--- a/src/protocols/rdp/settings.c
++++ b/src/protocols/rdp/settings.c
+@@ -1616,6 +1616,39 @@ int guac_rdp_get_depth(freerdp* rdp) {
+ #endif
+ }
+ 
++/**
++ * Returns the RDPGFX capability versions to suppress, as a FreeRDP
++ * GfxCapsFilter bitmask, or zero to advertise everything.
++ *
++ * The AVC_THINCLIENT flag that requests AVC420 rather than AVC444 is only
++ * carried by capability sets from version 10.3 onward: FreeRDP appends the
++ * V10, V10.1 and V10.2 sets before adding the flag to its working copy of the
++ * flags. A server free to choose any version may therefore confirm one that
++ * never carried the request, and send AVC444 anyway.
++ *
++ * Setting GUAC_RDP_H264_CAPS_FILTER=1 suppresses V8, V8.1, V10, V10.1 and
++ * V10.2 (bits 0 through 4 of the filter, in the order FreeRDP lists them in
++ * rdpgfx_is_capability_filtered), leaving only 10.3 and later -- every one of
++ * which carries the flag.
++ *
++ * Off by default: it narrows what the session can negotiate, and a server
++ * supporting nothing above 10.2 would end up with no graphics pipeline at all.
++ *
++ * @return
++ *     The GfxCapsFilter bitmask to apply, or zero for no filtering.
++ */
++static UINT32 guac_rdp_h264_caps_filter(void) {
++
++    const char* value = getenv("GUAC_RDP_H264_CAPS_FILTER");
++
++    /* V8 | V8.1 | V10 | V10.1 | V10.2 */
++    if (value != NULL && strcmp(value, "1") == 0)
++        return 0x1F;
++
++    return 0;
++
++}
++
+ /**
+  * Returns non-zero if the RDPGFX AVC_THINCLIENT capability flag should be
+  * advertised, which tells the server this client supports AVC420 but not
+@@ -1750,6 +1783,19 @@ void guac_rdp_push_settings(guac_client* client,
+             freerdp_settings_set_bool(rdp_settings, FreeRDP_GfxThinClient,
+                     avc444 && avc420_only);
+ 
++            /* Optionally suppress the capability versions that predate the
++             * AVC_THINCLIENT flag, so the server cannot confirm one that never
++             * carried the request. */
++            UINT32 caps_filter = guac_rdp_h264_caps_filter();
++            if (caps_filter != 0) {
++                freerdp_settings_set_uint32(rdp_settings,
++                        FreeRDP_GfxCapsFilter, caps_filter);
++                guac_client_log(client, GUAC_LOG_INFO,
++                        "GUAC_RDP_H264_CAPS_FILTER is set: advertising only "
++                        "RDPGFX capability versions 10.3 and later, all of "
++                        "which carry the AVC420 request.");
++            }
++
+             if (avc444 && avc420_only)
+                 guac_client_log(client, GUAC_LOG_INFO,
+                         "Advertising AVC444 to reach the RDPGFX V10 capability "
