@@ -330,6 +330,18 @@ This is what produced the corrupted areas on Windows that `013` did not fix — 
 | `src/libguac/display-plan.c` | Send the region list; track precise regions for suppression |
 | `src/protocols/rdp/channels/rdpgfx.c` | Convert and forward `meta.regionRects` for AVC420 and AVC444 |
 
+## 016-h264-suppress-switch.patch / 017-h264-suppress-img-only.patch
+
+**Problem:** `013`'s suppression over-fired. Dragging a window containing video left stale rectangles along the path it travelled. Confirmed by `016`, which adds `GUAC_H264_SUPPRESS=0` to disable suppression entirely — with it off, the artefacts disappear.
+
+Two distinct causes, both fixed by `017`:
+
+1. **`COPY` and `RECT` operations were being suppressed.** Suppression exists solely to avoid re-encoding regions the H.264 stream already carries, and only `IMG` operations encode anything. A window drag is expressed as copies; dropping those discards real content and saves nothing. `017` restricts suppression to `GUAC_DISPLAY_PLAN_OPERATION_IMG`.
+
+2. **Regions were accumulated across every H.264 frame in a flush.** A flush may carry several frames, so a moving window's regions unioned into the swept path — suppressing everything underneath and leaving the vacated areas stale. The client draws the frames in order, so only the last determines the final state of the H.264 area; regions covered solely by earlier frames must still receive their image updates. `017` retains only the most recent frame's regions.
+
+`GUAC_H264_SUPPRESS=0` is retained as a diagnostic. With suppression off the display is still correct — image operations are drawn after the H.264 frames of the same guacd frame, so they win — merely more expensive, which forfeits the entire benefit of the passthrough on mixed-codec servers.
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:
