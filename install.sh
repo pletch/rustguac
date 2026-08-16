@@ -477,6 +477,10 @@ install_systemd() {
 # Environment for rustguac-guacd. Preserved across reinstalls.
 # Uncomment to enable; restart rustguac-guacd after changing.
 
+# guacd log level: trace, debug, info, warning, error. The H.264 diagnostics
+# log per-surface-command detail at trace and per-frame detail at debug.
+#GUACD_LOG_LEVEL=debug
+
 # Pass H.264 through to the client without decoding it in guacd. Requires a
 # server that sends AVC420 (xrdp with a GFX codec order listing H.264, or
 # Windows with GUAC_RDP_H264_AVC444=1 below plus AVC444ModePreferred=0 on the
@@ -507,7 +511,7 @@ After=network.target
 [Service]
 Type=simple
 User=rustguac
-ExecStart=$PREFIX/sbin/guacd -b 127.0.0.1 -l 4822 -L info -f -C $PREFIX/tls/cert.pem -K $PREFIX/tls/key.pem
+ExecStart=/bin/sh -c 'exec $PREFIX/sbin/guacd -b 127.0.0.1 -l 4822 -L \${GUACD_LOG_LEVEL:-info} -f -C $PREFIX/tls/cert.pem -K $PREFIX/tls/key.pem'
 Restart=on-failure
 RestartSec=5
 Environment=LD_LIBRARY_PATH=$PREFIX/lib
