@@ -1,18 +1,9 @@
 diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
-index 43948b42..609c4a20 100644
+index 43948b42..252d431d 100644
 --- a/src/protocols/rdp/channels/rdpgfx.c
 +++ b/src/protocols/rdp/channels/rdpgfx.c
-@@ -440,12 +440,68 @@ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
-         rdp_client->orig_surface_command = (void*) rdpgfx->SurfaceCommand;
-         rdpgfx->SurfaceCommand = guac_rdp_gfx_surface_command;
- 
-+        rdp_client->orig_caps_confirm = (void*) rdpgfx->CapsConfirm;
-+        rdpgfx->CapsConfirm = guac_rdp_gfx_caps_confirm;
-+
-         guac_client_log(client, GUAC_LOG_INFO,
-                 "H.264 passthrough enabled for RDPGFX channel.");
-     }
- 
+@@ -394,6 +394,57 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+     return result;
  }
  
 +/**
@@ -66,6 +57,22 @@ index 43948b42..609c4a20 100644
 +
 +    return CHANNEL_RC_OK;
 +
+ /**
+  * Callback which associates handlers specific to Guacamole with the
+  * RdpgfxClientContext instance allocated by FreeRDP to deal with received
+@@ -440,12 +491,17 @@ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
+         rdp_client->orig_surface_command = (void*) rdpgfx->SurfaceCommand;
+         rdpgfx->SurfaceCommand = guac_rdp_gfx_surface_command;
+ 
++        rdp_client->orig_caps_confirm = (void*) rdpgfx->CapsConfirm;
++        rdpgfx->CapsConfirm = guac_rdp_gfx_caps_confirm;
++
+         guac_client_log(client, GUAC_LOG_INFO,
+                 "H.264 passthrough enabled for RDPGFX channel.");
+     }
+ 
+ }
+ 
 +}
 +
  /**
