@@ -146,6 +146,18 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * is painted.
      */
     var lastOutputTime = 0;
+
+    /**
+     * Time of the first decoder output since the current rate() sample began.
+     *
+     * Gaps are only recorded between successive outputs, so silence at either
+     * end of a sample window is invisible to them: a stream that delivers one
+     * clean burst and then stops reports a healthy mean gap and no long gaps
+     * at all, while the frame rate collapses. Recording where the first and
+     * last outputs fell within the window makes that shape explicit instead of
+     * leaving it to be inferred from a contradiction between the two.
+     */
+    var firstOutputTime = 0;
     var gapCount = 0;
     var gapSum = 0;
     var gapMin = Infinity;
@@ -349,6 +361,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     frameRegistry.register(frame, frameState);
 
                 var now = performance.now();
+                if (!firstOutputTime) firstOutputTime = now;
                 if (lastOutputTime) {
                     var gap = now - lastOutputTime;
                     gapCount++;
@@ -582,6 +595,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         // measured from the last frame BEFORE sampling began -- which for an
         // idle session is arbitrarily large and skews mean, stdDev and max.
         lastOutputTime = 0;
+        firstOutputTime = 0;
+        var sampleStart = performance.now();
         gapCount = 0; gapSum = 0; gapSquares = 0;
         gapMin = Infinity; gapMax = 0; gapsOver100 = 0;
 
@@ -617,7 +632,21 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                         : 0,
                     minGapMs      : gapMin === Infinity ? 0 : +gapMin.toFixed(1),
                     maxGapMs      : +gapMax.toFixed(1),
-                    gapsOver100ms : gapsOver100
+                    gapsOver100ms : gapsOver100,
+
+                    // Where the frames actually fell within the window. A
+                    // burst followed by silence and a genuinely steady stream
+                    // produce the same mean gap; these tell them apart.
+                    // activeSpanMs well below windowMs means the stream
+                    // stopped rather than slowed.
+                    windowMs      : +(performance.now() - sampleStart).toFixed(0),
+                    activeSpanMs  : (firstOutputTime && lastOutputTime)
+                        ? +(lastOutputTime - firstOutputTime).toFixed(0) : 0,
+                    idleAtStartMs : firstOutputTime
+                        ? +(firstOutputTime - sampleStart).toFixed(0)
+                        : +(performance.now() - sampleStart).toFixed(0),
+                    idleAtEndMs   : lastOutputTime
+                        ? +(performance.now() - lastOutputTime).toFixed(0) : 0
                 });
             }, interval);
         });
