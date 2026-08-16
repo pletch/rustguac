@@ -1,0 +1,82 @@
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index ca0cb8a4..8bf772ad 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -172,15 +172,19 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+     guac_client* client = ((rdp_freerdp_context*) rdp_context)->client;
+     guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
+ 
+-    /* Any surface command that is not H.264 paints content the H.264 stream
+-     * does not carry. Suppression of image operations assumes the opposite, so
+-     * record where the other codec painted and let the display exempt that
+-     * area from suppression for this frame. Checked against the codec ID
+-     * rather than against whether NAL data was captured, so that an H.264
+-     * command whose capture failed is not misreported as another codec. */
+-    if (cmd->codecId != RDPGFX_CODECID_AVC420
+-            && cmd->codecId != RDPGFX_CODECID_AVC444
+-            && cmd->codecId != RDPGFX_CODECID_AVC444v2) {
++    /* Any surface command not passed through as H.264 paints content the
++     * H.264 stream does not carry. Suppression of image operations assumes the
++     * opposite, so record where the other codec painted and let the display
++     * exempt that area from suppression for this frame.
++     *
++     * AVC444 counts as "another codec" here despite being H.264: it is not
++     * captured for passthrough (see below), so it reaches the client only as a
++     * decoded and re-encoded image, which suppression must not discard.
++     *
++     * Tested against the codec ID rather than against whether NAL data was
++     * captured, so that an AVC420 command whose capture failed is not silently
++     * treated as passed through. */
++    if (cmd->codecId != RDPGFX_CODECID_AVC420) {
+ 
+         guac_rect mixed;
+         guac_rect_init(&mixed, cmd->left, cmd->top,
+@@ -252,23 +256,33 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+             }
+         }
+     }
++    /* AVC444 is deliberately NOT captured. It splits the image across two
++     * bitstreams -- bitstream[0] carries the main view, bitstream[1] an
++     * auxiliary view from which the full-resolution chroma is reconstructed.
++     * Forwarding bitstream[0] alone produces a picture that is half luma and
++     * half auxiliary chroma: the screen renders as a green half and a pink
++     * half. Reconstructing YUV444 in the browser would need a second decoder
++     * and a chroma merge pass, which is not implemented.
++     *
++     * Falling through without setting saved_h264 leaves these commands to the
++     * normal GDI decode path, so they render correctly at the cost of the
++     * decode plus a re-encode. Correctness does not then depend on the
++     * server's AVC444ModePreferred registry value being right -- a host that
++     * negotiates AVC444 for any reason simply loses the passthrough for those
++     * commands rather than displaying garbage. */
+     else if ((cmd->codecId == RDPGFX_CODECID_AVC444
+-           || cmd->codecId == RDPGFX_CODECID_AVC444v2)
+-           && cmd->extra != NULL) {
+-        RDPGFX_AVC444_BITMAP_STREAM* avc444 =
+-                (RDPGFX_AVC444_BITMAP_STREAM*) cmd->extra;
+-        if (avc444->bitstream[0].data != NULL
+-                && avc444->bitstream[0].length > 0) {
+-            saved_length = avc444->bitstream[0].length;
+-            saved_h264 = malloc(saved_length);
+-            if (saved_h264 != NULL) {
+-                memcpy(saved_h264, avc444->bitstream[0].data, saved_length);
+-                saved_keyframe = guac_rdp_h264_is_keyframe(
+-                        saved_h264, saved_length, &saved_nal_types);
+-                saved_rects = guac_rdp_h264_copy_rects(
+-                        &avc444->bitstream[0].meta, &saved_num_rects);
+-            }
++           || cmd->codecId == RDPGFX_CODECID_AVC444v2)) {
++
++        static int warned = 0;
++        if (!warned) {
++            warned = 1;
++            guac_client_log(client, GUAC_LOG_WARNING,
++                    "Server is sending AVC444; H.264 passthrough is disabled "
++                    "for those commands and they will be decoded and "
++                    "re-encoded instead. Set AVC444ModePreferred to 0 on the "
++                    "RDP host to get AVC420 and restore the passthrough.");
+         }
++
+     }
+ 
+     UINT result = CHANNEL_RC_OK;

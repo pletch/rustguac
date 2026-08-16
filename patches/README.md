@@ -484,6 +484,18 @@ Long GDI decodes immediately before each arrival gap mean guacd stalled the serv
 
 **Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
 
+## 025-h264-avc444-no-passthrough.patch
+
+**Problem:** `004` captured AVC444 and AVC444v2 commands and forwarded `bitstream[0]`. AVC444 splits the image across two bitstreams -- `bitstream[0]` is the main view, `bitstream[1]` an auxiliary view from which full-resolution chroma is reconstructed -- so forwarding the first alone renders half the screen green and half pink.
+
+`012` worked around this by advertising the AVC444 capability (Windows offers no H.264 at all without the RDPGFX V10 caps, which FreeRDP reaches only via `GfxAVC444`) while relying on `AVC444ModePreferred=0` on the host to make Windows decline it and send AVC420. That makes correct rendering depend on a registry value on a machine we do not control. It resurfaced the moment the Windows host's graphics pipeline changed: disabling the WDDM Remote Desktop display driver (needed there to get NVENC engaged at all) changed the negotiation and Windows chose AVC444 again.
+
+**Fix:** never capture AVC444. Those commands fall through to the normal GDI decode and are re-encoded as images, so they render correctly at CPU cost. A host that negotiates AVC444 for any reason now loses the passthrough for those commands instead of displaying garbage. Logged once per connection at `WARNING`, naming the registry value that restores AVC420.
+
+The mixed-codec test in the same function narrowed to `codecId != AVC420` to match: AVC444 is H.264 but is no longer passed through, so the images it produces must be exempt from suppression like any other codec's.
+
+**Files patched:** `src/protocols/rdp/channels/rdpgfx.c`
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:
