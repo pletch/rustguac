@@ -1,0 +1,37 @@
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index 8ebc7e3f..2d9cfba4 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -148,8 +148,9 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+      * 10=PLANAR, 11=AVC420, 12=ALPHA, 13=CAPROGRESSIVE_V2, 14=AVC444,
+      * 15=AVC444v2. */
+     guac_client_log(client, GUAC_LOG_TRACE,
+-            "GFX surface command: codec=%u, %ux%u at %u,%u",
+-            cmd->codecId, cmd->width, cmd->height, cmd->left, cmd->top);
++            "GFX surface command: surface=%u, codec=%u, %ux%u at %u,%u",
++            cmd->surfaceId, cmd->codecId,
++            cmd->width, cmd->height, cmd->left, cmd->top);
+ 
+     /* Save H.264 NAL data BEFORE calling the original handler. The original
+      * GDI handler may free or modify cmd->extra data during AVC decoding,
+@@ -244,10 +245,18 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+             rdp_client->gdi_modified = 1;
+ 
+         guac_client_log(client, GUAC_LOG_TRACE,
+-                "H.264 passthrough: %u bytes, %s, %ux%u at %u,%u",
++                "H.264 passthrough: %u bytes, %s, %ux%u at %u,%u, rects=%i",
+                 saved_length,
+                 saved_keyframe ? "keyframe" : "delta",
+-                cmd->width, cmd->height, cmd->left, cmd->top);
++                cmd->width, cmd->height, cmd->left, cmd->top,
++                saved_num_rects);
++
++        if (saved_num_rects > 0)
++            guac_client_log(client, GUAC_LOG_TRACE,
++                    "H.264 first region: %ix%i at %i,%i",
++                    guac_rect_width(&saved_rects[0]),
++                    guac_rect_height(&saved_rects[0]),
++                    saved_rects[0].left, saved_rects[0].top);
+         free(saved_h264);
+     }
+ 
