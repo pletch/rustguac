@@ -264,62 +264,73 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
             output: function(frame) {
 
-                var frameState = pendingFrames[frame.timestamp];
+                var frameState = null;
+                var canvas = null;
 
-                /* The draw task already gave up on this frame, or it belongs
-                 * to a decoder that has since been replaced. */
-                if (!frameState) {
-                    frame.close();
-                    return;
-                }
-
-                if (frameState.watchdog) {
-                    clearTimeout(frameState.watchdog);
-                    frameState.watchdog = null;
-                }
-
-                /* An auxiliary AVC444 view is not an image. It had to be
-                 * decoded to keep the sequence's reference chain intact, but
-                 * drawing it would paint packed chroma data over the screen. */
-                if (frameState.view !== 0) {
-                    frame.close();
-                    if (frameState.onReady)
-                        frameState.onReady();
-                    return;
-                }
-
-                /* Snapshot to a canvas and release the VideoFrame before
-                 * returning, rather than holding it until the draw task runs.
-                 * A hardware decoder has a small pool of output surfaces and an
-                 * open VideoFrame holds one, so holding frames until their
-                 * scheduled draw exhausts that pool as soon as the display
-                 * queue falls behind: the decoder stalls, which delays the
-                 * draws, which holds more frames.
-                 *
-                 * The copy is synchronous, and deliberately so. Snapshotting
-                 * via createImageBitmap() leaves the frame open across a
-                 * promise, and any path where that promise neither resolves
-                 * nor rejects orphans the frame with its surface still held.
-                 * That surface is only recovered when the collector eventually
-                 * runs, which is exactly the brief decoder stall it was meant
-                 * to avoid. Closing in a finally, with no await in between,
-                 * removes the window entirely. */
-                var canvas = acquireCanvas(frame.displayWidth,
-                        frame.displayHeight);
-
+                /* Everything touching the frame runs inside this try, so that
+                 * the close in the finally covers every path out -- including
+                 * one thrown from acquiring the snapshot canvas. A frame that
+                 * escapes without being closed holds one of the hardware
+                 * decoder's output surfaces until the collector runs, and
+                 * enough of them stall decoding outright. */
                 try {
+
+                    frameState = pendingFrames[frame.timestamp];
+
+                    /* The draw task already gave up on this frame, or it
+                     * belongs to a decoder that has since been replaced. */
+                    if (!frameState)
+                        return;
+
+                    if (frameState.watchdog) {
+                        clearTimeout(frameState.watchdog);
+                        frameState.watchdog = null;
+                    }
+
+                    /* An auxiliary AVC444 view is not an image. It had to be
+                     * decoded to keep the sequence's reference chain intact,
+                     * but drawing it would paint packed chroma over the
+                     * screen. Leave canvas null: nothing is drawn, but the
+                     * task below is still released. */
+                    if (frameState.view !== 0)
+                        return;
+
+                    /* Snapshot to a canvas and release the VideoFrame before
+                     * returning, rather than holding it until the draw task
+                     * runs. Holding frames until their scheduled draw exhausts
+                     * the surface pool as soon as the display queue falls
+                     * behind: the decoder stalls, which delays the draws,
+                     * which holds more frames.
+                     *
+                     * The copy is synchronous, and deliberately so.
+                     * Snapshotting via createImageBitmap() leaves the frame
+                     * open across a promise, and any path where that promise
+                     * neither resolves nor rejects orphans the frame with its
+                     * surface still held. Closing in a finally, with no await
+                     * in between, removes the window rather than narrowing
+                     * it. */
+                    canvas = acquireCanvas(frame.displayWidth,
+                            frame.displayHeight);
+
                     canvas.getContext('2d').drawImage(frame, 0, 0);
+                    frameState.canvas = canvas;
+
                 } catch (e) {
+
                     console.error('[rustguac] H.264 snapshot failed:',
                             e.message);
+
                     releaseCanvas(canvas);
-                    canvas = null;
+                    if (frameState)
+                        frameState.canvas = null;
+
                 } finally {
                     frame.close();
                 }
 
-                frameState.canvas = canvas;
-                if (frameState.onReady)
+                /* Released after the frame is closed, since this runs the
+                 * display queue synchronously and may draw several frames. */
+                if (frameState && frameState.onReady)
                     frameState.onReady();
 
             },
