@@ -1036,12 +1036,31 @@ Guacamole.Display = function() {
             decoder.drawDecoded(token);
         }, true);
 
+        /* Unblocking runs the display queue synchronously, and the decoder may
+         * invoke this from within decode() itself -- at which point token is
+         * still null and the draw task would run against nothing, discarding a
+         * frame that decoded perfectly well. Hold any such call until decode()
+         * has returned and token is assigned. */
+        var decoding = true;
+        var readyDuringDecode = false;
+
+        var unblock = function __display_h264_ready() {
+            if (decoding)
+                readyDuringDecode = true;
+            else
+                task.unblock();
+        };
+
         /* The decoder unblocks the task once the frame is available, or
          * immediately if it cannot be decoded at all -- an unblocked task is
          * required either way, or this frame and every frame behind it stalls
          * in the queue. */
         token = decoder.decode(layer, x, y, width, height, nalData,
-                isKeyFrame, rects, task.unblock, view);
+                isKeyFrame, rects, unblock, view);
+
+        decoding = false;
+        if (readyDuringDecode)
+            task.unblock();
 
     };
 
