@@ -156,21 +156,76 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
-     * Releases any ImageBitmap still held awaiting its draw task. Frames live
-     * here between decode and draw, so discarding the map without closing them
-     * leaks GPU memory.
+     * Canvases available for reuse as frame snapshots. A snapshot is held from
+     * decode until its draw task runs, so several are live at once and one
+     * shared canvas will not do. Allocating a fresh canvas per frame instead
+     * would churn a 1080p-sized buffer at frame rate.
+     *
+     * @private
+     * @type {HTMLCanvasElement[]}
+     */
+    var canvasPool = [];
+
+    /**
+     * Maximum number of canvases to retain for reuse. The pipeline holds only a
+     * few frames at a time; canvases beyond this are dropped for collection
+     * rather than kept alive indefinitely after a burst.
+     *
+     * @private
+     * @constant
+     * @type {number}
+     */
+    var MAX_CANVAS_POOL = 8;
+
+    /**
+     * Returns a canvas of the given size, reusing a pooled one where possible.
+     *
+     * @private
+     * @param {number} width - Required width, in pixels.
+     * @param {number} height - Required height, in pixels.
+     * @returns {!HTMLCanvasElement}
+     */
+    function acquireCanvas(width, height) {
+
+        var canvas = canvasPool.pop();
+        if (!canvas)
+            canvas = document.createElement('canvas');
+
+        /* Assigning either dimension clears the canvas, so only resize when the
+         * size actually differs; the frame is about to overwrite it anyway. */
+        if (canvas.width !== width)
+            canvas.width = width;
+        if (canvas.height !== height)
+            canvas.height = height;
+
+        return canvas;
+
+    }
+
+    /**
+     * Returns a canvas to the pool for reuse.
+     *
+     * @private
+     * @param {HTMLCanvasElement} canvas - The canvas to release.
+     */
+    function releaseCanvas(canvas) {
+        if (canvas && canvasPool.length < MAX_CANVAS_POOL)
+            canvasPool.push(canvas);
+    }
+
+    /**
+     * Releases any frame snapshot still held awaiting its draw task. Snapshots
+     * live here between decode and draw, so discarding the map without
+     * reclaiming them throws away the pool's canvases.
      *
      * @private
      */
     function releaseHeldFrames() {
         for (var key in pendingFrames) {
             var frameState = pendingFrames[key];
-            if (frameState && frameState.bitmap) {
-                try {
-                    frameState.bitmap.close();
-                } catch (e) {
-                    /* Already closed */
-                }
+            if (frameState && frameState.canvas) {
+                releaseCanvas(frameState.canvas);
+                frameState.canvas = null;
             }
         }
         pendingFrames = {};
@@ -233,39 +288,39 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     return;
                 }
 
-                /* Snapshot to an ImageBitmap and release the VideoFrame at
-                 * once, rather than holding it until the draw task runs. A
-                 * hardware decoder has a small pool of output surfaces and an
+                /* Snapshot to a canvas and release the VideoFrame before
+                 * returning, rather than holding it until the draw task runs.
+                 * A hardware decoder has a small pool of output surfaces and an
                  * open VideoFrame holds one, so holding frames until their
                  * scheduled draw exhausts that pool as soon as the display
                  * queue falls behind: the decoder stalls, which delays the
-                 * draws, which holds more frames. An ImageBitmap has no such
-                 * pool, at the cost of one copy per frame. */
-                createImageBitmap(frame).then(function(bitmap) {
+                 * draws, which holds more frames.
+                 *
+                 * The copy is synchronous, and deliberately so. Snapshotting
+                 * via createImageBitmap() leaves the frame open across a
+                 * promise, and any path where that promise neither resolves
+                 * nor rejects orphans the frame with its surface still held.
+                 * That surface is only recovered when the collector eventually
+                 * runs, which is exactly the brief decoder stall it was meant
+                 * to avoid. Closing in a finally, with no await in between,
+                 * removes the window entirely. */
+                var canvas = acquireCanvas(frame.displayWidth,
+                        frame.displayHeight);
 
+                try {
+                    canvas.getContext('2d').drawImage(frame, 0, 0);
+                } catch (e) {
+                    console.error('[rustguac] H.264 snapshot failed:',
+                            e.message);
+                    releaseCanvas(canvas);
+                    canvas = null;
+                } finally {
                     frame.close();
+                }
 
-                    if (frameState.settled) {
-                        bitmap.close();
-                        return;
-                    }
-
-                    frameState.bitmap = bitmap;
-                    if (frameState.onReady)
-                        frameState.onReady();
-
-                }).catch(function() {
-
-                    try {
-                        frame.close();
-                    } catch (e) {
-                        /* Already closed */
-                    }
-
-                    if (frameState.onReady)
-                        frameState.onReady();
-
-                });
+                frameState.canvas = canvas;
+                if (frameState.onReady)
+                    frameState.onReady();
 
             },
 
@@ -366,7 +421,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 rects: (rects && rects.length) ? rects : null,
                 view: view || 0,
                 onReady: onReady,
-                bitmap: null,
+                canvas: null,
                 settled: false,
                 watchdog: null
             };
@@ -375,7 +430,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
             frameState.watchdog = setTimeout(function() {
                 frameState.watchdog = null;
-                if (!frameState.bitmap && frameState.onReady)
+                if (!frameState.canvas && frameState.onReady)
                     frameState.onReady();
             }, DECODE_WATCHDOG_MS);
 
@@ -383,9 +438,38 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             return token;
 
         } catch (e) {
+
             console.error('[rustguac] H.264 chunk error:', e.message);
+
+            /* The frame may already have been registered and counted before
+             * the throw. Returning null means drawDecoded() will never be
+             * called for it, so nothing else will ever settle it, and an
+             * unsettled decode holds pendingDecodes above zero permanently:
+             * resolveIfIdle() then never fires again and every subsequent sync
+             * waits out its full timeout. Undo the registration here.
+             *
+             * frameState is undefined if the throw came from constructing the
+             * chunk, before anything was registered. */
+            if (frameState) {
+                if (frameState.watchdog) {
+                    clearTimeout(frameState.watchdog);
+                    frameState.watchdog = null;
+                }
+                delete pendingFrames[token];
+
+                /* A snapshot already taken for this frame would otherwise be
+                 * stranded outside the pool, since no draw task will run. */
+                if (frameState.canvas) {
+                    releaseCanvas(frameState.canvas);
+                    frameState.canvas = null;
+                }
+
+                settle(frameState);
+            }
+
             if (onReady) onReady();
             return null;
+
         }
 
     };
@@ -418,8 +502,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             frameState.watchdog = null;
         }
 
-        var bitmap = frameState.bitmap;
-        if (!bitmap) {
+        var snapshot = frameState.canvas;
+        if (!snapshot) {
             settle(frameState);
             return;
         }
@@ -437,7 +521,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 if (frameState.rects) {
                     for (var r = 0; r < frameState.rects.length; r++) {
                         var rect = frameState.rects[r];
-                        ctx.drawImage(bitmap,
+                        ctx.drawImage(snapshot,
                                 rect.x, rect.y, rect.width, rect.height,
                                 rect.x, rect.y, rect.width, rect.height);
                     }
@@ -445,12 +529,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
                 /* No regions given: the entire picture is valid */
                 else
-                    ctx.drawImage(bitmap, frameState.x, frameState.y);
+                    ctx.drawImage(snapshot, frameState.x, frameState.y);
 
             }
 
         } finally {
-            bitmap.close();
+            frameState.canvas = null;
+            releaseCanvas(snapshot);
             settle(frameState);
         }
 
