@@ -108,6 +108,21 @@ Provider discovery is **lazy with retry** (`OidcState::client()` in `src/oidc.rs
 - The `rustguac` system user MUST have a real home directory (`/home/rustguac`) or Chromium's crashpad crashes with `trap int3`.
 - Each Chromium session gets an isolated `--user-data-dir` to avoid profile lock conflicts.
 
+### H.264 passthrough (RDP)
+
+Per-connection **H.264** checkbox forwards the RDP server's H.264 stream to the
+browser's WebCodecs decoder instead of decoding it in guacd and re-encoding as
+JPEG/WebP. Takes guacd from ~100% of a core to ~2% with 1080p video, on both
+xrdp and Windows. No environment variables — `enable-h264` is the only switch.
+
+**Windows hosts need host-side settings, and one is non-obvious:** the Group
+Policy *"Use WDDM graphics display driver for Remote Desktop Connections"* must
+be **Disabled** or hardware H.264 encoding never engages (GPU 3D shows load
+while Video Encode stays at 0%). `AVC444ModePreferred=1` is also required *for
+hardware encoding*, and makes Windows send AVC444 — which is handled: both
+views are forwarded and only the main one is drawn, so chroma is 4:2:0. Full
+details, including verification commands, in `docs/rdp-h264.md`.
+
 ## guacamole-server patches
 
 The `patches/` directory contains patches applied to guacamole-server before building. These fix:
@@ -115,6 +130,7 @@ The `patches/` directory contains patches applied to guacamole-server before bui
 1. **Autoconf `-Werror` vs deprecated FreeRDP headers** — FreeRDP 3.15 deprecates `codecs_free()`, breaking `-Werror` compile tests and cascading into missing feature macros.
 2. **Deprecated function pointer API** — Replaces `->input->KeyboardEvent()` etc. with `freerdp_input_send_keyboard_event()` safe API.
 3. **NULL deref in display channel** — FreeRDP 3.x fires PubSub events before `guac_rdp_disp` is allocated.
+4. **H.264 passthrough** (`004-h264-passthrough.patch`) — see `docs/rdp-h264.md`.
 
 To add a new patch: edit `../guacamole-server`, export with `git diff > patches/NNN-description.patch`.
 

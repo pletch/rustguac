@@ -12,6 +12,11 @@ var Guacamole = Guacamole || {};
  * H.264 video decoder that uses the WebCodecs VideoDecoder API for
  * hardware-accelerated decoding of H.264 NAL units received from guacd.
  *
+ * Frames are not drawn from the decoder's output callback. They are drawn from
+ * a task scheduled on the display's queue at the point the instruction
+ * arrived, so that decoded video is painted in stream order rather than
+ * whenever decode happens to finish. See Guacamole.Display.drawH264().
+ *
  * @constructor
  * @param {!Guacamole.Display} display
  *     The Guacamole display to render decoded frames to.
@@ -36,7 +41,18 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var configured = false;
 
     /**
-     * Monotonic timestamp counter for EncodedVideoChunk (microseconds).
+     * Whether the next access unit submitted must be a keyframe. Set after a
+     * terminal decoder error, since a rebuilt decoder holds no reference
+     * frames and a delta frame would only error it again immediately.
+     *
+     * @private
+     * @type {boolean}
+     */
+    var needsKeyFrame = false;
+
+    /**
+     * Monotonic timestamp counter for EncodedVideoChunk (microseconds). Also
+     * serves as the token identifying each submitted frame.
      *
      * @private
      * @type {number}
@@ -44,7 +60,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var timestamp = 0;
 
     /**
-     * Number of frames submitted to the decoder but not yet output.
+     * Number of frames submitted to the decoder but not yet painted.
      *
      * @private
      * @type {number}
@@ -52,13 +68,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var pendingDecodes = 0;
 
     /**
-     * Maximum number of frames allowed to remain in flight (submitted to the
-     * decoder but not yet painted) when acknowledging a Guacamole sync. A depth
-     * of 0 forces the sync ack to wait for every frame to fully decode and
-     * paint, serializing network RTT and async decode time on every frame and
-     * causing severe input lag. Allowing a shallow pipeline overlaps RTT with
-     * decode while keeping the backlog bounded, so guacd backpressure still
-     * applies once the queue exceeds this depth.
+     * Maximum number of frames allowed to remain in flight when acknowledging
+     * a Guacamole sync. A depth of 0 forces the sync ack to wait for every
+     * frame to fully decode and paint, serializing network RTT and async
+     * decode time on every frame and causing severe input lag. Allowing a
+     * shallow pipeline overlaps RTT with decode while keeping the backlog
+     * bounded, so guacd backpressure still applies beyond this depth.
      *
      * @private
      * @constant
@@ -69,8 +84,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     /**
      * Safety timeout (ms) for the sync gate. If pending decodes do not drain
      * within this window the sync is acked anyway, preventing a permanent
-     * stall if the decoder wedges. Kept short: it is a pure safety net, not a
-     * throttle, so a healthy decoder never reaches it.
+     * stall if the decoder wedges.
      *
      * @private
      * @constant
@@ -79,9 +93,22 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var SYNC_WAIT_TIMEOUT_MS = 200;
 
     /**
-     * Timestamp of the last sync-timeout warning, for rate-limiting the log
-     * so a struggling decoder cannot flood the console (heavy logging on the
-     * main thread itself worsens decode/paint latency).
+     * How long a scheduled draw task may wait for its frame before giving up,
+     * in milliseconds. The task blocks the display queue until its frame
+     * arrives, so a frame lost without an error being reported would stall the
+     * display indefinitely; skipping one frame is the lesser cost. Generous,
+     * because a healthy decoder returns frames in single-digit milliseconds.
+     *
+     * @private
+     * @constant
+     * @type {number}
+     */
+    var DECODE_WATCHDOG_MS = 1000;
+
+    /**
+     * Timestamp of the last sync-timeout warning, for rate-limiting the log so
+     * a struggling decoder cannot flood the console (heavy logging on the main
+     * thread itself worsens decode and paint latency).
      *
      * @private
      * @type {number}
@@ -89,18 +116,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var lastTimeoutWarn = 0;
 
     /**
-     * Per-frame draw positions keyed by chunk timestamp. The VideoDecoder
-     * output callback uses this to draw each frame at the correct position,
-     * avoiding shared mutable state between concurrent decodes.
+     * Per-frame state keyed by token, from submission until the frame is drawn
+     * or abandoned.
      *
      * @private
-     * @type {Object.<number, {layer: Guacamole.Display.VisibleLayer, x: number, y: number}>}
+     * @type {Object.<number, Object>}
      */
-    var pendingPositions = {};
+    var pendingFrames = {};
 
     /**
-     * Callbacks waiting for all pending decodes to complete (used by
-     * waitForPending to gate the Guacamole sync response).
+     * Callbacks waiting for pending decodes to drain, used by waitForPending
+     * to gate the Guacamole sync response.
      *
      * @private
      * @type {function[]}
@@ -108,70 +134,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var flushResolvers = [];
 
     /**
-     * Total frames decoded.
-     *
-     * @type {number}
-     */
-    this.framesDecoded = 0;
-
-    /**
-     * Total frames dropped or errored.
-     *
-     * @type {number}
-     */
-    this.framesDropped = 0;
-
-    /**
-     * Total number of sync responses that were delayed waiting for H.264
-     * decode completion.
-     *
-     * @type {number}
-     */
-    this.syncsGated = 0;
-
-    /**
-     * Peak decode queue depth seen during this session.
-     *
-     * @type {number}
-     */
-    this.peakQueueDepth = 0;
-
-    /**
-     * Decode latency of the most recent frame: milliseconds from submitting
-     * the chunk to decoder.decode() until its decoded frame arrived in the
-     * output callback. This isolates browser-side decode cost (and any
-     * decoder reordering, e.g. B-frames) from server-side encoder latency:
-     * if this stays small but motion-to-photon lag is high, the buffering is
-     * upstream of the browser (the xrdp H.264 encoder).
-     *
-     * @type {number}
-     */
-    this.lastDecodeLatency = 0;
-
-    /**
-     * Peak per-frame decode latency seen this session, in milliseconds.
-     *
-     * @type {number}
-     */
-    this.peakDecodeLatency = 0;
-
-    /**
-     * Running sum and count of per-frame decode latencies, used to report a
-     * session average in stats().
-     *
-     * @private
-     * @type {number}
-     */
-    var decodeLatencySum = 0;
-    var decodeLatencyCount = 0;
-
-    /**
-     * Reference to this for closures.
-     */
-    var self = this;
-
-    /**
-     * If pendingDecodes has reached zero, fire and clear all flush resolvers.
+     * If the backlog has drained, fire and clear all flush resolvers.
      *
      * @private
      */
@@ -185,6 +148,100 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
+     * Marks a pending decode as finished exactly once, whatever its outcome:
+     * drawn, failed, or abandoned. pendingDecodes gates the sync response, so
+     * a decode that is never settled leaves the client reporting a backlog
+     * forever and every sync waiting out its timeout.
+     *
+     * @private
+     * @param {!Object} frameState
+     *     The per-frame state to settle.
+     */
+    function settle(frameState) {
+        if (!frameState || frameState.settled)
+            return;
+        frameState.settled = true;
+        pendingDecodes--;
+        resolveIfIdle();
+    }
+
+    /**
+     * Canvases available for reuse as frame snapshots. A snapshot is held from
+     * decode until its draw task runs, so several are live at once and one
+     * shared canvas will not do. Allocating a fresh canvas per frame instead
+     * would churn a 1080p-sized buffer at frame rate.
+     *
+     * @private
+     * @type {HTMLCanvasElement[]}
+     */
+    var canvasPool = [];
+
+    /**
+     * Maximum number of canvases to retain for reuse. The pipeline holds only a
+     * few frames at a time; canvases beyond this are dropped for collection
+     * rather than kept alive indefinitely after a burst.
+     *
+     * @private
+     * @constant
+     * @type {number}
+     */
+    var MAX_CANVAS_POOL = 8;
+
+    /**
+     * Returns a canvas of the given size, reusing a pooled one where possible.
+     *
+     * @private
+     * @param {number} width - Required width, in pixels.
+     * @param {number} height - Required height, in pixels.
+     * @returns {!HTMLCanvasElement}
+     */
+    function acquireCanvas(width, height) {
+
+        var canvas = canvasPool.pop();
+        if (!canvas)
+            canvas = document.createElement('canvas');
+
+        /* Assigning either dimension clears the canvas, so only resize when the
+         * size actually differs; the frame is about to overwrite it anyway. */
+        if (canvas.width !== width)
+            canvas.width = width;
+        if (canvas.height !== height)
+            canvas.height = height;
+
+        return canvas;
+
+    }
+
+    /**
+     * Returns a canvas to the pool for reuse.
+     *
+     * @private
+     * @param {HTMLCanvasElement} canvas - The canvas to release.
+     */
+    function releaseCanvas(canvas) {
+        if (canvas && canvasPool.length < MAX_CANVAS_POOL)
+            canvasPool.push(canvas);
+    }
+
+    /**
+     * Releases any frame snapshot still held awaiting its draw task. Snapshots
+     * live here between decode and draw, so discarding the map without
+     * reclaiming them throws away the pool's canvases.
+     *
+     * @private
+     */
+    function releaseHeldFrames() {
+        for (var key in pendingFrames) {
+            var frameState = pendingFrames[key];
+            if (frameState && frameState.canvas) {
+                releaseCanvas(frameState.canvas);
+                frameState.canvas = null;
+            }
+        }
+        pendingFrames = {};
+    }
+
+    /**
      * Initialise the VideoDecoder if not already done.
      *
      * @private
@@ -193,7 +250,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     function ensureDecoder(width, height) {
 
-        if (decoder && configured)
+        /* A decoder that has hit a terminal error is left closed. Treating it
+         * as usable because `configured` is still set means every later frame
+         * is dropped and nothing is drawn again -- and since guacd suppresses
+         * ordinary image operations for a layer carrying an H.264 stream, that
+         * is a permanently black screen rather than a degraded one. */
+        if (decoder && configured && decoder.state !== 'closed')
             return;
 
         if (typeof VideoDecoder === 'undefined') {
@@ -201,42 +263,131 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             return;
         }
 
-        decoder = new VideoDecoder({
-            output: function(frame) {
-                self.framesDecoded++;
-                try {
-                    var pos = pendingPositions[frame.timestamp];
-                    delete pendingPositions[frame.timestamp];
-                    if (pos && pos.t !== undefined) {
-                        var latency = performance.now() - pos.t;
-                        self.lastDecodeLatency = latency;
-                        if (latency > self.peakDecodeLatency)
-                            self.peakDecodeLatency = latency;
-                        decodeLatencySum += latency;
-                        decodeLatencyCount++;
-                    }
-                    if (pos && pos.layer) {
-                        var canvas = pos.layer.getCanvas();
-                        var ctx = canvas.getContext('2d');
-                        ctx.drawImage(frame, pos.x, pos.y);
-                    }
-                } finally {
-                    // CRITICAL: always close VideoFrame to release GPU memory
-                    frame.close();
-                    pendingDecodes--;
-                    resolveIfIdle();
-                }
-            },
-            error: function(e) {
-                self.framesDropped++;
-                pendingDecodes--;
-                resolveIfIdle();
-                console.error('[rustguac] H.264 decode error:', e.message);
+        /* Release any decoder being replaced. reset() clears the configured
+         * flag, so a later decode() can reach this point with a live decoder
+         * still assigned; overwriting it without closing leaks its GPU
+         * resources and leaves a second decoder able to deliver frames here. */
+        if (decoder && decoder.state !== 'closed') {
+            try {
+                decoder.close();
+            } catch (e) {
+                /* Already in an error state */
             }
+        }
+
+        decoder = new VideoDecoder({
+
+            output: function(frame) {
+
+                var frameState = null;
+                var canvas = null;
+
+                /* Everything touching the frame runs inside this try, so that
+                 * the close in the finally covers every path out -- including
+                 * one thrown from acquiring the snapshot canvas. A frame that
+                 * escapes without being closed holds one of the hardware
+                 * decoder's output surfaces until the collector runs, and
+                 * enough of them stall decoding outright. */
+                try {
+
+                    frameState = pendingFrames[frame.timestamp];
+
+                    /* The draw task already gave up on this frame, or it
+                     * belongs to a decoder that has since been replaced. */
+                    if (!frameState)
+                        return;
+
+                    if (frameState.watchdog) {
+                        clearTimeout(frameState.watchdog);
+                        frameState.watchdog = null;
+                    }
+
+                    /* An auxiliary AVC444 view is not an image. It had to be
+                     * decoded to keep the sequence's reference chain intact,
+                     * but drawing it would paint packed chroma over the
+                     * screen. Leave canvas null: nothing is drawn, but the
+                     * task below is still released. */
+                    if (frameState.view !== 0)
+                        return;
+
+                    /* Snapshot to a canvas and release the VideoFrame before
+                     * returning, rather than holding it until the draw task
+                     * runs. Holding frames until their scheduled draw exhausts
+                     * the surface pool as soon as the display queue falls
+                     * behind: the decoder stalls, which delays the draws,
+                     * which holds more frames.
+                     *
+                     * The copy is synchronous, and deliberately so.
+                     * Snapshotting via createImageBitmap() leaves the frame
+                     * open across a promise, and any path where that promise
+                     * neither resolves nor rejects orphans the frame with its
+                     * surface still held. Closing in a finally, with no await
+                     * in between, removes the window rather than narrowing
+                     * it. */
+                    canvas = acquireCanvas(frame.displayWidth,
+                            frame.displayHeight);
+
+                    canvas.getContext('2d').drawImage(frame, 0, 0);
+                    frameState.canvas = canvas;
+
+                } catch (e) {
+
+                    console.error('[rustguac] H.264 snapshot failed:',
+                            e.message);
+
+                    releaseCanvas(canvas);
+                    if (frameState)
+                        frameState.canvas = null;
+
+                } finally {
+
+                    frame.close();
+
+                    /* Released here rather than after the try, because the
+                     * early returns above exit the function once this finally
+                     * has run -- they do not fall through to code following
+                     * the block. Releasing there left every AVC444 auxiliary
+                     * view's draw task blocked forever, its watchdog having
+                     * been cleared above, and the display queue is ordered, so
+                     * the first auxiliary frame stopped the display for good.
+                     *
+                     * Ordered after the close deliberately: this runs the
+                     * display queue synchronously and may draw several frames,
+                     * by which point the frame's surface is back in the
+                     * decoder's pool. */
+                    if (frameState && frameState.onReady)
+                        frameState.onReady();
+
+                }
+
+            },
+
+            error: function(e) {
+
+                console.error('[rustguac] H.264 decode error:', e.message);
+
+                /* Terminal: the decoder is now closed and will never accept
+                 * another chunk. Force ensureDecoder() to build a replacement,
+                 * and hold frames until the next keyframe, the earliest point
+                 * a fresh decoder can produce a picture at all. */
+                configured = false;
+                needsKeyFrame = true;
+
+                /* A VideoDecoder error is terminal for everything queued on
+                 * it: those frames will never reach the output callback. Each
+                 * holds a blocked task on the display queue, and the display
+                 * renders frames in order, so leaving them blocked freezes the
+                 * display on whatever was last painted. */
+                for (var key in pendingFrames) {
+                    var frameState = pendingFrames[key];
+                    if (frameState && frameState.onReady)
+                        frameState.onReady();
+                }
+
+            }
+
         });
 
-        // Configure for H.264 High Profile, Level 4.1 (matches xrdp)
-        // Let the decoder auto-detect level from the SPS NAL in the stream
         decoder.configure({
             codec: 'avc1.640029', // High profile, level 4.1
             hardwareAcceleration: 'prefer-hardware',
@@ -244,85 +395,237 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         });
 
         configured = true;
-        console.log('[rustguac] H.264 WebCodecs decoder initialised (' + width + 'x' + height + ')');
+
     }
 
     /**
-     * Decode a complete H.264 NAL unit buffer and render to the given layer.
+     * Submits a complete H.264 access unit for decoding. The frame is not
+     * drawn here; the caller schedules the draw and is notified via onReady
+     * once the frame is available, or once it is known that it cannot be.
      *
      * @param {!Guacamole.Display.VisibleLayer} layer
      *     The layer to draw the decoded frame to.
+     *
      * @param {number} x - X position on the layer.
      * @param {number} y - Y position on the layer.
      * @param {number} width - Frame width.
      * @param {number} height - Frame height.
-     * @param {!ArrayBuffer} nalData - Raw H.264 NAL unit data (Annex B format).
-     * @param {boolean} isKeyFrame - Whether this contains an IDR/keyframe.
+     *
+     * @param {!ArrayBuffer} nalData
+     *     Raw H.264 NAL unit data, in Annex B format.
+     *
+     * @param {boolean} isKeyFrame
+     *     Whether this access unit contains an IDR slice.
+     *
+     * @param {Array} [rects]
+     *     The regions of the decoded picture that are valid, each
+     *     {x, y, width, height} in surface coordinates. An H.264 picture is
+     *     always full-surface sized, but a server encoding only part of the
+     *     screen leaves the rest holding no meaningful content. Omit when the
+     *     entire picture is valid.
+     *
+     * @param {function} [onReady]
+     *     Called once the frame is ready to draw, or cannot be produced.
+     *
+     * @param {number} [view=0]
+     *     Which view this access unit carries: 0 is a displayable picture,
+     *     non-zero an AVC444 auxiliary chroma view, which is decoded for its
+     *     references but never drawn.
+     *
+     * @returns {?number}
+     *     A token identifying this frame, to be passed to drawDecoded(), or
+     *     null if it could not be submitted.
      */
-    this.decode = function(layer, x, y, width, height, nalData, isKeyFrame) {
+    this.decode = function(layer, x, y, width, height, nalData, isKeyFrame,
+            rects, onReady, view) {
 
         ensureDecoder(width, height);
 
-        if (!decoder || decoder.state === 'closed')
-            return;
+        /* No decoder at all: the caller's task must still be released, or the
+         * display queue stalls behind a frame that will never arrive. */
+        if (!decoder || decoder.state === 'closed') {
+            if (onReady) onReady();
+            return null;
+        }
 
-        // Track peak queue depth for diagnostics
-        if (decoder.decodeQueueSize > self.peakQueueDepth)
-            self.peakQueueDepth = decoder.decodeQueueSize;
+        /* Recovering from a terminal error. A rebuilt decoder holds no
+         * reference frames, so a delta would error it again at once and
+         * recovery would never converge; wait for the next IDR instead. */
+        if (needsKeyFrame) {
+            if (!isKeyFrame) {
+                if (onReady) onReady();
+                return null;
+            }
+            needsKeyFrame = false;
+            console.warn('[rustguac] H.264: decoder rebuilt, resuming at'
+                    + ' keyframe');
+        }
 
         try {
+
             var chunk = new EncodedVideoChunk({
                 type: isKeyFrame ? 'key' : 'delta',
                 timestamp: timestamp,
                 data: nalData
             });
 
-            // Store per-frame position (and submit time, for decode-latency
-            // measurement) before submitting to decoder
-            pendingPositions[timestamp] = {layer: layer, x: x, y: y, t: performance.now()};
-            pendingDecodes++;
+            var token = timestamp;
             timestamp += 33333; // ~30fps in microseconds
 
+            var frameState = pendingFrames[token] = {
+                layer: layer,
+                x: x,
+                y: y,
+                rects: (rects && rects.length) ? rects : null,
+                view: view || 0,
+                onReady: onReady,
+                canvas: null,
+                settled: false,
+                watchdog: null
+            };
+
+            pendingDecodes++;
+
+            frameState.watchdog = setTimeout(function() {
+                frameState.watchdog = null;
+                if (!frameState.canvas && frameState.onReady)
+                    frameState.onReady();
+            }, DECODE_WATCHDOG_MS);
+
             decoder.decode(chunk);
+            return token;
+
         } catch (e) {
-            self.framesDropped++;
+
             console.error('[rustguac] H.264 chunk error:', e.message);
+
+            /* The frame may already have been registered and counted before
+             * the throw. Returning null means drawDecoded() will never be
+             * called for it, so nothing else will ever settle it, and an
+             * unsettled decode holds pendingDecodes above zero permanently:
+             * resolveIfIdle() then never fires again and every subsequent sync
+             * waits out its full timeout. Undo the registration here.
+             *
+             * frameState is undefined if the throw came from constructing the
+             * chunk, before anything was registered. */
+            if (frameState) {
+                if (frameState.watchdog) {
+                    clearTimeout(frameState.watchdog);
+                    frameState.watchdog = null;
+                }
+                delete pendingFrames[token];
+
+                /* A snapshot already taken for this frame would otherwise be
+                 * stranded outside the pool, since no draw task will run. */
+                if (frameState.canvas) {
+                    releaseCanvas(frameState.canvas);
+                    frameState.canvas = null;
+                }
+
+                settle(frameState);
+            }
+
+            if (onReady) onReady();
+            return null;
+
         }
+
     };
 
     /**
-     * Wait for all pending decodes to complete, then invoke the callback.
-     * Used to gate the Guacamole sync response so that guacd receives
-     * accurate backpressure from the client's decode speed.
+     * Draws the frame decoded for the given token, then releases it. Called
+     * from the display's task queue so that frames are painted in the order
+     * the instruction stream specified, rather than whenever decode finished.
      *
-     * Includes a short safety timeout (SYNC_WAIT_TIMEOUT_MS) to prevent a
-     * permanent stall if the decoder enters an unexpected state.
+     * Safe to call with a token that has no decoded frame: the decode may have
+     * failed, or the watchdog may have released the task early, in which case
+     * nothing is drawn.
      *
-     * @param {function} callback - Called when all pending decodes are done.
+     * @param {number} token
+     *     The token returned by decode().
+     */
+    this.drawDecoded = function(token) {
+
+        if (token === null || token === undefined)
+            return;
+
+        var frameState = pendingFrames[token];
+        if (!frameState)
+            return;
+
+        delete pendingFrames[token];
+
+        if (frameState.watchdog) {
+            clearTimeout(frameState.watchdog);
+            frameState.watchdog = null;
+        }
+
+        var snapshot = frameState.canvas;
+        if (!snapshot) {
+            settle(frameState);
+            return;
+        }
+
+        try {
+
+            if (frameState.layer) {
+
+                var ctx = frameState.layer.getCanvas().getContext('2d');
+
+                /* Draw only the regions the server marked valid. The decoded
+                 * picture spans the whole surface, so blitting all of it would
+                 * overwrite areas delivered via other codecs on a server that
+                 * mixes them within a frame. */
+                if (frameState.rects) {
+                    for (var r = 0; r < frameState.rects.length; r++) {
+                        var rect = frameState.rects[r];
+                        ctx.drawImage(snapshot,
+                                rect.x, rect.y, rect.width, rect.height,
+                                rect.x, rect.y, rect.width, rect.height);
+                    }
+                }
+
+                /* No regions given: the entire picture is valid */
+                else
+                    ctx.drawImage(snapshot, frameState.x, frameState.y);
+
+            }
+
+        } finally {
+            frameState.canvas = null;
+            releaseCanvas(snapshot);
+            settle(frameState);
+        }
+
+    };
+
+    /**
+     * Waits for pending decodes to drain, then invokes the callback. Used to
+     * gate the Guacamole sync response so that guacd receives accurate
+     * backpressure from the client's decode speed.
+     *
+     * @param {function} callback
+     *     Called when the backlog is within the allowed pipeline depth.
      */
     this.waitForPending = function(callback) {
-        // Ack as soon as the backlog is within the allowed pipeline depth.
-        // Gating strictly on <= 0 serializes network RTT and async decode
-        // time on every frame, causing severe input lag.
-        if (pendingDecodes <= MAX_PIPELINE_DEPTH || !decoder || decoder.state === 'closed') {
+
+        if (pendingDecodes <= MAX_PIPELINE_DEPTH || !decoder
+                || decoder.state === 'closed') {
             callback();
             return;
         }
 
-        self.syncsGated++;
-        var waitStart = performance.now();
         var waitingOn = pendingDecodes;
-
         var resolved = false;
+
         var timer = setTimeout(function() {
             if (!resolved) {
                 resolved = true;
-                // Rate-limit: at most one warning per second, so a wedged
-                // decoder cannot flood the console (which would itself add jank).
                 var now = performance.now();
                 if (now - lastTimeoutWarn > 1000) {
                     lastTimeoutWarn = now;
-                    console.warn('[rustguac] H.264: sync wait timeout (' + waitingOn + ' frames pending), forcing flush');
+                    console.warn('[rustguac] H.264: sync wait timeout ('
+                            + waitingOn + ' frames pending), forcing flush');
                 }
                 callback();
             }
@@ -332,81 +635,63 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             if (!resolved) {
                 resolved = true;
                 clearTimeout(timer);
-                var elapsed = (performance.now() - waitStart).toFixed(1);
-                if (elapsed > 16) // only log if wait was > 1 frame (~16ms)
-                    console.log('[rustguac] H.264: sync gated ' + elapsed + 'ms (' + waitingOn + ' frames)');
                 callback();
             }
         });
+
     };
 
     /**
-     * Reset the decoder (e.g. after reconnection or error recovery).
-     * The next frame must be a keyframe.
+     * Resets the decoder, e.g. after reconnection or error recovery. The next
+     * frame submitted must be a keyframe.
      */
     this.reset = function() {
+
         if (decoder && decoder.state !== 'closed') {
             try {
                 decoder.reset();
                 configured = false;
+                needsKeyFrame = true;
                 timestamp = 0;
-                console.log('[rustguac] H.264 decoder reset');
             } catch (e) {
-                // Decoder may be in error state
+                /* Decoder may be in an error state */
             }
         }
+
         pendingDecodes = 0;
-        pendingPositions = {};
+        releaseHeldFrames();
+
         var resolvers = flushResolvers;
         flushResolvers = [];
         for (var i = 0; i < resolvers.length; i++)
             resolvers[i]();
+
     };
 
     /**
-     * Return current decoder statistics for console debugging.
-     * Usage: open browser console and run:
-     *   client._h264Decoder.stats()
-     *
-     * @returns {Object} Decoder statistics.
-     */
-    this.stats = function() {
-        var s = {
-            framesDecoded: self.framesDecoded,
-            framesDropped: self.framesDropped,
-            syncsGated: self.syncsGated,
-            pendingDecodes: pendingDecodes,
-            decodeQueueSize: decoder ? decoder.decodeQueueSize : 0,
-            peakQueueDepth: self.peakQueueDepth,
-            lastDecodeLatencyMs: +self.lastDecodeLatency.toFixed(1),
-            avgDecodeLatencyMs: decodeLatencyCount
-                ? +(decodeLatencySum / decodeLatencyCount).toFixed(1) : 0,
-            peakDecodeLatencyMs: +self.peakDecodeLatency.toFixed(1),
-            decoderState: decoder ? decoder.state : 'none'
-        };
-        console.table(s);
-        return s;
-    };
-
-    /**
-     * Close and release the decoder.
+     * Closes and releases the decoder.
      */
     this.destroy = function() {
+
         if (decoder && decoder.state !== 'closed') {
             try {
                 decoder.close();
             } catch (e) {
-                // Ignore
+                /* Ignore */
             }
         }
+
         decoder = null;
         configured = false;
+        needsKeyFrame = false;
         pendingDecodes = 0;
-        pendingPositions = {};
+        releaseHeldFrames();
+
         var resolvers = flushResolvers;
         flushResolvers = [];
         for (var i = 0; i < resolvers.length; i++)
             resolvers[i]();
+
     };
 
 };
