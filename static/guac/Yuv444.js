@@ -140,6 +140,16 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
     var auxWidth = 0;
     var auxHeight = 0;
 
+    /**
+     * Whether each view's chroma arrived interleaved (NV12) rather than as two
+     * planes (I420). Set by the upload functions, since only they see the
+     * shape of what they were given.
+     *
+     * @private
+     */
+    var lumaInterleaved = false;
+    var auxInterleaved = false;
+
     /* ==================== Shaders ==================== */
 
     var VERTEX_SHADER = [
@@ -170,12 +180,28 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         'uniform ivec2 uSize;',    /* picture dimensions */
         'uniform ivec2 uAuxSize;', /* auxiliary luma plane dimensions */
         'uniform int uLayout;',    /* 0 = 4:2:0 only, 1 = chroma v1, 2 = chroma v2 */
+        'uniform int uInterleaved;',/* bit 0: main view is NV12, bit 1: auxiliary is */
         'uniform float uFilter;',  /* recovery threshold, or 0 to leave the mean alone */
 
         'out vec4 fragColor;',
 
         'float fetch(sampler2D s, int x, int y) {',
         '    return texelFetch(s, ivec2(x, y), 0).r;',
+        '}',
+
+        /**
+         * One sample of a view's V plane, wherever the decoder happened to put
+         * it. A hardware decoder generally produces NV12, whose chroma is a
+         * single plane of interleaved pairs; that plane is uploaded as a
+         * two-channel texture in the U slot, so V is its second channel and
+         * the V slot is unused. A software decoder produces I420, with the
+         * two planes separate. Converting between them is not an option --
+         * VideoFrame.copyTo() refuses that particular conversion -- so both
+         * are addressed here instead.
+         */
+        'float fetchV(sampler2D su, sampler2D sv, int inter, int x, int y) {',
+        '    if (inter != 0) return texelFetch(su, ivec2(x, y), 0).g;',
+        '    return texelFetch(sv, ivec2(x, y), 0).r;',
         '}',
 
         /**
@@ -189,7 +215,7 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
          * block, so every pixel starts with a value even where the auxiliary
          * view carries none. */
         '    U = fetch(uLumaU, x >> 1, y >> 1);',
-        '    V = fetch(uLumaV, x >> 1, y >> 1);',
+        '    V = fetchV(uLumaU, uLumaV, uInterleaved & 1, x >> 1, y >> 1);',
 
         '    int halfW = uSize.x >> 1;',
         '    int quarterW = uSize.x >> 2;',
@@ -216,8 +242,8 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         '            }',
         '            else {',
         '                int k = (x - 2) >> 2;',
-        '                U = fetch(uAuxV, k, ay);',
-        '                V = fetch(uAuxV, k + quarterW, ay);',
+        '                U = fetchV(uAuxU, uAuxV, uInterleaved & 2, k, ay);',
+        '                V = fetchV(uAuxU, uAuxV, uInterleaved & 2, k + quarterW, ay);',
         '            }',
         '        }',
         '    }',
@@ -243,7 +269,7 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
          *  chroma planes. */
         '        else if ((x & 1) == 1) {',
         '            U = fetch(uAuxU, x >> 1, y >> 1);',
-        '            V = fetch(uAuxV, x >> 1, y >> 1);',
+        '            V = fetchV(uAuxU, uAuxV, uInterleaved & 2, x >> 1, y >> 1);',
         '        }',
         '    }',
         '}',
@@ -387,6 +413,8 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
                 uniforms.auxSize = gl.getUniformLocation(program, 'uAuxSize');
                 uniforms.layout = gl.getUniformLocation(program, 'uLayout');
                 uniforms.filter = gl.getUniformLocation(program, 'uFilter');
+                uniforms.interleaved = gl.getUniformLocation(program,
+                        'uInterleaved');
 
                 /* One texture per plane, each on its own unit and bound once.
                  * Nearest filtering throughout: these are data planes, and
@@ -403,7 +431,13 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
                     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
                     gl.uniform1i(gl.getUniformLocation(program, PLANES[i]), i);
-                    textures[PLANES[i]] = { texture: texture, unit: i, w: 0, h: 0 };
+                    textures[PLANES[i]] = {
+                        texture: texture,
+                        unit: i,
+                        w: 0,
+                        h: 0,
+                        channels: 0
+                    };
 
                 }
 
@@ -427,26 +461,36 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      * @param {!number} stride - Bytes per row within data.
      * @param {!number} w - Plane width, in samples.
      * @param {!number} h - Plane height, in samples.
+     * @param {number} [channels=1] - Samples per texel: 1 for an ordinary
+     *                                plane, 2 for an interleaved NV12 chroma
+     *                                plane, whose pairs become RG texels.
      */
-    function uploadPlane(name, data, stride, w, h) {
+    function uploadPlane(name, data, stride, w, h, channels) {
+
+        channels = channels || 1;
+
+        var internal = (channels === 2) ? gl.RG8 : gl.R8;
+        var format = (channels === 2) ? gl.RG : gl.RED;
 
         var slot = textures[name];
         gl.activeTexture(gl.TEXTURE0 + slot.unit);
         gl.bindTexture(gl.TEXTURE_2D, slot.texture);
 
         /* Rows are addressed through UNPACK_ROW_LENGTH rather than by copying
-         * the plane out, so a padded stride costs nothing. */
-        gl.pixelStorei(gl.UNPACK_ROW_LENGTH, stride);
+         * the plane out, so a padded stride costs nothing. It counts texels
+         * rather than bytes, so an interleaved plane's byte stride halves. */
+        gl.pixelStorei(gl.UNPACK_ROW_LENGTH, (stride / channels) | 0);
 
-        if (slot.w !== w || slot.h !== h) {
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0,
-                    gl.RED, gl.UNSIGNED_BYTE, data);
+        if (slot.w !== w || slot.h !== h || slot.channels !== channels) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0,
+                    format, gl.UNSIGNED_BYTE, data);
             slot.w = w;
             slot.h = h;
+            slot.channels = channels;
         }
         else
             gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h,
-                    gl.RED, gl.UNSIGNED_BYTE, data);
+                    format, gl.UNSIGNED_BYTE, data);
 
         gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
 
@@ -456,8 +500,10 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      * Uploads the main view of a picture: an ordinary YUV420 frame.
      *
      * @param {!Uint8Array} y - The luma plane.
-     * @param {!Uint8Array} u - The U plane, at half resolution in both axes.
-     * @param {!Uint8Array} v - The V plane.
+     * @param {!Uint8Array} u - The U plane, at half resolution in both axes,
+     *                           or the interleaved UV plane if v is null.
+     * @param {Uint8Array} v - The V plane, or null if the chroma is
+     *                         interleaved into u (NV12).
      * @param {!number[]} strides - Bytes per row for [y, u, v].
      * @param {!number} w - Picture width.
      * @param {!number} h - Picture height.
@@ -477,9 +523,16 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         var halfW = (w + 1) >> 1;
         var halfH = (h + 1) >> 1;
 
+        lumaInterleaved = !v;
+
         uploadPlane('uLumaY', y, strides[0], w, h);
-        uploadPlane('uLumaU', u, strides[1], halfW, halfH);
-        uploadPlane('uLumaV', v, strides[2], halfW, halfH);
+
+        if (lumaInterleaved)
+            uploadPlane('uLumaU', u, strides[1], halfW, halfH, 2);
+        else {
+            uploadPlane('uLumaU', u, strides[1], halfW, halfH);
+            uploadPlane('uLumaV', v, strides[2], halfW, halfH);
+        }
 
     };
 
@@ -488,8 +541,9 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      * how they map onto the output is the shader's business.
      *
      * @param {!Uint8Array} y - The auxiliary luma plane.
-     * @param {!Uint8Array} u - The auxiliary U plane.
-     * @param {!Uint8Array} v - The auxiliary V plane.
+     * @param {!Uint8Array} u - The auxiliary U plane, or the interleaved UV
+     *                           plane if v is null.
+     * @param {Uint8Array} v - The auxiliary V plane, or null if interleaved.
      * @param {!number[]} strides - Bytes per row for [y, u, v].
      * @param {!number} w - Auxiliary frame width.
      * @param {!number} h - Auxiliary frame height, which the v1 layout pads to
@@ -506,9 +560,16 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         var halfW = (w + 1) >> 1;
         var halfH = (h + 1) >> 1;
 
+        auxInterleaved = !v;
+
         uploadPlane('uAuxY', y, strides[0], w, h);
-        uploadPlane('uAuxU', u, strides[1], halfW, halfH);
-        uploadPlane('uAuxV', v, strides[2], halfW, halfH);
+
+        if (auxInterleaved)
+            uploadPlane('uAuxU', u, strides[1], halfW, halfH, 2);
+        else {
+            uploadPlane('uAuxU', u, strides[1], halfW, halfH);
+            uploadPlane('uAuxV', v, strides[2], halfW, halfH);
+        }
 
     };
 
@@ -546,6 +607,8 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         gl.uniform2i(uniforms.auxSize, auxWidth, auxHeight);
         gl.uniform1i(uniforms.layout, layout);
         gl.uniform1f(uniforms.filter, filter === false ? -1.0 : filter / 255.0);
+        gl.uniform1i(uniforms.interleaved,
+                (lumaInterleaved ? 1 : 0) | (auxInterleaved ? 2 : 0));
 
         gl.drawArrays(gl.TRIANGLES, 0, 3);
 
