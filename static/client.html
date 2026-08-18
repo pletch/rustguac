@@ -251,6 +251,35 @@
             throw new Error('No session ID');
         }
 
+        // ---- Native (device-pixel) framebuffer sizing -------------------
+        //
+        // Set from the session's display_scale, which the server computed when
+        // the session was created: it, not this page, knows whether the
+        // connection entry asked for a physical-pixel framebuffer. The value
+        // matters here only so that resize requests stay in the same units the
+        // session was created in -- sending CSS pixels to a session negotiated
+        // in physical ones would shrink it back on the first resize.
+        //
+        // scaleDisplay() needs no knowledge of it: it fits whatever framebuffer
+        // arrives into the available CSS area, which lands on 1/displayScale on
+        // its own -- one framebuffer pixel per physical pixel, no resampling.
+        // Mouse input follows too, since sendMouseState(state, true) divides by
+        // that same scale.
+        var displayScale = 1;
+
+        // Converts a CSS-pixel size into the size to ask the server for. Width
+        // is rounded down to a multiple of 8 (SPICE requires it, RDP prefers
+        // it) and both are kept positive, since a zero size reads as a
+        // monitor-close.
+        function deviceSize(cssW, cssH) {
+            var w = Math.round(cssW * displayScale) & ~0x7;
+            var h = Math.round(cssH * displayScale);
+            return {
+                width:  w > 0 ? w : Math.max(8, cssW & ~0x7),
+                height: h > 0 ? h : Math.max(8, cssH)
+            };
+        }
+
         var statusEl = document.getElementById('status');
         var urlParams = new URLSearchParams(window.location.search);
         var shareToken = urlParams.get('token');
@@ -345,6 +374,7 @@
                     };
                 }
                 if (session && session.entry_display_name) entryDisplayName = session.entry_display_name;
+                if (session && session.display_scale > 1) displayScale = session.display_scale;
                 if (session && session.fullscreen_on_connect) wantFullscreen = true;
                 if (session && session.autohide_side_tabs) wantAutohideTabs = true;
                 return showBanner(session.banner);
@@ -870,8 +900,10 @@
                 // (SPICE wants width as a multiple of 8). Contiguous index. Guard
                 // against a not-yet-laid-out popup reporting 0 (a positive size is
                 // required or the server reads it as a monitor-close).
-                var reqW = ((win.innerWidth || 1280) & ~0x7) || 1280;
-                var reqH = win.innerHeight || 800;
+                var popSize = deviceSize(win.innerWidth || 1280,
+                        win.innerHeight || 800);
+                var reqW = popSize.width;
+                var reqH = popSize.height;
                 if (reqW < 8) reqW = 1280;
                 if (reqH < 8) reqH = 800;
                 client.sendSize(reqW, reqH, index, 0);
@@ -915,9 +947,10 @@
                 win.addEventListener('resize', function() {
                     if (popResizeTimer) win.clearTimeout(popResizeTimer);
                     popResizeTimer = win.setTimeout(function() {
-                        var w = (win.innerWidth || 0) & ~0x7;
-                        var h = win.innerHeight || 0;
-                        if (w >= 8 && h >= 8) client.sendSize(w, h, index, 0);
+                        var rs = deviceSize(win.innerWidth || 0,
+                                win.innerHeight || 0);
+                        if (rs.width >= 8 && rs.height >= 8)
+                            client.sendSize(rs.width, rs.height, index, 0);
                     }, 300);
                 });
 
@@ -1579,9 +1612,10 @@
                             var fitToWindow = function() {
                                 scaleDisplay();
                                 var anyPanelOpen = panelOpen || filePanelOpen;
-                                var sw = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
-                                var sh = window.innerHeight;
-                                if (sw > 0 && sh > 0) client.sendSize(sw, sh);
+                                var cssW = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
+                                var fit = deviceSize(cssW, window.innerHeight);
+                                if (fit.width > 0 && fit.height > 0)
+                                    client.sendSize(fit.width, fit.height);
                             };
                             setTimeout(fitToWindow, 800);
                             setTimeout(fitToWindow, 2000);
@@ -1716,10 +1750,15 @@
                 var headers = { 'Content-Type': 'application/json' };
                 if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
 
+                // CSS pixels plus the browser's pixel ratio: whether the
+                // framebuffer is sized in physical pixels is the connection
+                // entry's "Native Resolution" setting to decide, and the server
+                // applies it.
                 var body = {
                     width: window.innerWidth,
                     height: window.innerHeight,
-                    dpi: Math.round((window.devicePixelRatio || 1) * 96)
+                    dpi: Math.round((window.devicePixelRatio || 1) * 96),
+                    device_pixel_ratio: window.devicePixelRatio || 1
                 };
 
                 var url = '/api/addressbook/folders/' + encodeURIComponent(scope)
@@ -1874,6 +1913,11 @@
                 }
                 else {
                     // Single display: scale the whole framebuffer to fit.
+                    // With the framebuffer requested in device pixels this
+                    // lands on 1/devicePixelRatio, i.e. one framebuffer pixel
+                    // per physical pixel -- no resampling. It stays correct
+                    // when a panel opens or the window is resized ahead of the
+                    // debounced sendSize, just at a softer intermediate scale.
                     display.scale(Math.min(availW / dw, availH / dh));
                     displayEl.style.overflow = '';
                     displayEl.style.position = '';
@@ -1896,9 +1940,9 @@
                 clearTimeout(resizeTimer);
                 resizeTimer = setTimeout(function() {
                     var anyPanelOpen = panelOpen || filePanelOpen;
-                    var sw = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
-                    var sh = window.innerHeight;
-                    client.sendSize(sw, sh);
+                    var cssW = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
+                    var rz = deviceSize(cssW, window.innerHeight);
+                    client.sendSize(rz.width, rz.height);
                 }, 250);
             });
 

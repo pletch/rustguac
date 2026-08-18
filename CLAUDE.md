@@ -123,6 +123,24 @@ hardware encoding*, and makes Windows send AVC444 — which is handled: both
 views are forwarded and only the main one is drawn, so chroma is 4:2:0. Full
 details, including verification commands, in `docs/rdp-h264.md`.
 
+### Native resolution (HiDPI)
+
+Per-connection **Native Resolution** checkbox requests the framebuffer in the
+browser's physical pixels rather than its CSS pixels, so text stays sharp on a
+HiDPI display. The browser reports `device_pixel_ratio` on connect and the
+server decides, since only the entry knows whether the target scales its own UI.
+
+RDP is asked to scale via `desktopScaleFactor` (patch `011-rdp-dpi-scaling`).
+**Only 100/140/180 work**, so the factor snaps to 1.4 or 1.8: MS-RDPBCGR
+restricts `deviceScaleFactor` to those three, and FreeRDP transposes the pair
+when synthesising a single-monitor definition, so only equal values survive.
+The scale is re-sent on every display update — a `MONITOR_LAYOUT` carrying
+zeroes resets the session to 100%, which used to undo it a second after connect.
+
+X11 behind xrdp has no per-connection DPI negotiation; scale it inside the
+session (`xfconf-query -c xsettings -p /Xft/DPI`). See `docs/xrdp-dpi-scaling.md`
+for what an xrdp patch would involve.
+
 ## guacamole-server patches
 
 The `patches/` directory contains patches applied to guacamole-server before building. These fix:

@@ -220,3 +220,58 @@ git apply --check ../rustguac/patches/001-freerdp3-debian13.patch 2>&1 || echo "
 1. Make changes in the `../guacamole-server` working tree
 2. Export: `cd ../guacamole-server && git diff > ../rustguac/patches/NNN-description.patch`
 3. Patches are applied in numeric order by the build scripts
+
+## 011-rdp-dpi-scaling.patch
+
+**Feature:** a `desktop-scale` RDP parameter, sent to the server as
+`desktopScaleFactor` so the remote session renders its UI at a matching DPI.
+
+Without it, asking for a framebuffer in physical rather than logical pixels —
+which is what makes text render sharply on a HiDPI display — produces a desktop
+whose every icon and glyph is half the size it should be. guacd had no way to
+request DPI scaling at all: `channels/disp.c` pins `DesktopScaleFactor` and
+`DeviceScaleFactor` to 0, and the existing `dpi` parameter only rescales the
+requested width and height, which `settings.c` skips whenever an explicit width
+and height are supplied.
+
+**How it works.** `desktop-scale` is parsed as a percentage and validated
+against the 100–500 range of MS-RDPBCGR 2.2.1.3.2. When non-zero,
+`guac_rdp_push_settings()` sets `FreeRDP_DesktopScaleFactor` to it and
+`FreeRDP_DeviceScaleFactor` to a legal companion value; FreeRDP writes both
+into the client core data (`gcc.c`). Zero, the default, leaves FreeRDP's
+defaults alone and the session behaves exactly as before.
+
+**Only 100, 140 and 180 work,** for two compounding reasons, and
+`guac_rdp_normalize_desktop_scale()` snaps the request to the nearest of them.
+
+MS-RDPBCGR 2.2.1.3.2 already restricts `deviceScaleFactor` to those three, and
+a server discards the desktop factor along with an out-of-range device factor
+rather than degrading. On top of that, **FreeRDP transposes the pair** when it
+synthesises the single-monitor definition that every windowed session uses
+(`libfreerdp/core/settings.c`, introduced in `401f81683` and present through
+3.x):
+
+```c
+const UINT32 desktopScaleFactor = get(FreeRDP_DeviceScaleFactor);   /* reads Device */
+const UINT32 deviceScaleFactor  = get(FreeRDP_DesktopScaleFactor);  /* reads Desktop */
+...
+monitor.attributes.desktopScaleFactor = desktopScaleFactor;
+monitor.attributes.deviceScaleFactor  = deviceScaleFactor;
+```
+
+So any pair of differing values reaches the server backwards: a request for
+200%/100% arrives as `deviceScaleFactor=200`, which is illegal, and the whole
+pair is dropped. Setting both factors to the *same* value is immune to the
+transposition — which is exactly why FreeRDP's own `/scale` accepts only these
+three and sets both at once. `static/client.html` snaps its framebuffer factor
+to match (1.4 or 1.8), so the extra pixels and the session scaling agree and
+physical sizes stay correct.
+
+**Scope.** RDP only, and Windows-only in practice. An X11 desktop behind xrdp
+has no per-connection DPI negotiation; scaling there has to be arranged inside
+the session (for example via `xfconf-query -c xsettings -p
+/Gdk/WindowScalingFactor`, or `Xft.dpi` for non-integer factors).
+
+**Client side.** `static/client.html` sends `desktop_scale` on the connect
+request, and only when it actually asked for a device-pixel framebuffer — see
+`localStorage.rgNativeRes`, which is off by default.
