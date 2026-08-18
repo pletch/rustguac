@@ -224,6 +224,258 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
+     * Combines the two views of an AVC444 picture into 4:4:4, or null when the
+     * stream carries no auxiliary view, the browser cannot support it, or it
+     * has been switched off. Created lazily, on first sight of an auxiliary
+     * view, so an AVC420 stream never allocates a GL context.
+     *
+     * @private
+     * @type {Guacamole.Yuv444Renderer}
+     */
+    var yuv444 = null;
+
+    /**
+     * Whether 4:4:4 combining has been ruled out for this stream, so it is not
+     * attempted again on every frame.
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var yuv444Unavailable = false;
+
+    /**
+     * Whether the current stream is being combined to 4:4:4. False until an
+     * auxiliary view actually arrives: an AVC420 stream has no second view to
+     * combine, and reading planes back costs a copy per frame that would buy
+     * nothing there.
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var combining = false;
+
+    /**
+     * Serialises plane read-back across frames. Both views of a picture write
+     * into the same set of textures, and the auxiliary view refines what the
+     * main view uploaded, so the copies have to complete in decode order --
+     * copyTo() promises settling out of order would combine one picture's
+     * chroma into another's luma.
+     *
+     * @private
+     * @type {!Promise}
+     */
+    var copyChain = Promise.resolve();
+
+    /**
+     * Buffers available for reuse when reading planes back out of a frame,
+     * keyed by byte length. A 1080p I420 frame is about 3MB, so allocating one
+     * per frame would churn heavily at frame rate.
+     *
+     * @private
+     * @type {!Object.<number, ArrayBuffer[]>}
+     */
+    var bufferPool = {};
+
+    /**
+     * Maximum buffers to retain per size.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var MAX_BUFFER_POOL = 4;
+
+    /**
+     * Returns a buffer of at least the given size, reusing a pooled one where
+     * possible.
+     *
+     * @private
+     * @param {!number} size - Required size, in bytes.
+     * @returns {!Uint8Array}
+     */
+    function acquireBuffer(size) {
+        var pool = bufferPool[size];
+        if (pool && pool.length)
+            return pool.pop();
+        return new Uint8Array(size);
+    }
+
+    /**
+     * Returns a buffer to the pool.
+     *
+     * @private
+     * @param {Uint8Array} buffer - The buffer to release.
+     */
+    function releaseBuffer(buffer) {
+        if (!buffer)
+            return;
+        var pool = bufferPool[buffer.length];
+        if (!pool)
+            pool = bufferPool[buffer.length] = [];
+        if (pool.length < MAX_BUFFER_POOL)
+            pool.push(buffer);
+    }
+
+    /**
+     * Returns the 4:4:4 renderer, creating it on first use. Returns null if the
+     * browser cannot provide one, having recorded that so the attempt is not
+     * repeated.
+     *
+     * @private
+     * @returns {Guacamole.Yuv444Renderer}
+     */
+    function ensureYuv444() {
+
+        if (yuv444 || yuv444Unavailable)
+            return yuv444;
+
+        if (typeof Guacamole.Yuv444Renderer === 'undefined'
+                || !Guacamole.Yuv444Renderer.isSupported()) {
+            console.warn('[rustguac] H.264: 4:4:4 chroma unavailable'
+                    + ' (needs WebGL2 and VideoFrame.copyTo); AVC444 will'
+                    + ' render at 4:2:0');
+            yuv444Unavailable = true;
+            return null;
+        }
+
+        yuv444 = new Guacamole.Yuv444Renderer();
+
+        if (!yuv444.supported) {
+            yuv444 = null;
+            yuv444Unavailable = true;
+            return null;
+        }
+
+        console.log('[rustguac] H.264: combining AVC444 views to 4:4:4');
+        return yuv444;
+
+    }
+
+    /**
+     * Whether 4:4:4 combining is switched on. Overridable at runtime as
+     * window.__h264Chroma444 = false to compare against the 4:2:0 path within
+     * a single session.
+     *
+     * @private
+     * @returns {!boolean}
+     */
+    function chroma444Enabled() {
+        if (typeof window !== 'undefined'
+                && window.__h264Chroma444 !== undefined)
+            return !!window.__h264Chroma444;
+        return true;
+    }
+
+    /**
+     * Reads the three planes out of a decoded frame and hands them to the
+     * renderer, then renders and snapshots the result.
+     *
+     * The frame is held across copyTo(), which is asynchronous and has no
+     * synchronous equivalent -- there is no other way to reach the raw planes,
+     * and the auxiliary view's planes are not an image, so drawing it through a
+     * canvas would give colour-converted nonsense. The close is therefore in a
+     * finally on the chained promise, and the draw task's watchdog still covers
+     * a copy that never settles at all.
+     *
+     * @private
+     * @param {!VideoFrame} frame - The decoded frame. Closed by this function.
+     * @param {!object} frameState - The frame's pending state.
+     */
+    function combineFrame(frame, frameState) {
+
+        var renderer = yuv444;
+        var view = frameState.view;
+        var rect = frame.codedRect || null;
+
+        /* The coded frame rather than the visible one: the v1 chroma layout
+         * pads the auxiliary view to a multiple of 16 rows and addresses that
+         * padding, so cropping to the visible rect would drop rows the combine
+         * reads. */
+        var options = rect
+            ? { format: 'I420', rect: { x: 0, y: 0, width: rect.width, height: rect.height } }
+            : { format: 'I420' };
+
+        var planeW = rect ? rect.width : frame.codedWidth;
+        var planeH = rect ? rect.height : frame.codedHeight;
+        var pictureW = frame.displayWidth;
+        var pictureH = frame.displayHeight;
+
+        var buffer = null;
+        var size = 0;
+
+        try {
+            size = frame.allocationSize(options);
+            buffer = acquireBuffer(size);
+        } catch (e) {
+            console.error('[rustguac] H.264: cannot size frame planes:', e.message);
+            try { frame.close(); } catch (ignore) { /* already closed */ }
+            if (frameState.onReady) frameState.onReady();
+            return;
+        }
+
+        copyChain = copyChain.then(function() {
+            return frame.copyTo(buffer, options);
+        }).then(function(layout) {
+
+            var y = new Uint8Array(buffer.buffer, buffer.byteOffset + layout[0].offset);
+            var u = new Uint8Array(buffer.buffer, buffer.byteOffset + layout[1].offset);
+            var v = new Uint8Array(buffer.buffer, buffer.byteOffset + layout[2].offset);
+            var strides = [layout[0].stride, layout[1].stride, layout[2].stride];
+
+            if (view === 0)
+                renderer.uploadLuma(y, u, v, strides, pictureW, pictureH);
+            else
+                renderer.uploadAux(y, u, v, strides, planeW, planeH);
+
+            /* The main view renders on its own as an ordinary 4:2:0 picture,
+             * exactly as a luma-only (LC=1) update does for FreeRDP; the
+             * auxiliary view then re-renders the same picture with its chroma
+             * applied. Two paints per picture is the reference behaviour, not
+             * an accident. */
+            var rendered = renderer.render(view === 0 ? 0 : view);
+            if (!rendered)
+                return;
+
+            /* The watchdog may have released this frame's task while the
+             * copy was in flight, in which case drawDecoded() has already run
+             * and nothing will ever paint this snapshot -- keeping it would
+             * strand a canvas outside the pool. */
+            if (frameState.settled)
+                return;
+
+            var snapshot = acquireCanvas(pictureW, pictureH);
+            snapshot.getContext('2d').drawImage(rendered, 0, 0);
+            frameState.canvas = snapshot;
+
+        }).catch(function(e) {
+
+            console.error('[rustguac] H.264: 4:4:4 combine failed:',
+                    e && e.message ? e.message : e);
+
+            /* One failure is usually terminal for this path -- an unsupported
+             * pixel format does not become supported later -- so fall back
+             * rather than failing once per frame for the rest of the session. */
+            combining = false;
+            yuv444Unavailable = true;
+
+        }).then(function() {
+
+            try {
+                frame.close();
+            } catch (ignore) {
+                /* Already closed */
+            }
+
+            releaseBuffer(buffer);
+
+            if (frameState.onReady)
+                frameState.onReady();
+
+        });
+
+    }
+
+    /**
      * Releases any frame snapshot still held awaiting its draw task. Snapshots
      * live here between decode and draw, so discarding the map without
      * reclaiming them throws away the pool's canvases.
@@ -302,11 +554,40 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                         frameState.watchdog = null;
                     }
 
-                    /* An auxiliary AVC444 view is not an image. It had to be
-                     * decoded to keep the sequence's reference chain intact,
-                     * but drawing it would paint packed chroma over the
-                     * screen. Leave canvas null: nothing is drawn, but the
-                     * task below is still released. */
+                    /* An auxiliary view means this is an AVC444 stream, so
+                     * its chroma can be recovered. Switch over for the frames
+                     * that follow; this one cannot be combined, because the
+                     * main view it refines went through the 4:2:0 path and its
+                     * planes were never uploaded. */
+                    if (frameState.view !== 0 && !combining) {
+
+                        if (chroma444Enabled() && ensureYuv444())
+                            combining = true;
+
+                        /* Not an image on its own: drawing packed chroma would
+                         * paint garbage over the screen. Leave canvas null so
+                         * nothing is drawn, but release the task below. */
+                        return;
+
+                    }
+
+                    /* Both views go through the combiner: the main one renders
+                     * as an ordinary 4:2:0 picture and uploads the planes the
+                     * auxiliary one then refines. It closes the frame and
+                     * releases the task itself, since it must do both after an
+                     * asynchronous plane copy. */
+                    if (combining) {
+                        var handed = frame;
+                        combineFrame(handed, frameState);
+                        /* Ownership passes only once the call has returned; a
+                         * synchronous throw leaves the frame ours to close,
+                         * which the finally below then does. */
+                        frame = null;
+                        return;
+                    }
+
+                    /* No auxiliary view in this stream, or combining is off:
+                     * the main view is a complete picture on its own. */
                     if (frameState.view !== 0)
                         return;
 
@@ -341,7 +622,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
                 } finally {
 
-                    frame.close();
+                    /* Null when combineFrame() took ownership: it closes the
+                     * frame once its plane copy has settled, and releases the
+                     * task itself. */
+                    if (frame)
+                        frame.close();
 
                     /* Released here rather than after the try, because the
                      * early returns above exit the function once this finally
@@ -355,7 +640,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                      * display queue synchronously and may draw several frames,
                      * by which point the frame's surface is back in the
                      * decoder's pool. */
-                    if (frameState && frameState.onReady)
+                    if (frame && frameState && frameState.onReady)
                         frameState.onReady();
 
                 }
@@ -684,6 +969,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         decoder = null;
         configured = false;
         needsKeyFrame = false;
+
+        if (yuv444) {
+            yuv444.destroy();
+            yuv444 = null;
+        }
+        combining = false;
+        bufferPool = {};
         pendingDecodes = 0;
         releaseHeldFrames();
 
