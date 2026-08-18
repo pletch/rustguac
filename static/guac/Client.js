@@ -1501,6 +1501,16 @@ Guacamole.Client = function(tunnel) {
                 });
             }
 
+            // Whether an auxiliary chroma view for this same picture follows
+            // immediately. Set only on the main view of an AVC444 command that
+            // carries both (MS-RDPEGFX LC=0); a client combining the two views
+            // can then skip painting a main view that is about to be repainted
+            // in full 4:4:4. Trails the rects because they are variable in
+            // number, so that a guacd sending neither this nor the rect count
+            // still parses.
+            var paired = parameters.length > 9 + numRects * 4
+                    ? parseInt(parameters[9 + numRects * 4]) !== 0 : false;
+
             // Create stream to receive H.264 NAL unit data
             var stream = streams[stream_index] = new Guacamole.InputStream(guac_client, stream_index);
 
@@ -1565,7 +1575,7 @@ Guacamole.Client = function(tunnel) {
                     display.drawH264(
                         layer, guac_client._h264Decoder,
                         x, y, width, height,
-                        bytes.buffer, isKeyFrame, rects, view
+                        bytes.buffer, isKeyFrame, rects, view, paired
                     );
                 } catch (e) {
                     if (typeof console !== 'undefined')
