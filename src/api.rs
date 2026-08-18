@@ -2542,6 +2542,12 @@ pub struct ConnectRequest {
     /// framebuffer sized in physical pixels.
     #[serde(default)]
     pub desktop_scale: Option<u32>,
+    /// The browser's devicePixelRatio. Reported rather than acted on: whether
+    /// the framebuffer is actually sized in physical pixels is the entry's
+    /// `native_resolution` setting to decide, since it is only safe where the
+    /// target scales its UI to match.
+    #[serde(default)]
+    pub device_pixel_ratio: Option<f64>,
     #[serde(default)]
     pub banner: Option<String>,
     /// Override or supply credentials at connect time (never stored).
@@ -2706,6 +2712,35 @@ pub async fn ab_connect_entry(
     // Build CreateSessionRequest from the Vault entry + connect request display params.
     // ConnectRequest credentials override address book values (for prompted credentials).
     let ab_entry_key = format!("{}/{}/{}", scope, folder, entry);
+
+    // Physical-pixel framebuffer, when this entry asks for one. The browser
+    // reports its devicePixelRatio and sends CSS-pixel dimensions; scaling them
+    // here keeps the policy with the entry rather than in the page.
+    //
+    // The factor is snapped to 1.4 or 1.8 because those are the only scalings
+    // an RDP session can actually be given -- see guac_rdp_normalize_desktop_scale
+    // in patches/011 -- and a framebuffer scaled by more than the desktop is
+    // scaled leaves everything proportionally too small.
+    let native_factor = if ab_entry.native_resolution.unwrap_or(false) {
+        match req.device_pixel_ratio {
+            Some(dpr) if dpr >= 1.6 => 1.8,
+            Some(dpr) if dpr > 1.0 => 1.4,
+            _ => 1.0,
+        }
+    } else {
+        1.0
+    };
+
+    let (width, height, desktop_scale) = if native_factor > 1.0 {
+        (
+            req.width.map(|w| ((w as f64 * native_factor).round() as u32) & !0x7),
+            req.height.map(|h| (h as f64 * native_factor).round() as u32),
+            Some((native_factor * 100.0).round() as u32),
+        )
+    } else {
+        (req.width, req.height, req.desktop_scale)
+    };
+
     let create_req = CreateSessionRequest {
         session_type,
         hostname: ab_entry.hostname,
@@ -2729,10 +2764,11 @@ pub async fn ab_connect_entry(
         jump_username: None,
         jump_password: None,
         jump_private_key: None,
-        width: req.width,
-        height: req.height,
+        width,
+        height,
         dpi: req.dpi,
-        desktop_scale: req.desktop_scale,
+        desktop_scale,
+        display_scale: (native_factor > 1.0).then_some(native_factor),
         banner: req.banner.or(ab_entry.banner),
         enable_drive: ab_entry.enable_drive,
         remote_app: ab_entry.remote_app,
@@ -4561,6 +4597,7 @@ pub async fn quick_connect(
             height: query.height,
             dpi: query.dpi,
             desktop_scale: query.desktop_scale,
+            display_scale: None,
             banner: ab_entry.banner,
             enable_drive: ab_entry.enable_drive,
             remote_app: ab_entry.remote_app,
@@ -4687,6 +4724,7 @@ pub async fn quick_connect(
         height: query.height,
         dpi: query.dpi,
         desktop_scale: query.desktop_scale,
+        display_scale: None,
         banner: None,
         enable_drive: None,
         remote_app: None,

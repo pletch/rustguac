@@ -180,6 +180,16 @@ pub struct AddressBookEntry {
     /// Requires GFX enabled and xrdp with x264 on the target. Default: true when GFX enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_h264: Option<bool>,
+    /// Request the framebuffer in the browser's physical pixels rather than its
+    /// CSS pixels, so text renders sharply on a HiDPI display.
+    ///
+    /// Per-entry rather than global because it is only safe where the target
+    /// also scales its UI to match. RDP does that automatically (guacd asks via
+    /// desktopScaleFactor); an X11 desktop behind xrdp has no per-connection DPI
+    /// negotiation, so enabling it there without a session-side scaling hook
+    /// just makes every icon and glyph smaller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_resolution: Option<bool>,
     /// Docker image for VDI sessions (e.g. "myregistry/desktop:latest").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_image: Option<String>,
@@ -410,6 +420,9 @@ pub struct EntryInfo {
     /// Enable H.264 passthrough.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_h264: Option<bool>,
+    /// Request the framebuffer in physical rather than CSS pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_resolution: Option<bool>,
     /// Docker image for VDI sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_image: Option<String>,
@@ -547,6 +560,7 @@ impl From<(&str, &AddressBookEntry)> for EntryInfo {
             enable_full_window_drag: e.enable_full_window_drag,
             force_lossless: e.force_lossless,
             enable_h264: e.enable_h264,
+            native_resolution: e.native_resolution,
             container_image: e.container_image.clone(),
             container_cpu_limit: e.container_cpu_limit,
             container_memory_limit: e.container_memory_limit,
