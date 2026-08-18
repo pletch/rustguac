@@ -142,6 +142,7 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         'uniform ivec2 uSize;',    /* picture dimensions */
         'uniform ivec2 uAuxSize;', /* auxiliary luma plane dimensions */
         'uniform int uLayout;',    /* 0 = 4:2:0 only, 1 = chroma v1, 2 = chroma v2 */
+        'uniform float uFilter;',  /* recovery threshold, or 0 to leave the mean alone */
 
         'out vec4 fragColor;',
 
@@ -149,19 +150,18 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         '    return texelFetch(s, ivec2(x, y), 0).r;',
         '}',
 
-        'void main() {',
-
-        /* gl_FragCoord is bottom-up; the picture is top-down. */
-        '    int x = int(gl_FragCoord.x);',
-        '    int y = uSize.y - 1 - int(gl_FragCoord.y);',
-
-        '    float Y = fetch(uLumaY, x, y);',
+        /**
+         * Chroma for one pixel, as the combination rules of the negotiated
+         * layout place it. Written as a function because the reverse filter in
+         * main() needs the same lookup for three neighbouring pixels.
+         */
+        'void chromaAt(int x, int y, out float U, out float V) {',
 
         /* The luma pass replicates each 4:2:0 chroma sample across its 2x2
          * block, so every pixel starts with a value even where the auxiliary
          * view carries none. */
-        '    float U = fetch(uLumaU, x >> 1, y >> 1);',
-        '    float V = fetch(uLumaV, x >> 1, y >> 1);',
+        '    U = fetch(uLumaU, x >> 1, y >> 1);',
+        '    V = fetch(uLumaV, x >> 1, y >> 1);',
 
         '    int halfW = uSize.x >> 1;',
         '    int quarterW = uSize.x >> 2;',
@@ -217,6 +217,64 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         '            U = fetch(uAuxU, x >> 1, y >> 1);',
         '            V = fetch(uAuxV, x >> 1, y >> 1);',
         '        }',
+        '    }',
+        '}',
+
+        /**
+         * The reverse of the encoder's chroma filter, for the one sample per
+         * 2x2 block that no auxiliary view carries.
+         *
+         * The main view's value at that position is not a subsample of the
+         * 4:4:4 source but the mean of the block, so the sample belonging to
+         * the pixel itself has to be solved for from the mean and the three
+         * neighbours the auxiliary view did carry:
+         *
+         *     u0 = 4 * mean - u1 - u2 - u3
+         *
+         * uFilter guards the multiplication. Scaling the mean by four scales
+         * its quantisation error by four as well, so a difference too small to
+         * be a real chroma edge is discarded in favour of the unfiltered
+         * value. This mirrors CONDITIONAL_CLIP in FreeRDP's prim_internal.h,
+         * whose threshold of 30/255 is where the caller's default comes from.
+         */
+        'float unfilter(float mean, float sum3) {',
+        '    float recovered = clamp(4.0 * mean - sum3, 0.0, 1.0);',
+        '    if (abs(recovered - mean) < uFilter) return mean;',
+        '    return recovered;',
+        '}',
+
+        'void main() {',
+
+        /* gl_FragCoord is bottom-up; the picture is top-down. */
+        '    int x = int(gl_FragCoord.x);',
+        '    int y = uSize.y - 1 - int(gl_FragCoord.y);',
+
+        '    float Y = fetch(uLumaY, x, y);',
+
+        '    float U, V;',
+        '    chromaAt(x, y, U, V);',
+
+        /* Even column of an even row is the one position in each 2x2 block
+         * that stayed at the main view's averaged value. Both layouts leave
+         * exactly that position untouched, and in both the other three are
+         * real samples, so the inversion is well posed either way.
+         *
+         * Skipped when no auxiliary view has been combined: with all four
+         * values equal the expression collapses to an identity, and the three
+         * extra fetches would buy nothing. Skipped at the right and bottom
+         * edges for the same reason -- the neighbours are outside the picture,
+         * and CLAMP_TO_EDGE would feed the arithmetic duplicates. */
+        '    if (uFilter >= 0.0 && uLayout != 0',
+        '            && (x & 1) == 0 && (y & 1) == 0',
+        '            && x + 1 < uSize.x && y + 1 < uSize.y) {',
+
+        '        float uR, vR, uD, vD, uRD, vRD;',
+        '        chromaAt(x + 1, y,     uR,  vR);',
+        '        chromaAt(x,     y + 1, uD,  vD);',
+        '        chromaAt(x + 1, y + 1, uRD, vRD);',
+
+        '        U = unfilter(U, uR + uD + uRD);',
+        '        V = unfilter(V, vR + vD + vRD);',
         '    }',
 
         /* YUV to RGB. BT.709 at full range, matching the coefficients FreeRDP
@@ -300,6 +358,7 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
                 uniforms.size = gl.getUniformLocation(program, 'uSize');
                 uniforms.auxSize = gl.getUniformLocation(program, 'uAuxSize');
                 uniforms.layout = gl.getUniformLocation(program, 'uLayout');
+                uniforms.filter = gl.getUniformLocation(program, 'uFilter');
 
                 /* One texture per plane, each on its own unit and bound once.
                  * Nearest filtering throughout: these are data planes, and
@@ -436,11 +495,18 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      *     (yielding an ordinary 4:2:0 image), 1 or 2 for the AVC444 chroma
      *     layouts of that version.
      *
+     * @param {number|boolean} [filter=false]
+     *     Whether to also undo the encoder's chroma filter, recovering the one
+     *     sample per 2x2 block that the auxiliary view does not carry, and if
+     *     so with what threshold: a value in 0-255 below which the recovered
+     *     sample is discarded as noise, or false not to recover at all. Has no
+     *     effect when the layout is 0.
+     *
      * @returns {HTMLCanvasElement}
      *     The canvas holding the rendered image, or null if this renderer is
      *     not usable.
      */
-    this.render = function render(layout) {
+    this.render = function render(layout, filter) {
 
         if (!renderer.supported || !width || !height)
             return null;
@@ -451,6 +517,7 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         gl.uniform2i(uniforms.size, width, height);
         gl.uniform2i(uniforms.auxSize, auxWidth, auxHeight);
         gl.uniform1i(uniforms.layout, layout);
+        gl.uniform1f(uniforms.filter, filter === false ? -1.0 : filter / 255.0);
 
         gl.drawArrays(gl.TRIANGLES, 0, 3);
 
