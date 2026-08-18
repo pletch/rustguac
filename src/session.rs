@@ -73,6 +73,10 @@ pub struct CreateSessionRequest {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub dpi: Option<u32>,
+    /// DPI scaling percentage to request from an RDP server, so a framebuffer
+    /// asked for in physical pixels renders at the right physical size rather
+    /// than half of it. RDP only; ignored by other protocols.
+    pub desktop_scale: Option<u32>,
     pub banner: Option<String>,
     /// Override drive/file transfer setting for this session.
     pub enable_drive: Option<bool>,
@@ -684,6 +688,9 @@ impl SessionManager {
         let width = raw_width.clamp(640, 8192);
         let height = raw_height.clamp(480, 8192);
         let dpi = raw_dpi.clamp(16, 384);
+        // MS-RDPBCGR 2.2.1.3.2 permits 100-500; a server discards the whole
+        // pair if it is out of range, so clamp rather than pass it through.
+        let desktop_scale = req.desktop_scale.map(|s| s.clamp(100, 500));
         if width != raw_width || height != raw_height || dpi != raw_dpi {
             tracing::warn!(
                 session_id = %session_id,
@@ -947,6 +954,7 @@ impl SessionManager {
                     enable_full_window_drag: req.enable_full_window_drag.unwrap_or(false),
                     force_lossless: req.force_lossless.unwrap_or(false),
                     enable_h264: req.enable_h264.unwrap_or(false),
+                    desktop_scale,
                     secondary_monitors: req.max_monitors.unwrap_or(1).saturating_sub(1),
                     wol: wol.clone(),
                 }));
@@ -1412,6 +1420,7 @@ impl SessionManager {
                     enable_full_window_drag: false,
                     force_lossless: false,
                     enable_h264: true,
+                    desktop_scale,
                     secondary_monitors: req.max_monitors.unwrap_or(1).saturating_sub(1),
                     // VDI container on the Docker host — WoL not applicable.
                     wol: guacd::WolParams::default(),

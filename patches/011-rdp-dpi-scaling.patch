@@ -1,0 +1,173 @@
+diff --git a/src/protocols/rdp/settings.c b/src/protocols/rdp/settings.c
+index 72511a93..184d8161 100644
+--- a/src/protocols/rdp/settings.c
++++ b/src/protocols/rdp/settings.c
+@@ -101,6 +101,7 @@ const char* GUAC_RDP_CLIENT_ARGS[] = {
+     "disable-glyph-caching",
+     "disable-gfx",
+     "enable-h264",
++    "desktop-scale",
+     "preconnection-id",
+     "preconnection-blob",
+     "timezone",
+@@ -447,6 +448,12 @@ enum RDP_ARGS_IDX {
+      */
+     IDX_ENABLE_H264,
+ 
++    /**
++     * The DPI scaling percentage the RDP session should render its UI at, or
++     * 0 to leave the server's default (100%) alone.
++     */
++    IDX_DESKTOP_SCALE,
++
+     /**
+      * The preconnection ID to send within the preconnection PDU when
+      * initiating an RDP connection, if any.
+@@ -1308,6 +1315,22 @@ guac_rdp_settings* guac_rdp_parse_args(guac_user* user,
+         guac_user_parse_args_boolean(user, GUAC_RDP_CLIENT_ARGS, argv,
+                 IDX_ENABLE_H264, 0);
+ 
++    /* DPI scaling percentage requested for the remote session. Zero leaves
++     * FreeRDP's defaults untouched, which is a plain 100% session. */
++    settings->desktop_scale =
++        guac_user_parse_args_int(user, GUAC_RDP_CLIENT_ARGS, argv,
++                IDX_DESKTOP_SCALE, 0);
++
++    if (settings->desktop_scale != 0
++            && (settings->desktop_scale < GUAC_RDP_MIN_DESKTOP_SCALE
++             || settings->desktop_scale > GUAC_RDP_MAX_DESKTOP_SCALE)) {
++        guac_user_log(user, GUAC_LOG_WARNING,
++                "Ignoring out-of-range desktop scale of %i%% (must be %i-%i).",
++                settings->desktop_scale, GUAC_RDP_MIN_DESKTOP_SCALE,
++                GUAC_RDP_MAX_DESKTOP_SCALE);
++        settings->desktop_scale = 0;
++    }
++
+     /* Session color depth */
+     settings->color_depth =
+         guac_user_parse_args_int(user, GUAC_RDP_CLIENT_ARGS, argv,
+@@ -1573,6 +1596,30 @@ int guac_rdp_get_depth(freerdp* rdp) {
+ #endif
+ }
+ 
++/**
++ * Returns the deviceScaleFactor to pair with the given desktopScaleFactor.
++ * MS-RDPBCGR 2.2.1.3.2 permits only 100, 140 and 180, and a server presented
++ * with anything else discards the desktop factor along with it.
++ *
++ * @param desktop_scale
++ *     The desired desktopScaleFactor, as a percentage.
++ *
++ * @return
++ *     The deviceScaleFactor to send alongside it.
++ */
++static int guac_rdp_device_scale(int desktop_scale) {
++
++    /* Matched exactly, these are the values FreeRDP's own /scale option sets
++     * for both factors at once. */
++    if (desktop_scale == 140 || desktop_scale == 180)
++        return desktop_scale;
++
++    /* Any other scale is carried by the desktop factor alone, which is what a
++     * client running at 125%, 150% or 200% sends. */
++    return 100;
++
++}
++
+ void guac_rdp_push_settings(guac_client* client,
+         guac_rdp_settings* guac_settings, freerdp* rdp) {
+ 
+@@ -1590,6 +1637,29 @@ void guac_rdp_push_settings(guac_client* client,
+ 
+     /* Session */
+ 
++    /* DPI scaling of the remote session. Both factors travel in the client
++     * core data (MS-RDPBCGR 2.2.1.3.2) and the server ignores the pair unless
++     * desktopScaleFactor is 100-500 AND deviceScaleFactor is exactly 100, 140
++     * or 180, so an out-of-range device factor silently disables scaling
++     * altogether rather than falling back. Mirror FreeRDP's own /scale, which
++     * sets both together for the three values it accepts, and otherwise sets
++     * only the desktop factor -- what a client at, say, 200% actually sends. */
++    if (guac_settings->desktop_scale != 0) {
++
++        int device_scale = guac_rdp_device_scale(guac_settings->desktop_scale);
++
++        freerdp_settings_set_uint32(rdp_settings, FreeRDP_DesktopScaleFactor,
++                guac_settings->desktop_scale);
++        freerdp_settings_set_uint32(rdp_settings, FreeRDP_DeviceScaleFactor,
++                device_scale);
++
++        guac_client_log(client, GUAC_LOG_INFO,
++                "Requesting %i%% DPI scaling from the RDP server "
++                "(deviceScaleFactor=%i).",
++                guac_settings->desktop_scale, device_scale);
++
++    }
++
+     freerdp_settings_set_uint32(rdp_settings, FreeRDP_DesktopWidth, guac_settings->width);
+     freerdp_settings_set_uint32(rdp_settings, FreeRDP_DesktopHeight, guac_settings->height);
+     freerdp_settings_set_uint32(rdp_settings, FreeRDP_ColorDepth, guac_settings->color_depth);
+@@ -1870,6 +1940,21 @@ void guac_rdp_push_settings(guac_client* client,
+ 
+     /* Session */
+     rdp_settings->ColorDepth = guac_settings->color_depth;
++    /* DPI scaling of the remote session -- see the FreeRDP 3 path above. */
++    if (guac_settings->desktop_scale != 0) {
++
++        int device_scale = guac_rdp_device_scale(guac_settings->desktop_scale);
++
++        rdp_settings->DesktopScaleFactor = guac_settings->desktop_scale;
++        rdp_settings->DeviceScaleFactor = device_scale;
++
++        guac_client_log(client, GUAC_LOG_INFO,
++                "Requesting %i%% DPI scaling from the RDP server "
++                "(deviceScaleFactor=%i).",
++                guac_settings->desktop_scale, device_scale);
++
++    }
++
+     rdp_settings->DesktopWidth = guac_settings->width;
+     rdp_settings->DesktopHeight = guac_settings->height;
+     rdp_settings->AlternateShell = guac_strdup(guac_settings->initial_program);
+diff --git a/src/protocols/rdp/settings.h b/src/protocols/rdp/settings.h
+index a821b5f6..8480a5c8 100644
+--- a/src/protocols/rdp/settings.h
++++ b/src/protocols/rdp/settings.h
+@@ -179,6 +179,18 @@ typedef enum guac_rdp_resize_method {
+ /**
+  * All settings supported by the Guacamole RDP client.
+  */
++/**
++ * The smallest DPI scaling percentage an RDP server will accept
++ * (MS-RDPBCGR 2.2.1.3.2).
++ */
++#define GUAC_RDP_MIN_DESKTOP_SCALE 100
++
++/**
++ * The largest DPI scaling percentage an RDP server will accept
++ * (MS-RDPBCGR 2.2.1.3.2).
++ */
++#define GUAC_RDP_MAX_DESKTOP_SCALE 500
++
+ typedef struct guac_rdp_settings {
+ 
+     /**
+@@ -660,6 +672,18 @@ typedef struct guac_rdp_settings {
+      */
+     int enable_h264;
+ 
++    /**
++     * The DPI scaling percentage the remote session should render its UI at,
++     * sent to the server as desktopScaleFactor, or 0 to leave the server's
++     * default of 100% alone.
++     *
++     * This exists so that a client requesting a framebuffer in physical rather
++     * than logical pixels -- which is what makes text render sharply on a
++     * HiDPI display -- does not simply get a desktop whose every element is
++     * half the size it should be.
++     */
++    int desktop_scale;
++
+     /**
+      * Whether multi-touch support is enabled.
+      */

@@ -220,3 +220,39 @@ git apply --check ../rustguac/patches/001-freerdp3-debian13.patch 2>&1 || echo "
 1. Make changes in the `../guacamole-server` working tree
 2. Export: `cd ../guacamole-server && git diff > ../rustguac/patches/NNN-description.patch`
 3. Patches are applied in numeric order by the build scripts
+
+## 011-rdp-dpi-scaling.patch
+
+**Feature:** a `desktop-scale` RDP parameter, sent to the server as
+`desktopScaleFactor` so the remote session renders its UI at a matching DPI.
+
+Without it, asking for a framebuffer in physical rather than logical pixels —
+which is what makes text render sharply on a HiDPI display — produces a desktop
+whose every icon and glyph is half the size it should be. guacd had no way to
+request DPI scaling at all: `channels/disp.c` pins `DesktopScaleFactor` and
+`DeviceScaleFactor` to 0, and the existing `dpi` parameter only rescales the
+requested width and height, which `settings.c` skips whenever an explicit width
+and height are supplied.
+
+**How it works.** `desktop-scale` is parsed as a percentage and validated
+against the 100–500 range of MS-RDPBCGR 2.2.1.3.2. When non-zero,
+`guac_rdp_push_settings()` sets `FreeRDP_DesktopScaleFactor` to it and
+`FreeRDP_DeviceScaleFactor` to a legal companion value; FreeRDP writes both
+into the client core data (`gcc.c`). Zero, the default, leaves FreeRDP's
+defaults alone and the session behaves exactly as before.
+
+The device factor matters: a server discards the pair outright unless
+`deviceScaleFactor` is exactly 100, 140 or 180, so an arbitrary value silently
+disables scaling rather than degrading. `guac_rdp_device_scale()` mirrors
+FreeRDP's own `/scale` option, which sets both factors together for those three
+values, and otherwise sends the desktop factor alone with a device factor of
+100 — what a client running at 125%, 150% or 200% actually sends.
+
+**Scope.** RDP only, and Windows-only in practice. An X11 desktop behind xrdp
+has no per-connection DPI negotiation; scaling there has to be arranged inside
+the session (for example via `xfconf-query -c xsettings -p
+/Gdk/WindowScalingFactor`, or `Xft.dpi` for non-integer factors).
+
+**Client side.** `static/client.html` sends `desktop_scale` on the connect
+request, and only when it actually asked for a device-pixel framebuffer — see
+`localStorage.rgNativeRes`, which is off by default.
