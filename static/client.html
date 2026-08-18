@@ -1802,15 +1802,31 @@
                 if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
 
                 // Device pixels, matching the size the resize path will ask
-                // for once connected; the dpi hint makes Windows scale its UI
-                // to suit, so text stays the same physical size but is drawn
-                // with the full pixel count.
+                // for once connected.
+                //
+                // desktop_scale asks the RDP server to render its UI at the
+                // matching DPI percentage, so the extra pixels sharpen the
+                // desktop rather than shrinking it. It travels in the RDP
+                // client core data at connection time and cannot be changed
+                // afterwards, which is why it rides the connect request rather
+                // than the later size negotiation. Sent only when a
+                // device-pixel framebuffer was actually requested; at scale 1
+                // there is nothing to compensate for.
+                //
+                // Non-RDP protocols ignore it. An X11 desktop behind xrdp has
+                // no per-connection DPI negotiation at all, so scaling there
+                // has to be arranged inside the session itself.
                 var initial = deviceSize(window.innerWidth, window.innerHeight);
+                var initialScale = nativeScale(window.innerWidth, window.innerHeight);
                 var body = {
                     width: initial.width,
                     height: initial.height,
                     dpi: Math.round((window.devicePixelRatio || 1) * 96)
                 };
+
+                if (initialScale > 1)
+                    body.desktop_scale = Math.max(100, Math.min(500,
+                            Math.round(initialScale * 100)));
 
                 var url = '/api/addressbook/folders/' + encodeURIComponent(scope)
                     + '/' + encodeURIComponent(folder)
