@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/sol1/rustguac)](LICENSE)
 [![Docker](https://img.shields.io/docker/pulls/sol1/rustguac)](https://hub.docker.com/r/sol1/rustguac)
 
-> **Fork notice** — This is a personal fork of [sol1/rustguac](https://github.com/sol1/rustguac) maintained by [@pletch](https://github.com/pletch), with additional fixes and features layered on top of upstream **v1.9.7** (see [Fork changes](#fork-changes)). Badges and install instructions below still point at the upstream project; for canonical releases and commercial support, use the upstream repository.
+> **Fork notice** — This is a personal fork of [sol1/rustguac](https://github.com/sol1/rustguac) maintained by [@pletch](https://github.com/pletch), with additional fixes and features layered on top of upstream **v1.9.9** (see [Fork changes](#fork-changes)). Badges and install instructions below still point at the upstream project; for canonical releases and commercial support, use the upstream repository.
 
 A lightweight Rust replacement for the Apache Guacamole Java webapp. Browser-based SSH, RDP, VNC, SPICE, Proxmox VE consoles, web browsing, and VDI desktop containers through [guacd](https://github.com/apache/guacamole-server).
 
@@ -13,31 +13,107 @@ No Java. No Tomcat. Single binary + guacd.
 
 ## Fork changes
 
-This fork layers the following on top of upstream **v1.9.7**:
+This fork layers the following on top of upstream **v1.9.9**. Everything here
+is in `main-fork`; the guacd-side changes live in `patches/` and are applied by
+the build scripts.
 
-**RDP / H.264**
-- **Lower passthrough decode latency** — WebCodecs decode pipeline tuning plus per-frame instrumentation (`client._h264Decoder.stats()`).
+### RDP H.264 passthrough
 
-**Connections / sessions**
-- **Per-entry Wake-on-LAN** — sends a magic packet via guacd and polls the target before connecting (SSH/RDP/VNC); configurable MAC, broadcast address, UDP port, and wait time.
-- **Configurable SSH terminal font size** with a **HiDPI fix** — SSH text no longer renders oversized on high-DPI displays (SSH DPI pinned to a 96 baseline; the client auto-scales).
+Upstream ships AVC420-only passthrough. This fork reworks it substantially.
 
-**UI / admin**
+- **AVC444 support** (`patches/004-h264-passthrough.patch`) — both views of an
+  AVC444 picture are forwarded and the main one drawn, so Windows hosts can use
+  **hardware** H.264 encoding, which requires `AVC444ModePreferred=1`. Upstream
+  forces `GfxAVC444` off to sidestep the colour corruption this used to cause.
+  Chroma is 4:2:0, as the auxiliary view is decoded for its references but not
+  composited (see [`docs/rdp-h264.md`](docs/rdp-h264.md)).
+- **Ordered drawing** — the `h264` instruction gains a `<view>` field and
+  trailing region rects, and frames are painted through the display's task
+  queue (`Display.drawH264`) rather than straight from the decoder's output
+  callback. Upstream draws on completion, so on a server mixing H.264 with
+  other codecs a late frame repaints stale video over newer content.
+- **No environment variables** — the per-connection `enable-h264` checkbox is
+  the only switch. Upstream's build is configured through env vars.
+- **Frame lifetime fixes** — decoded frames are snapshotted synchronously and
+  closed on every path out of the decoder callback. Holding a `VideoFrame`
+  across a promise exhausts the hardware decoder's output-surface pool as soon
+  as the display queue falls behind, which shows up as brief video freezes.
+  The decoder is also rebuilt after a terminal error rather than being left
+  closed, which otherwise blanks the session permanently.
+- **Latency tuning** — bounded decode pipeline with sync gating, so stream lag
+  cannot grow without limit.
+
+Measured with 1080p video playing, guacd session CPU over 30s:
+
+| | decode + re-encode | passthrough |
+|---|---|---|
+| xrdp (AVC420) | ~100% of a core | **2.0%** |
+| Windows 11 (AVC444) | 90.6% of a core | **2.1%** |
+
+### Display / HiDPI
+
+- **Per-connection Native Resolution** — requests the framebuffer in the
+  browser's physical pixels rather than its CSS pixels, so text stays sharp on
+  a high-DPI display. Off by default and set per entry, because it is only safe
+  where the target also scales its own UI.
+- **RDP DPI scaling** (`patches/011-rdp-dpi-scaling.patch`) — a `desktop-scale`
+  parameter asking the server to render its desktop at a matching DPI, which
+  guacd otherwise cannot do at all: it pins `DesktopScaleFactor` to zero, and
+  its `dpi` parameter only rescales the requested dimensions. The scale is
+  re-sent on every display update, since a monitor layout carrying zeroes
+  resets the session to 100%.
+- **Configurable SSH terminal font size** with a **HiDPI fix** — SSH text no
+  longer renders oversized on high-DPI displays (SSH DPI pinned to a 96
+  baseline; the client auto-scales).
+
+### Connections / sessions
+
+- **Per-entry Wake-on-LAN** — sends a magic packet via guacd and polls the
+  target before connecting (SSH/RDP/VNC); configurable MAC, broadcast address,
+  UDP port, and wait time.
+
+### OIDC
+
+- **Lazy provider discovery with retry** — if the OIDC provider (e.g. Authelia)
+  is unreachable at startup, SSO stays enabled instead of being silently
+  disabled until restart; provider metadata is discovered on the first login
+  and cached, so SSO recovers automatically once the provider comes up. The
+  login page reflects live availability: while the provider is unreachable the
+  SSO button is disabled with a "temporarily unavailable" notice and the page
+  polls until it recovers (re-enabling the button without a reload).
+- **Callback diagnostics** — on a state-cookie mismatch, logs whether the
+  cookie was absent vs. present-but-different plus `Host`/`X-Forwarded-*`
+  headers, to diagnose reverse-proxy cookie issues.
+
+### UI / admin
+
 - **Onboarding modal close button** to skip the welcome tour entirely.
 
-**OIDC**
-- **Lazy provider discovery with retry** — if the OIDC provider (e.g. Authelia) is unreachable at startup, SSO stays enabled instead of being silently disabled until restart; provider metadata is discovered on the first login and cached, so SSO recovers automatically once the provider comes up. The login page reflects live availability: while the provider is unreachable the SSO button is disabled with a "temporarily unavailable" notice and the page polls until it recovers (re-enabling the button without a reload).
-- **Callback diagnostics** — on a state-cookie mismatch, logs whether the cookie was absent vs. present-but-different plus `Host`/`X-Forwarded-*` headers, to diagnose reverse-proxy cookie issues.
+### Docs and tooling
+
+- [`docs/rdp-h264.md`](docs/rdp-h264.md) — H.264 passthrough setup, including
+  the non-obvious Windows requirement that the *"Use WDDM graphics display
+  driver for Remote Desktop Connections"* policy be **Disabled** or hardware
+  encoding never engages.
+- [`docs/xrdp-dpi-scaling.md`](docs/xrdp-dpi-scaling.md) — what an xrdp patch
+  would need in order to act on the DPI scale factor it already parses,
+  validates and then discards.
+- `contrib/measure-guacd-cpu.sh`, `contrib/setup-rdp-performance.ps1`.
 
 ### Merged upstream
 
-These started here and now ship in upstream rustguac, so they are no longer fork-specific:
+These started here and now ship in upstream rustguac, so they are no longer
+fork-specific:
 
-- **AVC420-only H.264 passthrough** — fixes AVC444 colour corruption on Windows hosts (upstream as of v1.8.1).
-- **Per-entry RDP desktop appearance** — configurable wallpaper, theming, and full-window drag (upstream as of v1.8.1).
+- **AVC420-only H.264 passthrough** — worked around AVC444 colour corruption on
+  Windows hosts by disabling AVC444 outright (upstream as of v1.8.1). This fork
+  has since superseded it by handling AVC444 properly, as described above.
+- **Per-entry RDP desktop appearance** — configurable wallpaper, theming, and
+  full-window drag (upstream as of v1.8.1).
 - **TCP_NODELAY** — Nagle's algorithm disabled on rustguac's TCP sockets.
 - **Local-time timestamps** on the admin page.
-- **Rendering fixes ported from `fixes-1.6.0`** — terminal OSC-consume and RDP mod-16 dirty-region guacd patches.
+- **Rendering fixes ported from `fixes-1.6.0`** — terminal OSC-consume and RDP
+  mod-16 dirty-region guacd patches.
 
 ## Architecture
 
