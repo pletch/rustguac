@@ -41,6 +41,16 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var configured = false;
 
     /**
+     * Whether the next access unit submitted must be a keyframe. Set after a
+     * terminal decoder error, since a rebuilt decoder holds no reference
+     * frames and a delta frame would only error it again immediately.
+     *
+     * @private
+     * @type {boolean}
+     */
+    var needsKeyFrame = false;
+
+    /**
      * Monotonic timestamp counter for EncodedVideoChunk (microseconds). Also
      * serves as the token identifying each submitted frame.
      *
@@ -240,7 +250,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     function ensureDecoder(width, height) {
 
-        if (decoder && configured)
+        /* A decoder that has hit a terminal error is left closed. Treating it
+         * as usable because `configured` is still set means every later frame
+         * is dropped and nothing is drawn again -- and since guacd suppresses
+         * ordinary image operations for a layer carrying an H.264 stream, that
+         * is a permanently black screen rather than a degraded one. */
+        if (decoder && configured && decoder.state !== 'closed')
             return;
 
         if (typeof VideoDecoder === 'undefined') {
@@ -325,19 +340,38 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                         frameState.canvas = null;
 
                 } finally {
-                    frame.close();
-                }
 
-                /* Released after the frame is closed, since this runs the
-                 * display queue synchronously and may draw several frames. */
-                if (frameState && frameState.onReady)
-                    frameState.onReady();
+                    frame.close();
+
+                    /* Released here rather than after the try, because the
+                     * early returns above exit the function once this finally
+                     * has run -- they do not fall through to code following
+                     * the block. Releasing there left every AVC444 auxiliary
+                     * view's draw task blocked forever, its watchdog having
+                     * been cleared above, and the display queue is ordered, so
+                     * the first auxiliary frame stopped the display for good.
+                     *
+                     * Ordered after the close deliberately: this runs the
+                     * display queue synchronously and may draw several frames,
+                     * by which point the frame's surface is back in the
+                     * decoder's pool. */
+                    if (frameState && frameState.onReady)
+                        frameState.onReady();
+
+                }
 
             },
 
             error: function(e) {
 
                 console.error('[rustguac] H.264 decode error:', e.message);
+
+                /* Terminal: the decoder is now closed and will never accept
+                 * another chunk. Force ensureDecoder() to build a replacement,
+                 * and hold frames until the next keyframe, the earliest point
+                 * a fresh decoder can produce a picture at all. */
+                configured = false;
+                needsKeyFrame = true;
 
                 /* A VideoDecoder error is terminal for everything queued on
                  * it: those frames will never reach the output callback. Each
@@ -412,6 +446,19 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (!decoder || decoder.state === 'closed') {
             if (onReady) onReady();
             return null;
+        }
+
+        /* Recovering from a terminal error. A rebuilt decoder holds no
+         * reference frames, so a delta would error it again at once and
+         * recovery would never converge; wait for the next IDR instead. */
+        if (needsKeyFrame) {
+            if (!isKeyFrame) {
+                if (onReady) onReady();
+                return null;
+            }
+            needsKeyFrame = false;
+            console.warn('[rustguac] H.264: decoder rebuilt, resuming at'
+                    + ' keyframe');
         }
 
         try {
@@ -604,6 +651,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             try {
                 decoder.reset();
                 configured = false;
+                needsKeyFrame = true;
                 timestamp = 0;
             } catch (e) {
                 /* Decoder may be in an error state */
@@ -635,6 +683,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         decoder = null;
         configured = false;
+        needsKeyFrame = false;
         pendingDecodes = 0;
         releaseHeldFrames();
 
