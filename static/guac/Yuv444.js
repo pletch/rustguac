@@ -72,14 +72,28 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
     var gl = null;
 
     try {
+        /* This canvas is never in the document; it exists to be read back
+         * from with drawImage(). That rules out two attributes that would
+         * otherwise be the obvious choice here:
+         *
+         * desynchronized asks for the low-latency present path, which is for
+         * canvases actually on screen and on some drivers -- mobile ones in
+         * particular -- puts the drawing buffer somewhere that is not a
+         * reliable source for a readback.
+         *
+         * preserveDrawingBuffer: false leaves the buffer's contents undefined
+         * after a compositing boundary. The drawImage() here is synchronous
+         * with the draw, so in principle it never crosses one, but it runs
+         * from a promise callback and that is a thinner guarantee than it
+         * looks. The copy it costs is one the driver is likely making anyway.
+         */
         gl = canvas.getContext('webgl2', {
             alpha: false,
             antialias: false,
             depth: false,
             stencil: false,
             premultipliedAlpha: false,
-            preserveDrawingBuffer: false,
-            desynchronized: true
+            preserveDrawingBuffer: true
         });
     } catch (e) {
         gl = null;
@@ -93,6 +107,20 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      * @type {!boolean}
      */
     this.supported = !!gl;
+
+    /* A lost context is the failure mode with no error attached: drawArrays()
+     * silently does nothing and every frame reads back black, for the rest of
+     * the session. Mobile GPUs lose contexts routinely -- backgrounding the
+     * tab is enough -- so this has to be watched for rather than assumed away.
+     */
+    if (gl) {
+        canvas.addEventListener('webglcontextlost', function(e) {
+            e.preventDefault();
+            console.warn('[rustguac] YUV444 WebGL context lost;'
+                    + ' falling back to 4:2:0');
+            renderer.supported = false;
+        });
+    }
 
     /**
      * The picture's dimensions, in pixels.
@@ -508,7 +536,7 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      */
     this.render = function render(layout, filter) {
 
-        if (!renderer.supported || !width || !height)
+        if (!renderer.supported || gl.isContextLost() || !width || !height)
             return null;
 
         gl.useProgram(program);

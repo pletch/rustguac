@@ -352,18 +352,58 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
+     * Reads a runtime override, from a window global, a query parameter, or
+     * localStorage, in that order. The last two exist because the devices
+     * where these paths behave differently -- phones and tablets -- are the
+     * ones with no console to set a global from.
+     *
+     * @private
+     * @param {!string} name - The override's name.
+     * @returns {*} The override's value, or undefined if unset.
+     */
+    function override(name) {
+
+        if (typeof window === 'undefined')
+            return undefined;
+
+        if (window['__' + name] !== undefined)
+            return window['__' + name];
+
+        var value = null;
+
+        try {
+            value = new URLSearchParams(window.location.search).get(name);
+            if (value === null && window.localStorage)
+                value = window.localStorage.getItem(name);
+        } catch (e) {
+            /* Storage can be blocked outright; the global still works. */
+        }
+
+        if (value === null || value === undefined)
+            return undefined;
+
+        if (value === 'off' || value === 'false' || value === '0')
+            return false;
+        if (value === 'on' || value === 'true')
+            return true;
+
+        var number = parseFloat(value);
+        return isNaN(number) ? true : number;
+
+    }
+
+    /**
      * Whether 4:4:4 combining is switched on. Overridable at runtime as
-     * window.__h264Chroma444 = false to compare against the 4:2:0 path within
-     * a single session.
+     * window.__h264Chroma444 = false, as ?h264Chroma444=off on the client's
+     * URL, or as the h264Chroma444 key in localStorage, to compare against the
+     * 4:2:0 path.
      *
      * @private
      * @returns {!boolean}
      */
     function chroma444Enabled() {
-        if (typeof window !== 'undefined'
-                && window.__h264Chroma444 !== undefined)
-            return !!window.__h264Chroma444;
-        return true;
+        var value = override('h264Chroma444');
+        return value === undefined ? true : !!value;
     }
 
     /**
@@ -380,19 +420,19 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * 4:2:0, combined, and combined-plus-filtered without a reload. Setting it
      * to a number overrides the threshold instead of switching the filter off;
      * that constant is inherited from FreeRDP rather than specified anywhere,
-     * and is the part of this least backed by evidence.
+     * and is the part of this least backed by evidence. Also settable as
+     * ?h264ChromaFilter= on the URL or from localStorage -- see override().
      *
      * @private
      * @returns {!(number|boolean)}
      */
     function chromaFilter() {
-        if (typeof window !== 'undefined'
-                && window.__h264ChromaFilter !== undefined) {
-            if (typeof window.__h264ChromaFilter === 'number')
-                return window.__h264ChromaFilter;
-            return window.__h264ChromaFilter ? 30 : false;
-        }
-        return 30;
+        var value = override('h264ChromaFilter');
+        if (value === undefined || value === true)
+            return 30;
+        if (typeof value === 'number')
+            return value;
+        return false;
     }
 
     /**
@@ -463,8 +503,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * an accident. */
             var rendered = renderer.render(view === 0 ? 0 : view,
                     chromaFilter());
-            if (!rendered)
+
+            /* Nothing to snapshot means the renderer has given up -- a lost
+             * context, most likely. Returning alone would leave every frame
+             * from here on blank, so drop the whole path. */
+            if (!rendered) {
+                combining = false;
+                yuv444Unavailable = true;
                 return;
+            }
 
             /* The watchdog may have released this frame's task while the
              * copy was in flight, in which case drawDecoded() has already run
