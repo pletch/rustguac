@@ -241,12 +241,31 @@ against the 100–500 range of MS-RDPBCGR 2.2.1.3.2. When non-zero,
 into the client core data (`gcc.c`). Zero, the default, leaves FreeRDP's
 defaults alone and the session behaves exactly as before.
 
-The device factor matters: a server discards the pair outright unless
-`deviceScaleFactor` is exactly 100, 140 or 180, so an arbitrary value silently
-disables scaling rather than degrading. `guac_rdp_device_scale()` mirrors
-FreeRDP's own `/scale` option, which sets both factors together for those three
-values, and otherwise sends the desktop factor alone with a device factor of
-100 — what a client running at 125%, 150% or 200% actually sends.
+**Only 100, 140 and 180 work,** for two compounding reasons, and
+`guac_rdp_normalize_desktop_scale()` snaps the request to the nearest of them.
+
+MS-RDPBCGR 2.2.1.3.2 already restricts `deviceScaleFactor` to those three, and
+a server discards the desktop factor along with an out-of-range device factor
+rather than degrading. On top of that, **FreeRDP transposes the pair** when it
+synthesises the single-monitor definition that every windowed session uses
+(`libfreerdp/core/settings.c`, introduced in `401f81683` and present through
+3.x):
+
+```c
+const UINT32 desktopScaleFactor = get(FreeRDP_DeviceScaleFactor);   /* reads Device */
+const UINT32 deviceScaleFactor  = get(FreeRDP_DesktopScaleFactor);  /* reads Desktop */
+...
+monitor.attributes.desktopScaleFactor = desktopScaleFactor;
+monitor.attributes.deviceScaleFactor  = deviceScaleFactor;
+```
+
+So any pair of differing values reaches the server backwards: a request for
+200%/100% arrives as `deviceScaleFactor=200`, which is illegal, and the whole
+pair is dropped. Setting both factors to the *same* value is immune to the
+transposition — which is exactly why FreeRDP's own `/scale` accepts only these
+three and sets both at once. `static/client.html` snaps its framebuffer factor
+to match (1.4 or 1.8), so the extra pixels and the session scaling agree and
+physical sizes stay correct.
 
 **Scope.** RDP only, and Windows-only in practice. An X11 desktop behind xrdp
 has no per-connection DPI negotiation; scaling there has to be arranged inside
