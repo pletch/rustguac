@@ -266,26 +266,38 @@
         // framebuffer into the available CSS area, so a framebuffer that is
         // devicePixelRatio times larger simply yields a scale of 1/dpr.
         //
-        // The cost is real -- at devicePixelRatio 2 the server encodes four
-        // times the pixels -- so it is capped, and can be turned off per
-        // browser for an A/B:
+        // OFF BY DEFAULT, because on its own it makes the remote desktop
+        // physically smaller: guacd never negotiates DPI scaling with the RDP
+        // server (channels/disp.c pins DesktopScaleFactor and
+        // DeviceScaleFactor to 0, and the `dpi` parameter only rescales the
+        // requested width/height, which is skipped entirely when an explicit
+        // width and height are sent -- as rustguac always does). The session
+        // therefore renders at 100% scaling however many pixels it is given,
+        // so more pixels means smaller icons and text rather than sharper
+        // ones. Enabling this is only worthwhile alongside a server that has
+        // been told to scale its UI to match.
         //
-        //   localStorage.rgNativeRes = 'off'   CSS pixels, as before
+        // The cost is real too -- at devicePixelRatio 2 the server encodes
+        // four times the pixels.
+        //
+        //   localStorage.rgNativeRes = 'on'    device pixels at full dpr
         //   localStorage.rgNativeRes = '1.5'   force a specific factor
-        //   localStorage.removeItem('rgNativeRes')
+        //   localStorage.rgNativeRes = 'off'   CSS pixels (the default)
         //
         var MAX_NATIVE_DIMENSION = 4096;
         var MAX_NATIVE_PIXELS = 3840 * 2160;
 
         function nativeScale(cssW, cssH) {
 
-            var dpr = window.devicePixelRatio || 1;
+            var dpr = 1;
 
             try {
                 var pref = localStorage.getItem('rgNativeRes');
-                if (pref === 'off')
+                if (!pref || pref === 'off')
                     return 1;
-                if (pref) {
+                if (pref === 'on')
+                    dpr = window.devicePixelRatio || 1;
+                else {
                     var forced = parseFloat(pref);
                     if (forced > 0) dpr = forced;
                 }
