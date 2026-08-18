@@ -456,13 +456,27 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var view = frameState.view;
         var rect = frame.codedRect || null;
 
+        /* Copied in whatever format the decoder produced, with no format
+         * option at all. Asking for I420 looks like the tidier choice -- one
+         * layout for the renderer to handle -- but copyTo() only converts
+         * between a narrow set of formats, and NV12 to I420 is not among
+         * them. A hardware decoder on Windows hands back NV12, so requesting
+         * I420 there throws before a single frame is copied.
+         *
+         * The two formats differ only in whether the chroma samples are in
+         * one interleaved plane or two, which the renderer can address either
+         * way, so taking what the decoder gives costs nothing. */
+        var format = frame.format || '';
+        var interleaved = (format.indexOf('NV12') === 0);
+        var planar = (format.indexOf('I420') === 0);
+
         /* The coded frame rather than the visible one: the v1 chroma layout
          * pads the auxiliary view to a multiple of 16 rows and addresses that
          * padding, so cropping to the visible rect would drop rows the combine
          * reads. */
         var options = rect
-            ? { format: 'I420', rect: { x: 0, y: 0, width: rect.width, height: rect.height } }
-            : { format: 'I420' };
+            ? { rect: { x: 0, y: 0, width: rect.width, height: rect.height } }
+            : {};
 
         var planeW = rect ? rect.width : frame.codedWidth;
         var planeH = rect ? rect.height : frame.codedHeight;
@@ -473,23 +487,49 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var size = 0;
 
         try {
+
+            if (!interleaved && !planar)
+                throw new Error('decoded frame is ' + (format || 'an unknown'
+                        + ' format') + ', which carries no YUV planes');
+
             size = frame.allocationSize(options);
             buffer = acquireBuffer(size);
+
         } catch (e) {
-            console.error('[rustguac] H.264: cannot size frame planes:', e.message);
+
+            console.error('[rustguac] H.264: cannot size frame planes:',
+                    e.message);
+
+            /* Whatever stopped the copy will stop the next one too, and this
+             * frame is already lost. Falling back here rather than only in
+             * the copy's catch matters: without it every later frame takes
+             * this same path, is neither combined nor drawn, and the display
+             * stays black for the rest of the session. */
+            combining = false;
+            yuv444Unavailable = true;
+
             try { frame.close(); } catch (ignore) { /* already closed */ }
             if (frameState.onReady) frameState.onReady();
             return;
+
         }
 
         copyChain = copyChain.then(function() {
             return frame.copyTo(buffer, options);
         }).then(function(layout) {
 
-            var y = new Uint8Array(buffer.buffer, buffer.byteOffset + layout[0].offset);
-            var u = new Uint8Array(buffer.buffer, buffer.byteOffset + layout[1].offset);
-            var v = new Uint8Array(buffer.buffer, buffer.byteOffset + layout[2].offset);
-            var strides = [layout[0].stride, layout[1].stride, layout[2].stride];
+            /* NV12 has two planes rather than three; a null V plane is how
+             * the renderer is told the chroma is interleaved into U. */
+            var y = new Uint8Array(buffer.buffer,
+                    buffer.byteOffset + layout[0].offset);
+            var u = new Uint8Array(buffer.buffer,
+                    buffer.byteOffset + layout[1].offset);
+            var v = interleaved ? null : new Uint8Array(buffer.buffer,
+                    buffer.byteOffset + layout[2].offset);
+
+            var strides = interleaved
+                ? [layout[0].stride, layout[1].stride]
+                : [layout[0].stride, layout[1].stride, layout[2].stride];
 
             if (view === 0)
                 renderer.uploadLuma(y, u, v, strides, pictureW, pictureH);
