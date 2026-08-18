@@ -73,6 +73,14 @@ pub struct CreateSessionRequest {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub dpi: Option<u32>,
+    /// DPI scaling percentage to request from an RDP server, so a framebuffer
+    /// asked for in physical pixels renders at the right physical size rather
+    /// than half of it. RDP only; ignored by other protocols.
+    pub desktop_scale: Option<u32>,
+    /// Factor by which the framebuffer was scaled past the browser's CSS
+    /// pixels, if it was. Surfaced in `SessionInfo` so client.html can keep
+    /// its own resize requests in the same units the session was created in.
+    pub display_scale: Option<f64>,
     pub banner: Option<String>,
     /// Override drive/file transfer setting for this session.
     pub enable_drive: Option<bool>,
@@ -239,6 +247,12 @@ pub struct SessionInfo {
     pub entry_display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
+    /// Factor by which this session's framebuffer was scaled past the
+    /// browser's CSS pixels, when the entry asked for a physical-pixel
+    /// framebuffer. Read by client.html from the /api/sessions/:id fetch so
+    /// its resize requests stay in the same units; omitted when unscaled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_scale: Option<f64>,
     /// Open the client in fullscreen on connect (#154). Read by client.html
     /// from the /api/sessions/:id fetch; omitted when false/unset.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -304,6 +318,9 @@ pub struct Session {
     /// Connections card hides its Share button. Does not block admin
     /// shadow (`/shadow`), which has its own audit trail.
     pub share_allowed: bool,
+    /// Factor by which the framebuffer was scaled past the browser's CSS
+    /// pixels, if the source entry asked for a physical-pixel framebuffer.
+    pub display_scale: Option<f64>,
     /// Copied from the source entry's `fullscreen_on_connect` flag
     /// (#154). Surfaced verbatim in `SessionInfo` so client.html can
     /// trigger fullscreen on first user gesture after CONNECTED.
@@ -519,6 +536,7 @@ impl Session {
             address_book_folder: self.address_book_folder.clone(),
             entry_display_name: self.entry_display_name.clone(),
             thumbnail_url: Some(format!("/api/sessions/{}/thumbnail", self.id)),
+            display_scale: self.display_scale,
             fullscreen_on_connect: self.fullscreen_on_connect,
             autohide_side_tabs: self.autohide_side_tabs,
         }
@@ -684,6 +702,9 @@ impl SessionManager {
         let width = raw_width.clamp(640, 8192);
         let height = raw_height.clamp(480, 8192);
         let dpi = raw_dpi.clamp(16, 384);
+        // MS-RDPBCGR 2.2.1.3.2 permits 100-500; a server discards the whole
+        // pair if it is out of range, so clamp rather than pass it through.
+        let desktop_scale = req.desktop_scale.map(|s| s.clamp(100, 500));
         if width != raw_width || height != raw_height || dpi != raw_dpi {
             tracing::warn!(
                 session_id = %session_id,
@@ -947,6 +968,7 @@ impl SessionManager {
                     enable_full_window_drag: req.enable_full_window_drag.unwrap_or(false),
                     force_lossless: req.force_lossless.unwrap_or(false),
                     enable_h264: req.enable_h264.unwrap_or(false),
+                    desktop_scale,
                     secondary_monitors: req.max_monitors.unwrap_or(1).saturating_sub(1),
                     wol: wol.clone(),
                 }));
@@ -1412,6 +1434,7 @@ impl SessionManager {
                     enable_full_window_drag: false,
                     force_lossless: false,
                     enable_h264: true,
+                    desktop_scale,
                     secondary_monitors: req.max_monitors.unwrap_or(1).saturating_sub(1),
                     // VDI container on the Docker host — WoL not applicable.
                     wol: guacd::WolParams::default(),
@@ -1698,6 +1721,7 @@ impl SessionManager {
             login_script_handle,
             shadow_tokens: Vec::new(),
             share_allowed,
+            display_scale: req.display_scale,
             fullscreen_on_connect: req.fullscreen_on_connect.unwrap_or(false),
             autohide_side_tabs: req.autohide_side_tabs.unwrap_or(false),
         };
@@ -2604,6 +2628,7 @@ mod tests {
             login_script_handle: None,
             shadow_tokens: Vec::new(),
             share_allowed: true,
+            display_scale: None,
             fullscreen_on_connect: false,
             autohide_side_tabs: false,
         }

@@ -123,6 +123,47 @@ hardware encoding*, and makes Windows send AVC444 — which is handled: both
 views are forwarded and only the main one is drawn, so chroma is 4:2:0. Full
 details, including verification commands, in `docs/rdp-h264.md`.
 
+### Native resolution (HiDPI)
+
+Per-connection **Native Resolution** checkbox requests the framebuffer in the
+browser's physical pixels rather than its CSS pixels, so text stays sharp on a
+HiDPI display. The browser reports `device_pixel_ratio` on connect and the
+server decides, since only the entry knows whether the target scales its own UI.
+
+**The framebuffer factor and the desktop scale are separate numbers, and used
+to be conflated.** The framebuffer takes the browser's true
+`devicePixelRatio` (capped by `MAX_NATIVE_FACTOR`), because the client fits
+whatever framebuffer arrives into the available CSS area -- so one framebuffer
+pixel lands on one physical pixel only when the two agree. Snapping the
+framebuffer to 1.8 on a 2.0 display left the client stretching by 1.111, which
+measured in the field as a uniformly soft picture with almost no single-pixel
+edges: 0.01% of adjacent pixels differing by >100 levels against a native
+render's 0.82%. The cost of separating them is a desktop scaled 180% inside a
+200% framebuffer drawing its UI ~10% smaller than nominal, which is legible and
+adjustable on the host where a resample is neither.
+
+RDP is asked to scale via `desktopScaleFactor` (patch `011-rdp-dpi-scaling`),
+and **the two channels that carry it are not equally capable**. At connection
+time only 100/140/180 survive: MS-RDPBCGR restricts `deviceScaleFactor` to
+those three, and FreeRDP transposes the pair when synthesising its
+single-monitor definition (`libfreerdp/core/settings.c` — the monitor's
+`desktopScaleFactor` is filled from `FreeRDP_DeviceScaleFactor` and vice
+versa), so only equal values reach the server intact. The display-control
+layout has no such problem: `disp.c` builds it directly, nothing transposes it,
+and MS-RDPEDISP 2.2.2.2.1 allows `desktopScaleFactor` anywhere in 100-500 while
+restricting only `deviceScaleFactor`. So that layout carries the **exact**
+percentage alongside the nearest legal device factor, and since the client fits
+the display shortly after connecting it is what the session ends up scaled by.
+That is what lets a 2.0 display run at 200% rather than the 180% that leaves
+its UI 10% smaller than nominal.
+
+The scale is re-sent on every display update — a `MONITOR_LAYOUT` carrying
+zeroes resets the session to 100%, which used to undo it a second after connect.
+
+X11 behind xrdp has no per-connection DPI negotiation; scale it inside the
+session (`xfconf-query -c xsettings -p /Xft/DPI`). See `docs/xrdp-dpi-scaling.md`
+for what an xrdp patch would involve.
+
 ## guacamole-server patches
 
 The `patches/` directory contains patches applied to guacamole-server before building. These fix:

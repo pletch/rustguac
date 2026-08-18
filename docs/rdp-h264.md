@@ -110,6 +110,54 @@ In the browser console, `__h264.stats()` reports decoder health —
 `avgDecodeLatencyMs` in the low single digits, `framesDropped` and `gcLeaks` at
 zero, `auxViewsDecoded` counting AVC444 auxiliary views.
 
+## When the whole picture looks soft
+
+Before blaming the codec, check that the client is not resampling. In the
+browser console on the client tab:
+
+```js
+__guac_client.getDisplay().getScale() * devicePixelRatio
+```
+
+**1.0** means one framebuffer pixel per physical pixel. Anything else is a
+resample, and it softens text, icons and images uniformly — which a codec does
+not do. Measured on a Windows session at 2.016, the picture contained almost no
+single-pixel edges at all: 0.01% of adjacent pixels differing by more than 100
+levels, against 0.82% for the same page rendered natively, with the sharpest
+transition anywhere reaching 114 where native reached 194.
+
+The fix is the entry's **Native Resolution (HiDPI)** checkbox, which asks for
+the framebuffer in physical pixels. Note it multiplies the pixels the host
+encodes and the browser decodes by the square of the ratio.
+
+### Asking for the exact DPI scaling
+
+MS-RDPBCGR restricts `deviceScaleFactor` to 100, 140 or 180. Pairing a
+framebuffer sized for a 2.0 display with 180% scaling draws the UI about 10%
+smaller than nominal — sharp, but small.
+
+The protocol is not the whole obstacle: `desktopScaleFactor` is legal from 100
+to 500. FreeRDP transposes the pair when it synthesises the single-monitor
+definition (`libfreerdp/core/settings.c`, the monitor's `desktopScaleFactor`
+filled from `FreeRDP_DeviceScaleFactor` and vice versa), so any unequal pair
+reaches the server backwards and an out-of-range device factor makes it discard
+both. Equal values are the only ones that survive that path, which is what
+`guac_rdp_normalize_desktop_scale` snaps to.
+
+**The display-control channel is not subject to that.** `disp.c` builds the
+`DISPLAY_CONTROL_MONITOR_LAYOUT` itself and hands it straight to the channel,
+so nothing transposes it, and MS-RDPEDISP 2.2.2.2.1 likewise restricts only
+`DeviceScaleFactor`. The layout therefore carries the exact percentage —
+`DesktopScaleFactor = 200` beside `DeviceScaleFactor = 180` — and since the
+client fits the display to the browser window shortly after connecting, that
+layout is what the session ends up scaled by. The connection-time core data
+still goes out snapped and is overridden a moment later.
+
+An xrdp target is unaffected either way: xrdp parses the scale factors and
+drops them unused (`docs/xrdp-dpi-scaling.md`), so a session script setting
+`/Gdk/WindowScalingFactor` or `/Xft/DPI` remains the only thing scaling that
+desktop.
+
 ## Recording
 
 Session recordings capture the raw stream, so a recording of an H.264 session
