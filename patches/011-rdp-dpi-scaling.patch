@@ -1,5 +1,52 @@
+diff --git a/src/protocols/rdp/channels/disp.c b/src/protocols/rdp/channels/disp.c
+index 1acad6ed..4e25a4e9 100644
+--- a/src/protocols/rdp/channels/disp.c
++++ b/src/protocols/rdp/channels/disp.c
+@@ -388,6 +388,20 @@ void guac_rdp_disp_update_size(guac_rdp_disp* disp,
+ 
+     else if (settings->resize_method == GUAC_RESIZE_DISPLAY_UPDATE) {
+ 
++        /* Repeat the DPI scaling on every layout update. The scale factors
++         * negotiated at connection time are not sticky: a MONITOR_LAYOUT
++         * carrying zeroes (MS-RDPEDISP 2.2.2.2.1 requires 100-500 and one of
++         * 100/140/180, so zero is out of range either way) drops the session
++         * back to 100%. A client that resizes shortly after connecting -- as
++         * one fitting the remote display to a browser window does -- therefore
++         * lost its scaling a second later, having applied it correctly at
++         * first.
++         *
++         * Zero remains the value sent when no scaling was requested, leaving
++         * an unscaled session behaving exactly as before. */
++        int scale = settings->desktop_scale != 0
++                ? guac_rdp_normalize_desktop_scale(settings->desktop_scale) : 0;
++
+         /* Multi-monitor: send the full client-requested monitor layout and
+          * republish it to the client so it can split the combined framebuffer */
+         if (disp->monitor_count > 1) {
+@@ -407,8 +421,8 @@ void guac_rdp_disp_update_size(guac_rdp_disp* disp,
+                     .PhysicalWidth = 0,
+                     .PhysicalHeight = 0,
+                     .Orientation = 0,
+-                    .DesktopScaleFactor = 0,
+-                    .DeviceScaleFactor = 0
++                    .DesktopScaleFactor = scale,
++                    .DeviceScaleFactor = scale
+                 };
+             }
+ 
+@@ -435,8 +449,8 @@ void guac_rdp_disp_update_size(guac_rdp_disp* disp,
+                 .PhysicalWidth = 0,
+                 .PhysicalHeight = 0,
+                 .Orientation = 0,
+-                .DesktopScaleFactor = 0,
+-                .DeviceScaleFactor = 0
++                .DesktopScaleFactor = scale,
++                .DeviceScaleFactor = scale
+             }};
+ 
+             /* Send display update notification if display channel is connected */
 diff --git a/src/protocols/rdp/settings.c b/src/protocols/rdp/settings.c
-index 72511a93..29122528 100644
+index 72511a93..f1e02b66 100644
 --- a/src/protocols/rdp/settings.c
 +++ b/src/protocols/rdp/settings.c
 @@ -101,6 +101,7 @@ const char* GUAC_RDP_CLIENT_ARGS[] = {
@@ -74,7 +121,7 @@ index 72511a93..29122528 100644
 + * @return
 + *     The nearest percentage that will actually take effect.
 + */
-+static int guac_rdp_normalize_desktop_scale(int desktop_scale) {
++int guac_rdp_normalize_desktop_scale(int desktop_scale) {
 +
 +    if (desktop_scale >= 160)
 +        return 180;
@@ -142,10 +189,10 @@ index 72511a93..29122528 100644
      rdp_settings->DesktopHeight = guac_settings->height;
      rdp_settings->AlternateShell = guac_strdup(guac_settings->initial_program);
 diff --git a/src/protocols/rdp/settings.h b/src/protocols/rdp/settings.h
-index a821b5f6..8480a5c8 100644
+index a821b5f6..4c6a6349 100644
 --- a/src/protocols/rdp/settings.h
 +++ b/src/protocols/rdp/settings.h
-@@ -179,6 +179,18 @@ typedef enum guac_rdp_resize_method {
+@@ -179,6 +179,31 @@ typedef enum guac_rdp_resize_method {
  /**
   * All settings supported by the Guacamole RDP client.
   */
@@ -161,10 +208,23 @@ index a821b5f6..8480a5c8 100644
 + */
 +#define GUAC_RDP_MAX_DESKTOP_SCALE 500
 +
++/**
++ * Snaps a requested DPI scaling percentage to one the RDP protocol and FreeRDP
++ * can actually deliver: 100, 140 or 180. See the implementation for why no
++ * other value survives.
++ *
++ * @param desktop_scale
++ *     The requested scaling percentage.
++ *
++ * @return
++ *     The nearest percentage that will actually take effect.
++ */
++int guac_rdp_normalize_desktop_scale(int desktop_scale);
++
  typedef struct guac_rdp_settings {
  
      /**
-@@ -660,6 +672,18 @@ typedef struct guac_rdp_settings {
+@@ -660,6 +685,18 @@ typedef struct guac_rdp_settings {
       */
      int enable_h264;
  
