@@ -280,7 +280,8 @@
         // The cost is real too -- at devicePixelRatio 2 the server encodes
         // four times the pixels.
         //
-        //   localStorage.rgNativeRes = 'on'    device pixels at full dpr
+        //   localStorage.rgNativeRes = 'on'    device pixels, snapped to a
+        //                                      factor RDP can be scaled by
         //   localStorage.rgNativeRes = '1.5'   force a specific factor
         //   localStorage.rgNativeRes = 'off'   CSS pixels (the default)
         //
@@ -305,6 +306,14 @@
 
             if (!(dpr > 1) || !cssW || !cssH)
                 return 1;
+
+            // Snap to a factor the RDP session can actually be scaled by.
+            // Only 140% and 180% survive the trip (see the desktop-scale
+            // parameter in patches/011), so asking for a 2x framebuffer while
+            // the desktop can only be scaled to 1.8x would leave everything
+            // 10% too small. Matching the two keeps physical sizes correct and
+            // still buys most of the sharpness.
+            dpr = dpr >= 1.6 ? 1.8 : 1.4;
 
             // Keep the framebuffer within what guacd, the encoder and the
             // browser's decoder handle sanely. Exceeding either bound scales
@@ -1825,8 +1834,7 @@
                 };
 
                 if (initialScale > 1)
-                    body.desktop_scale = Math.max(100, Math.min(500,
-                            Math.round(initialScale * 100)));
+                    body.desktop_scale = Math.round(initialScale * 100);
 
                 var url = '/api/addressbook/folders/' + encodeURIComponent(scope)
                     + '/' + encodeURIComponent(folder)
