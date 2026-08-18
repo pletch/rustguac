@@ -2535,6 +2535,10 @@ pub struct ConnectRequest {
     pub height: Option<u32>,
     #[serde(default)]
     pub dpi: Option<u32>,
+    /// DPI scaling percentage to request from an RDP server, paired with a
+    /// framebuffer sized in physical pixels.
+    #[serde(default)]
+    pub desktop_scale: Option<u32>,
     #[serde(default)]
     pub banner: Option<String>,
     /// Override or supply credentials at connect time (never stored).
@@ -2724,6 +2728,7 @@ pub async fn ab_connect_entry(
         width: req.width,
         height: req.height,
         dpi: req.dpi,
+        desktop_scale: req.desktop_scale,
         banner: req.banner.or(ab_entry.banner),
         enable_drive: ab_entry.enable_drive,
         remote_app: ab_entry.remote_app,
@@ -4295,6 +4300,7 @@ pub struct QuickConnectQuery {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub dpi: Option<u32>,
+    pub desktop_scale: Option<u32>,
     // Address book mode
     pub scope: Option<String>,
     pub folder: Option<String>,
@@ -4483,6 +4489,7 @@ pub async fn quick_connect(
             width: query.width,
             height: query.height,
             dpi: query.dpi,
+            desktop_scale: query.desktop_scale,
             banner: ab_entry.banner,
             enable_drive: ab_entry.enable_drive,
             remote_app: ab_entry.remote_app,
@@ -4607,6 +4614,7 @@ pub async fn quick_connect(
         width: query.width,
         height: query.height,
         dpi: query.dpi,
+        desktop_scale: query.desktop_scale,
         banner: None,
         enable_drive: None,
         remote_app: None,
