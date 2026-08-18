@@ -251,6 +251,75 @@
             throw new Error('No session ID');
         }
 
+        // ---- Native (device-pixel) framebuffer sizing -------------------
+        //
+        // Remote framebuffers are requested in DEVICE pixels, not CSS pixels.
+        // Asking for window.innerWidth on a HiDPI display yields a framebuffer
+        // with a fraction of the pixels the screen can actually show, which the
+        // browser then stretches to fit -- every remote pixel smeared across a
+        // 2x2 block at devicePixelRatio 2. That is most of why text looks
+        // softer here than in a native RDP client, and no amount of codec work
+        // touches it. Requesting the device resolution and letting
+        // scaleDisplay() shrink it back by the same factor renders 1:1.
+        //
+        // scaleDisplay() needs no change to cooperate: it already fits the
+        // framebuffer into the available CSS area, so a framebuffer that is
+        // devicePixelRatio times larger simply yields a scale of 1/dpr.
+        //
+        // The cost is real -- at devicePixelRatio 2 the server encodes four
+        // times the pixels -- so it is capped, and can be turned off per
+        // browser for an A/B:
+        //
+        //   localStorage.rgNativeRes = 'off'   CSS pixels, as before
+        //   localStorage.rgNativeRes = '1.5'   force a specific factor
+        //   localStorage.removeItem('rgNativeRes')
+        //
+        var MAX_NATIVE_DIMENSION = 4096;
+        var MAX_NATIVE_PIXELS = 3840 * 2160;
+
+        function nativeScale(cssW, cssH) {
+
+            var dpr = window.devicePixelRatio || 1;
+
+            try {
+                var pref = localStorage.getItem('rgNativeRes');
+                if (pref === 'off')
+                    return 1;
+                if (pref) {
+                    var forced = parseFloat(pref);
+                    if (forced > 0) dpr = forced;
+                }
+            } catch (e) { /* storage blocked */ }
+
+            if (!(dpr > 1) || !cssW || !cssH)
+                return 1;
+
+            // Keep the framebuffer within what guacd, the encoder and the
+            // browser's decoder handle sanely. Exceeding either bound scales
+            // the factor down rather than refusing it outright.
+            dpr = Math.min(dpr,
+                    MAX_NATIVE_DIMENSION / cssW,
+                    MAX_NATIVE_DIMENSION / cssH,
+                    Math.sqrt(MAX_NATIVE_PIXELS / (cssW * cssH)));
+
+            return dpr > 1 ? dpr : 1;
+
+        }
+
+        // Converts a CSS-pixel size into the device-pixel size to ask the
+        // server for. Width is rounded down to a multiple of 8 (SPICE requires
+        // it, RDP prefers it) and both are kept positive, since a zero size
+        // reads as a monitor-close.
+        function deviceSize(cssW, cssH) {
+            var factor = nativeScale(cssW, cssH);
+            var w = Math.round(cssW * factor) & ~0x7;
+            var h = Math.round(cssH * factor);
+            return {
+                width:  w > 0 ? w : Math.max(8, cssW & ~0x7),
+                height: h > 0 ? h : Math.max(8, cssH)
+            };
+        }
+
         var statusEl = document.getElementById('status');
         var urlParams = new URLSearchParams(window.location.search);
         var shareToken = urlParams.get('token');
@@ -870,8 +939,10 @@
                 // (SPICE wants width as a multiple of 8). Contiguous index. Guard
                 // against a not-yet-laid-out popup reporting 0 (a positive size is
                 // required or the server reads it as a monitor-close).
-                var reqW = ((win.innerWidth || 1280) & ~0x7) || 1280;
-                var reqH = win.innerHeight || 800;
+                var popSize = deviceSize(win.innerWidth || 1280,
+                        win.innerHeight || 800);
+                var reqW = popSize.width;
+                var reqH = popSize.height;
                 if (reqW < 8) reqW = 1280;
                 if (reqH < 8) reqH = 800;
                 client.sendSize(reqW, reqH, index, 0);
@@ -915,9 +986,10 @@
                 win.addEventListener('resize', function() {
                     if (popResizeTimer) win.clearTimeout(popResizeTimer);
                     popResizeTimer = win.setTimeout(function() {
-                        var w = (win.innerWidth || 0) & ~0x7;
-                        var h = win.innerHeight || 0;
-                        if (w >= 8 && h >= 8) client.sendSize(w, h, index, 0);
+                        var rs = deviceSize(win.innerWidth || 0,
+                                win.innerHeight || 0);
+                        if (rs.width >= 8 && rs.height >= 8)
+                            client.sendSize(rs.width, rs.height, index, 0);
                     }, 300);
                 });
 
@@ -1579,9 +1651,10 @@
                             var fitToWindow = function() {
                                 scaleDisplay();
                                 var anyPanelOpen = panelOpen || filePanelOpen;
-                                var sw = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
-                                var sh = window.innerHeight;
-                                if (sw > 0 && sh > 0) client.sendSize(sw, sh);
+                                var cssW = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
+                                var fit = deviceSize(cssW, window.innerHeight);
+                                if (fit.width > 0 && fit.height > 0)
+                                    client.sendSize(fit.width, fit.height);
                             };
                             setTimeout(fitToWindow, 800);
                             setTimeout(fitToWindow, 2000);
@@ -1716,9 +1789,14 @@
                 var headers = { 'Content-Type': 'application/json' };
                 if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
 
+                // Device pixels, matching the size the resize path will ask
+                // for once connected; the dpi hint makes Windows scale its UI
+                // to suit, so text stays the same physical size but is drawn
+                // with the full pixel count.
+                var initial = deviceSize(window.innerWidth, window.innerHeight);
                 var body = {
-                    width: window.innerWidth,
-                    height: window.innerHeight,
+                    width: initial.width,
+                    height: initial.height,
                     dpi: Math.round((window.devicePixelRatio || 1) * 96)
                 };
 
@@ -1874,6 +1952,11 @@
                 }
                 else {
                     // Single display: scale the whole framebuffer to fit.
+                    // With the framebuffer requested in device pixels this
+                    // lands on 1/devicePixelRatio, i.e. one framebuffer pixel
+                    // per physical pixel -- no resampling. It stays correct
+                    // when a panel opens or the window is resized ahead of the
+                    // debounced sendSize, just at a softer intermediate scale.
                     display.scale(Math.min(availW / dw, availH / dh));
                     displayEl.style.overflow = '';
                     displayEl.style.position = '';
@@ -1896,9 +1979,9 @@
                 clearTimeout(resizeTimer);
                 resizeTimer = setTimeout(function() {
                     var anyPanelOpen = panelOpen || filePanelOpen;
-                    var sw = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
-                    var sh = window.innerHeight;
-                    client.sendSize(sw, sh);
+                    var cssW = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
+                    var rz = deviceSize(cssW, window.innerHeight);
+                    client.sendSize(rz.width, rz.height);
                 }, 250);
             });
 
