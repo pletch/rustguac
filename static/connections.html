@@ -792,6 +792,10 @@
                         <input type="checkbox" id="em-enable-h264" style="display:inline;width:auto;margin-right:0.4em"> H.264 Passthrough
                         <div style="color:#888;font-size:0.75em;margin-top:0.2em;">Passes H.264 video direct to browser (low latency, hardware decoded). Requires GFX enabled and xrdp with x264 on the target server.</div>
                     </label>
+                    <label style="margin-top:0.3em">
+                        <input type="checkbox" id="em-native-resolution" style="display:inline;width:auto;margin-right:0.4em"> Native Resolution (HiDPI)
+                        <div style="color:#888;font-size:0.75em;margin-top:0.2em;">Sends the display at the screen's physical pixels instead of its logical ones, so text stays sharp on a HiDPI laptop. Windows is asked to scale its desktop to match. Nothing does that automatically on Linux/xrdp targets, so enable it there only if the session sets its own DPI &mdash; otherwise icons and text simply come out smaller. Roughly 3&times; the pixels to encode.</div>
+                    </label>
                     <div class="field-hint" style="margin-top:0.8em;margin-bottom:0.5em">Desktop appearance. Off by default to save bandwidth; enable for a normal-looking Windows desktop.</div>
                     <label style="margin-top:0.3em">
                         <input type="checkbox" id="em-enable-wallpaper" style="display:inline;width:auto;margin-right:0.4em"> Show Wallpaper
@@ -997,86 +1001,24 @@
         var _themeDescriptions={dark:'Navy & cyan \u2014 the default',light:'Clean white & blue','high-contrast':'Maximum readability',terminal:'Retro green-on-black',nord:'Arctic, muted blues',corporate:'Slate & steel blue',aurora:'Midnight blue with ambient glow',jaguar:'Racing green & gold'};
         function initTheme(t){if(!t)return;_themePresets=t.presets||{};_adminPreset=t.admin_preset||'aurora';var u=localStorage.getItem('rustguac_theme'),active=u&&_themePresets[u]?u:_adminPreset,colors=(active===_adminPreset)?t.admin_colors:_themePresets[active];if(colors)applyThemeColors(colors);if(t.logo_url){var l=document.getElementById('site-logo');if(l){if(l.src!==t.logo_url&&!l.src.endsWith(t.logo_url))l.src=t.logo_url;l.style.display=''}}var menu=document.getElementById('um-theme-list');if(menu){menu.innerHTML='';Object.keys(_themePresets).forEach(function(name){var item=document.createElement('div');item.className='um-item'+(name===active?' active':'');var sw=document.createElement('span');sw.className='um-swatch';var p=_themePresets[name];sw.style.background='linear-gradient(135deg,'+p.primary+' 50%,'+p.accent+' 50%)';item.appendChild(sw);var info=document.createElement('div');info.className='um-theme-info';var nm=document.createElement('span');nm.className='um-theme-name';nm.textContent=name;info.appendChild(nm);var desc=document.createElement('span');desc.className='um-theme-desc';desc.textContent=_themeDescriptions[name]||'';info.appendChild(desc);item.appendChild(info);item.addEventListener('click',function(){localStorage.setItem('rustguac_theme',name);applyThemeColors(_themePresets[name]);menu.querySelectorAll('.um-item').forEach(function(el){el.classList.remove('active')});item.classList.add('active');document.getElementById('user-menu').style.display='none'});menu.appendChild(item)})}}
         var _ub=document.getElementById('user-menu-btn');if(_ub)_ub.addEventListener('click',function(e){e.stopPropagation();var m=document.getElementById('user-menu');m.style.display=m.style.display==='block'?'none':'block'});document.addEventListener('click',function(){var m=document.getElementById('user-menu');if(m)m.style.display='none'});
-        // ---- Native (device-pixel) framebuffer sizing -------------------
+        // Returns the display fields to send when creating a session, given the
+        // browser's CSS-pixel viewport.
         //
-        // Sessions are created here, not in client.html, so this is where the
-        // framebuffer size is actually decided; client.html only attaches to
-        // the session afterwards. Keep this in step with the identical helpers
-        // there.
-        //
-        // Requesting CSS pixels on a HiDPI display yields a framebuffer with a
-        // fraction of the pixels the screen can show, which the browser then
-        // stretches -- the reason text renders softer than in a native client.
-        //
-        // OFF BY DEFAULT: extra pixels alone make the remote desktop smaller,
-        // not sharper, unless the session is also told to scale its UI.
-        // desktop_scale does that for RDP; an X11 desktop behind xrdp has no
-        // per-connection DPI negotiation and must be scaled inside the session.
-        //
-        //   localStorage.rgNativeRes = 'on'    device pixels, snapped to a
-        //                                      factor RDP can be scaled by
-        //   localStorage.rgNativeRes = '1.5'   force a specific factor
-        //   localStorage.rgNativeRes = 'off'   CSS pixels (the default)
-        //
-        var MAX_NATIVE_DIMENSION = 4096;
-        var MAX_NATIVE_PIXELS = 3840 * 2160;
-
-        function nativeScale(cssW, cssH) {
-
-            var dpr = 1;
-
-            try {
-                var pref = localStorage.getItem('rgNativeRes');
-                if (!pref || pref === 'off')
-                    return 1;
-                if (pref === 'on')
-                    dpr = window.devicePixelRatio || 1;
-                else {
-                    var forced = parseFloat(pref);
-                    if (forced > 0) dpr = forced;
-                }
-            } catch (e) { /* storage blocked */ }
-
-            if (!(dpr > 1) || !cssW || !cssH)
-                return 1;
-
-            // Only 140% and 180% survive to the RDP server (see the
-            // desktop-scale parameter in patches/011), so asking for a 2x
-            // framebuffer while the desktop can only scale to 1.8x would leave
-            // everything 10% too small. Match the two.
-            dpr = dpr >= 1.6 ? 1.8 : 1.4;
-
-            dpr = Math.min(dpr,
-                    MAX_NATIVE_DIMENSION / cssW,
-                    MAX_NATIVE_DIMENSION / cssH,
-                    Math.sqrt(MAX_NATIVE_PIXELS / (cssW * cssH)));
-
-            return dpr > 1 ? dpr : 1;
-
-        }
-
-        // Returns the width/height/desktop_scale to send when creating a
-        // session, given the browser's CSS-pixel viewport.
+        // The dimensions stay in CSS pixels, with device_pixel_ratio reported
+        // alongside them. Whether the framebuffer is actually sized in physical
+        // pixels is the connection entry's "Native Resolution" setting to
+        // decide, and the server applies it. The page cannot decide, because it
+        // does not know whether the target scales its own UI to match: an RDP
+        // host is asked to via desktopScaleFactor, while an X11 desktop behind
+        // xrdp has no per-connection equivalent, so there the extra pixels would
+        // only shrink everything.
         function sessionDisplayBody(cssW, cssH) {
-
-            var factor = nativeScale(cssW, cssH);
-            var w = Math.round(cssW * factor) & ~0x7;
-            var h = Math.round(cssH * factor);
-
-            var body = {
-                width:  w > 0 ? w : Math.max(8, cssW & ~0x7),
-                height: h > 0 ? h : Math.max(8, cssH),
-                dpi: Math.round((window.devicePixelRatio || 1) * 96)
+            return {
+                width: cssW,
+                height: cssH,
+                dpi: Math.round((window.devicePixelRatio || 1) * 96),
+                device_pixel_ratio: window.devicePixelRatio || 1
             };
-
-            // Ask an RDP server to render its UI at the matching DPI, so the
-            // extra pixels sharpen the desktop rather than shrinking it. Only
-            // meaningful when extra pixels were actually requested.
-            if (factor > 1)
-                body.desktop_scale = Math.round(factor * 100);
-
-            return body;
-
         }
 
         var _driveConfigured = false;
@@ -2439,8 +2381,8 @@
                 body.width = display.width;
                 body.height = display.height;
                 if (!body.dpi) body.dpi = display.dpi;
-                if (display.desktop_scale && !body.desktop_scale)
-                    body.desktop_scale = display.desktop_scale;
+                if (!body.device_pixel_ratio)
+                    body.device_pixel_ratio = display.device_pixel_ratio;
             }
             fetch('/api/addressbook/folders/' + encodeURIComponent(scope) + '/' + encodeURIComponent(folder) + '/entries/' + encodeURIComponent(name) + '/connect', {
                 method: 'POST',
@@ -3386,6 +3328,7 @@
             document.getElementById('em-enable-desktop-comp').checked = false;
             document.getElementById('em-force-lossless').checked = false;
             document.getElementById('em-enable-h264').checked = false;
+            document.getElementById('em-native-resolution').checked = false;
             document.getElementById('em-enable-wallpaper').checked = false;
             document.getElementById('em-enable-theming').checked = false;
             document.getElementById('em-enable-full-window-drag').checked = false;
@@ -3612,10 +3555,11 @@
                     document.getElementById('em-enable-desktop-comp').checked = !!entryData.enable_desktop_composition;
                     document.getElementById('em-force-lossless').checked = !!entryData.force_lossless;
                     document.getElementById('em-enable-h264').checked = !!entryData.enable_h264;
+                    document.getElementById('em-native-resolution').checked = !!entryData.native_resolution;
                     document.getElementById('em-enable-wallpaper').checked = !!entryData.enable_wallpaper;
                     document.getElementById('em-enable-theming').checked = !!entryData.enable_theming;
                     document.getElementById('em-enable-full-window-drag').checked = !!entryData.enable_full_window_drag;
-                    if (entryData.enable_gfx || entryData.enable_desktop_composition || entryData.force_lossless || entryData.enable_h264 || entryData.enable_wallpaper || entryData.enable_theming || entryData.enable_full_window_drag) {
+                    if (entryData.enable_gfx || entryData.enable_desktop_composition || entryData.force_lossless || entryData.enable_h264 || entryData.native_resolution || entryData.enable_wallpaper || entryData.enable_theming || entryData.enable_full_window_drag) {
                         document.getElementById('em-video-perf-fields').style.display = '';
                         document.getElementById('em-video-perf-arrow').innerHTML = '&#9660;';
                     }
@@ -3840,6 +3784,7 @@
                 if (document.getElementById('em-enable-desktop-comp').checked) entry.enable_desktop_composition = true;
                 if (document.getElementById('em-force-lossless').checked) entry.force_lossless = true;
                 if (document.getElementById('em-enable-h264').checked) entry.enable_h264 = true;
+                if (document.getElementById('em-native-resolution').checked) entry.native_resolution = true;
                 if (document.getElementById('em-enable-wallpaper').checked) entry.enable_wallpaper = true;
                 if (document.getElementById('em-enable-theming').checked) entry.enable_theming = true;
                 if (document.getElementById('em-enable-full-window-drag').checked) entry.enable_full_window_drag = true;

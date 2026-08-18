@@ -253,88 +253,27 @@
 
         // ---- Native (device-pixel) framebuffer sizing -------------------
         //
-        // Remote framebuffers are requested in DEVICE pixels, not CSS pixels.
-        // Asking for window.innerWidth on a HiDPI display yields a framebuffer
-        // with a fraction of the pixels the screen can actually show, which the
-        // browser then stretches to fit -- every remote pixel smeared across a
-        // 2x2 block at devicePixelRatio 2. That is most of why text looks
-        // softer here than in a native RDP client, and no amount of codec work
-        // touches it. Requesting the device resolution and letting
-        // scaleDisplay() shrink it back by the same factor renders 1:1.
+        // Set from the session's display_scale, which the server computed when
+        // the session was created: it, not this page, knows whether the
+        // connection entry asked for a physical-pixel framebuffer. The value
+        // matters here only so that resize requests stay in the same units the
+        // session was created in -- sending CSS pixels to a session negotiated
+        // in physical ones would shrink it back on the first resize.
         //
-        // scaleDisplay() needs no change to cooperate: it already fits the
-        // framebuffer into the available CSS area, so a framebuffer that is
-        // devicePixelRatio times larger simply yields a scale of 1/dpr.
-        //
-        // OFF BY DEFAULT, because on its own it makes the remote desktop
-        // physically smaller: guacd never negotiates DPI scaling with the RDP
-        // server (channels/disp.c pins DesktopScaleFactor and
-        // DeviceScaleFactor to 0, and the `dpi` parameter only rescales the
-        // requested width/height, which is skipped entirely when an explicit
-        // width and height are sent -- as rustguac always does). The session
-        // therefore renders at 100% scaling however many pixels it is given,
-        // so more pixels means smaller icons and text rather than sharper
-        // ones. Enabling this is only worthwhile alongside a server that has
-        // been told to scale its UI to match.
-        //
-        // The cost is real too -- at devicePixelRatio 2 the server encodes
-        // four times the pixels.
-        //
-        //   localStorage.rgNativeRes = 'on'    device pixels, snapped to a
-        //                                      factor RDP can be scaled by
-        //   localStorage.rgNativeRes = '1.5'   force a specific factor
-        //   localStorage.rgNativeRes = 'off'   CSS pixels (the default)
-        //
-        var MAX_NATIVE_DIMENSION = 4096;
-        var MAX_NATIVE_PIXELS = 3840 * 2160;
+        // scaleDisplay() needs no knowledge of it: it fits whatever framebuffer
+        // arrives into the available CSS area, which lands on 1/displayScale on
+        // its own -- one framebuffer pixel per physical pixel, no resampling.
+        // Mouse input follows too, since sendMouseState(state, true) divides by
+        // that same scale.
+        var displayScale = 1;
 
-        function nativeScale(cssW, cssH) {
-
-            var dpr = 1;
-
-            try {
-                var pref = localStorage.getItem('rgNativeRes');
-                if (!pref || pref === 'off')
-                    return 1;
-                if (pref === 'on')
-                    dpr = window.devicePixelRatio || 1;
-                else {
-                    var forced = parseFloat(pref);
-                    if (forced > 0) dpr = forced;
-                }
-            } catch (e) { /* storage blocked */ }
-
-            if (!(dpr > 1) || !cssW || !cssH)
-                return 1;
-
-            // Snap to a factor the RDP session can actually be scaled by.
-            // Only 140% and 180% survive the trip (see the desktop-scale
-            // parameter in patches/011), so asking for a 2x framebuffer while
-            // the desktop can only be scaled to 1.8x would leave everything
-            // 10% too small. Matching the two keeps physical sizes correct and
-            // still buys most of the sharpness.
-            dpr = dpr >= 1.6 ? 1.8 : 1.4;
-
-            // Keep the framebuffer within what guacd, the encoder and the
-            // browser's decoder handle sanely. Exceeding either bound scales
-            // the factor down rather than refusing it outright.
-            dpr = Math.min(dpr,
-                    MAX_NATIVE_DIMENSION / cssW,
-                    MAX_NATIVE_DIMENSION / cssH,
-                    Math.sqrt(MAX_NATIVE_PIXELS / (cssW * cssH)));
-
-            return dpr > 1 ? dpr : 1;
-
-        }
-
-        // Converts a CSS-pixel size into the device-pixel size to ask the
-        // server for. Width is rounded down to a multiple of 8 (SPICE requires
-        // it, RDP prefers it) and both are kept positive, since a zero size
-        // reads as a monitor-close.
+        // Converts a CSS-pixel size into the size to ask the server for. Width
+        // is rounded down to a multiple of 8 (SPICE requires it, RDP prefers
+        // it) and both are kept positive, since a zero size reads as a
+        // monitor-close.
         function deviceSize(cssW, cssH) {
-            var factor = nativeScale(cssW, cssH);
-            var w = Math.round(cssW * factor) & ~0x7;
-            var h = Math.round(cssH * factor);
+            var w = Math.round(cssW * displayScale) & ~0x7;
+            var h = Math.round(cssH * displayScale);
             return {
                 width:  w > 0 ? w : Math.max(8, cssW & ~0x7),
                 height: h > 0 ? h : Math.max(8, cssH)
@@ -435,6 +374,7 @@
                     };
                 }
                 if (session && session.entry_display_name) entryDisplayName = session.entry_display_name;
+                if (session && session.display_scale > 1) displayScale = session.display_scale;
                 if (session && session.fullscreen_on_connect) wantFullscreen = true;
                 if (session && session.autohide_side_tabs) wantAutohideTabs = true;
                 return showBanner(session.banner);
@@ -1810,31 +1750,16 @@
                 var headers = { 'Content-Type': 'application/json' };
                 if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
 
-                // Device pixels, matching the size the resize path will ask
-                // for once connected.
-                //
-                // desktop_scale asks the RDP server to render its UI at the
-                // matching DPI percentage, so the extra pixels sharpen the
-                // desktop rather than shrinking it. It travels in the RDP
-                // client core data at connection time and cannot be changed
-                // afterwards, which is why it rides the connect request rather
-                // than the later size negotiation. Sent only when a
-                // device-pixel framebuffer was actually requested; at scale 1
-                // there is nothing to compensate for.
-                //
-                // Non-RDP protocols ignore it. An X11 desktop behind xrdp has
-                // no per-connection DPI negotiation at all, so scaling there
-                // has to be arranged inside the session itself.
-                var initial = deviceSize(window.innerWidth, window.innerHeight);
-                var initialScale = nativeScale(window.innerWidth, window.innerHeight);
+                // CSS pixels plus the browser's pixel ratio: whether the
+                // framebuffer is sized in physical pixels is the connection
+                // entry's "Native Resolution" setting to decide, and the server
+                // applies it.
                 var body = {
-                    width: initial.width,
-                    height: initial.height,
-                    dpi: Math.round((window.devicePixelRatio || 1) * 96)
+                    width: window.innerWidth,
+                    height: window.innerHeight,
+                    dpi: Math.round((window.devicePixelRatio || 1) * 96),
+                    device_pixel_ratio: window.devicePixelRatio || 1
                 };
-
-                if (initialScale > 1)
-                    body.desktop_scale = Math.round(initialScale * 100);
 
                 var url = '/api/addressbook/folders/' + encodeURIComponent(scope)
                     + '/' + encodeURIComponent(folder)
