@@ -367,6 +367,35 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
+     * Whether the encoder's chroma filter is undone as part of combining, and
+     * with what threshold. The auxiliary view carries three of every four
+     * chroma samples; the fourth is left as the mean of its 2x2 block by the
+     * encoder and has to be solved for.
+     *
+     * Kept separate from chroma444Enabled() because it is the newer and less
+     * certain half: it multiplies the main view's chroma by four, so if a host
+     * turns out not to average that sample the error is amplified rather than
+     * corrected. Overridable at runtime as window.__h264ChromaFilter = false,
+     * which leaves plain 4:4:4 combining in place, so one build can compare
+     * 4:2:0, combined, and combined-plus-filtered without a reload. Setting it
+     * to a number overrides the threshold instead of switching the filter off;
+     * that constant is inherited from FreeRDP rather than specified anywhere,
+     * and is the part of this least backed by evidence.
+     *
+     * @private
+     * @returns {!(number|boolean)}
+     */
+    function chromaFilter() {
+        if (typeof window !== 'undefined'
+                && window.__h264ChromaFilter !== undefined) {
+            if (typeof window.__h264ChromaFilter === 'number')
+                return window.__h264ChromaFilter;
+            return window.__h264ChromaFilter ? 30 : false;
+        }
+        return 30;
+    }
+
+    /**
      * Reads the three planes out of a decoded frame and hands them to the
      * renderer, then renders and snapshots the result.
      *
@@ -432,7 +461,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * auxiliary view then re-renders the same picture with its chroma
              * applied. Two paints per picture is the reference behaviour, not
              * an accident. */
-            var rendered = renderer.render(view === 0 ? 0 : view);
+            var rendered = renderer.render(view === 0 ? 0 : view,
+                    chromaFilter());
             if (!rendered)
                 return;
 
