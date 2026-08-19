@@ -1,0 +1,510 @@
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index 19b59469..11e3c2ea 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -314,6 +314,10 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+          * view is flagged as paired: the client is about to receive an
+          * auxiliary view refining it to 4:4:4, and combining clients skip
+          * painting a picture that is superseded a moment later. */
++        /* Diagnostics: guacd's own framebuffer holds nothing for these
++         * regions, and several other RDPGFX operations read from it. */
++        rdp_client->h264_passthrough_frames += saved_count;
++
+         for (int i = 0; i < saved_count; i++)
+             guac_display_layer_set_h264(default_layer,
+                     saved_h264[i], saved_length[i], saved_keyframe[i],
+@@ -800,6 +804,345 @@ static UINT guac_rdp_gfx_end_frame(RdpgfxClientContext* context,
+ 
+ }
+ 
++/**
++ * How often the counts of the frequent surface operations are logged, in
++ * milliseconds. Individual lines would be unusable -- a busy desktop performs
++ * hundreds of cache and copy operations a second -- but a fault that shows up
++ * once in a working day has to be caught by whatever logging was already
++ * running when it happened, so the summary must be cheap enough to leave on.
++ */
++#define GUAC_RDP_GFX_OP_SUMMARY_INTERVAL 10000
++
++/**
++ * Individual surface operations logged per summary interval, across all
++ * operation types. A desktop under load performs hundreds a second, so the
++ * detail has to be capped; a burst is nonetheless what a black region looks
++ * like from here, and the summary counts what the cap discarded.
++ */
++#define GUAC_RDP_GFX_OP_LINES_PER_INTERVAL 10
++
++/**
++ * Returns non-zero if another individual operation line may be logged in the
++ * current summary interval, consuming that allowance.
++ *
++ * @param rdp_client
++ *     The client whose allowance should be consumed.
++ *
++ * @return
++ *     Non-zero if the caller should log, zero if the budget is spent.
++ */
++static int guac_rdp_gfx_op_line_budget(guac_rdp_client* rdp_client) {
++
++    if (rdp_client->gfx_op_lines >= GUAC_RDP_GFX_OP_LINES_PER_INTERVAL)
++        return 0;
++
++    rdp_client->gfx_op_lines++;
++    return 1;
++
++}
++
++/**
++ * Logs the counts of the wrapped surface operations, if any have occurred and
++ * the summary interval has elapsed since the last time they were logged.
++ *
++ * The passthrough frame count is included on every line because it is what
++ * makes the rest meaningful: a copy or cache operation is unremarkable in a
++ * session guacd is decoding, and is a potential source of black pixels in one
++ * it is not.
++ *
++ * @param client
++ *     The client whose counts should be logged.
++ *
++ * @param force
++ *     Non-zero to log regardless of how long it has been, as when an operation
++ *     occurs for the first time.
++ */
++static void guac_rdp_gfx_op_summary(guac_client* client, int force) {
++
++    guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
++
++    guac_timestamp now = guac_timestamp_current();
++
++    if (!force && rdp_client->gfx_op_summary_time != 0
++            && now - rdp_client->gfx_op_summary_time
++                < GUAC_RDP_GFX_OP_SUMMARY_INTERVAL)
++        return;
++
++    rdp_client->gfx_op_summary_time = now;
++    rdp_client->gfx_op_lines = 0;
++
++    guac_client_log(client, GUAC_LOG_INFO,
++            "RDPGFX surface ops: solidfill=%i surface-to-surface=%i "
++            "surface-to-cache=%i cache-to-surface=%i (H.264 frames passed "
++            "through undecoded: %i)",
++            rdp_client->gfx_solid_fill_count,
++            rdp_client->gfx_surface_to_surface_count,
++            rdp_client->gfx_surface_to_cache_count,
++            rdp_client->gfx_cache_to_surface_count,
++            rdp_client->h264_passthrough_frames);
++
++}
++
++/**
++ * Returns the guac_client associated with the given RDPGFX context.
++ *
++ * @param context
++ *     The RDPGFX context to resolve.
++ *
++ * @return
++ *     The guac_client behind the context.
++ */
++static guac_client* guac_rdp_gfx_client(RdpgfxClientContext* context) {
++    rdpGdi* gdi = (rdpGdi*) context->custom;
++    return ((rdp_freerdp_context*) gdi->context)->client;
++}
++
++/**
++ * Wrapper for the RDPGFX SolidFill callback, which logs the fill and then
++ * defers to FreeRDP's own handler.
++ *
++ * A solid fill writes into the surface guacd encodes from, so it is one of the
++ * ways a region the browser is painting from its own H.264 decoder can be
++ * overwritten by guacd. The colour is logged because a fill with zero
++ * components is indistinguishable, on screen, from a region that was never
++ * painted at all.
++ */
++static UINT guac_rdp_gfx_solid_fill(RdpgfxClientContext* context,
++        const RDPGFX_SOLID_FILL_PDU* pdu) {
++
++    guac_client* client = guac_rdp_gfx_client(context);
++    guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
++
++    int first = (rdp_client->gfx_solid_fill_count == 0);
++    rdp_client->gfx_solid_fill_count++;
++
++    if (pdu != NULL && (first || (rdp_client->h264_passthrough_frames > 0
++                    && guac_rdp_gfx_op_line_budget(rdp_client))))
++        guac_client_log(client, GUAC_LOG_INFO,
++                "RDPGFX SolidFill: surface=%u, colour=%02X%02X%02X%02X, "
++                "%u rect(s)%s", pdu->surfaceId,
++                pdu->fillPixel.B, pdu->fillPixel.G, pdu->fillPixel.R,
++                pdu->fillPixel.XA, pdu->fillRectCount,
++                first ? " (first of the session)" : "");
++
++    guac_rdp_gfx_op_summary(client, first);
++
++    pcRdpgfxSolidFill orig = (pcRdpgfxSolidFill) rdp_client->orig_solid_fill;
++    if (orig != NULL)
++        return orig(context, pdu);
++
++    return CHANNEL_RC_OK;
++
++}
++
++/**
++ * Wrapper for the RDPGFX SurfaceToSurface callback, which logs the copy and
++ * then defers to FreeRDP's own handler.
++ *
++ * The copy is performed by FreeRDP between its own surfaces. Under H.264
++ * passthrough the source region may never have been decoded, in which case
++ * what is copied is not the picture the browser is showing but the blank
++ * buffer behind it.
++ */
++static UINT guac_rdp_gfx_surface_to_surface(RdpgfxClientContext* context,
++        const RDPGFX_SURFACE_TO_SURFACE_PDU* pdu) {
++
++    guac_client* client = guac_rdp_gfx_client(context);
++    guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
++
++    int first = (rdp_client->gfx_surface_to_surface_count == 0);
++    rdp_client->gfx_surface_to_surface_count++;
++
++    if (pdu != NULL && (first || (rdp_client->h264_passthrough_frames > 0
++                    && guac_rdp_gfx_op_line_budget(rdp_client))))
++        guac_client_log(client, GUAC_LOG_INFO,
++                "RDPGFX SurfaceToSurface: %u -> %u, src %ux%u at %u,%u, "
++                "%u destination(s)%s",
++                pdu->surfaceIdSrc, pdu->surfaceIdDest,
++                pdu->rectSrc.right - pdu->rectSrc.left,
++                pdu->rectSrc.bottom - pdu->rectSrc.top,
++                pdu->rectSrc.left, pdu->rectSrc.top, pdu->destPtsCount,
++                first ? " (first of the session)" : "");
++
++    guac_rdp_gfx_op_summary(client, first);
++
++    pcRdpgfxSurfaceToSurface orig =
++            (pcRdpgfxSurfaceToSurface) rdp_client->orig_surface_to_surface;
++    if (orig != NULL)
++        return orig(context, pdu);
++
++    return CHANNEL_RC_OK;
++
++}
++
++/**
++ * Wrapper for the RDPGFX SurfaceToCache callback, which logs the cache store
++ * and then defers to FreeRDP's own handler.
++ *
++ * What is stored is read out of FreeRDP's surface, so under passthrough a
++ * cache slot filled from an H.264 region holds blank pixels. Nothing is wrong
++ * on screen at this point; the damage appears later, when the slot is restored.
++ */
++static UINT guac_rdp_gfx_surface_to_cache(RdpgfxClientContext* context,
++        const RDPGFX_SURFACE_TO_CACHE_PDU* pdu) {
++
++    guac_client* client = guac_rdp_gfx_client(context);
++    guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
++
++    int first = (rdp_client->gfx_surface_to_cache_count == 0);
++    rdp_client->gfx_surface_to_cache_count++;
++
++    if (pdu != NULL && first)
++        guac_client_log(client, GUAC_LOG_INFO,
++                "RDPGFX SurfaceToCache: surface=%u, slot=%u, %ux%u at %u,%u "
++                "(first of the session)", pdu->surfaceId, pdu->cacheSlot,
++                pdu->rectSrc.right - pdu->rectSrc.left,
++                pdu->rectSrc.bottom - pdu->rectSrc.top,
++                pdu->rectSrc.left, pdu->rectSrc.top);
++
++    guac_rdp_gfx_op_summary(client, first);
++
++    pcRdpgfxSurfaceToCache orig =
++            (pcRdpgfxSurfaceToCache) rdp_client->orig_surface_to_cache;
++    if (orig != NULL)
++        return orig(context, pdu);
++
++    return CHANNEL_RC_OK;
++
++}
++
++/**
++ * Wrapper for the RDPGFX CacheToSurface callback, which logs the restore and
++ * then defers to FreeRDP's own handler.
++ *
++ * This is the operation that makes a stale cache slot visible: it writes the
++ * slot's contents into the surface and invalidates the region, so guacd
++ * encodes and sends whatever the slot holds -- over the top of whatever the
++ * browser had drawn there from its own decoder. Destination coordinates are
++ * logged so a black region reported by a user can be matched against them.
++ */
++static UINT guac_rdp_gfx_cache_to_surface(RdpgfxClientContext* context,
++        const RDPGFX_CACHE_TO_SURFACE_PDU* pdu) {
++
++    guac_client* client = guac_rdp_gfx_client(context);
++    guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
++
++    int first = (rdp_client->gfx_cache_to_surface_count == 0);
++    rdp_client->gfx_cache_to_surface_count++;
++
++    if (pdu != NULL && (first || (rdp_client->h264_passthrough_frames > 0
++                    && guac_rdp_gfx_op_line_budget(rdp_client)))) {
++
++        /* One line per PDU, naming the first destination only: a PDU may carry
++         * many, and the count is enough to say whether the rest are worth
++         * chasing at trace level. */
++        int x = -1, y = -1;
++        if (pdu->destPtsCount > 0 && pdu->destPts != NULL) {
++            x = pdu->destPts[0].x;
++            y = pdu->destPts[0].y;
++        }
++
++        guac_client_log(client, GUAC_LOG_INFO,
++                "RDPGFX CacheToSurface: slot=%u -> surface=%u, %u "
++                "destination(s), first at %i,%i%s",
++                pdu->cacheSlot, pdu->surfaceId, pdu->destPtsCount, x, y,
++                first ? " (first of the session)" : "");
++
++    }
++
++    guac_rdp_gfx_op_summary(client, first);
++
++    pcRdpgfxCacheToSurface orig =
++            (pcRdpgfxCacheToSurface) rdp_client->orig_cache_to_surface;
++    if (orig != NULL)
++        return orig(context, pdu);
++
++    return CHANNEL_RC_OK;
++
++}
++
++/**
++ * Wrapper for the RDPGFX ResetGraphics callback, which logs the reset and then
++ * defers to FreeRDP's own handler.
++ *
++ * A reset re-establishes the whole graphics pipeline: surfaces are recreated
++ * blank and the desktop may change size. Windows performs one on a desktop
++ * switch -- the lock screen, or a UAC prompt -- which is precisely the sort of
++ * thing that happens to an unattended session. Always logged: it is rare, and
++ * it is the event most likely to precede a screen going black.
++ */
++static UINT guac_rdp_gfx_reset_graphics(RdpgfxClientContext* context,
++        const RDPGFX_RESET_GRAPHICS_PDU* pdu) {
++
++    guac_client* client = guac_rdp_gfx_client(context);
++    guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
++
++    if (pdu != NULL)
++        guac_client_log(client, GUAC_LOG_INFO,
++                "RDPGFX ResetGraphics: %ux%u, %u monitor(s) (H.264 frames "
++                "passed through undecoded: %i)", pdu->width, pdu->height,
++                pdu->monitorCount, rdp_client->h264_passthrough_frames);
++
++    guac_rdp_gfx_op_summary(client, 1);
++
++    pcRdpgfxResetGraphics orig =
++            (pcRdpgfxResetGraphics) rdp_client->orig_reset_graphics;
++    if (orig != NULL)
++        return orig(context, pdu);
++
++    return CHANNEL_RC_OK;
++
++}
++
++/**
++ * Wrapper for the RDPGFX CreateSurface callback, which logs the creation and
++ * then defers to FreeRDP's own handler. A new surface is blank until something
++ * paints it, and under passthrough nothing in guacd ever does.
++ */
++static UINT guac_rdp_gfx_create_surface(RdpgfxClientContext* context,
++        const RDPGFX_CREATE_SURFACE_PDU* pdu) {
++
++    guac_client* client = guac_rdp_gfx_client(context);
++    guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
++
++    if (pdu != NULL)
++        guac_client_log(client, GUAC_LOG_INFO,
++                "RDPGFX CreateSurface: surface=%u, %ux%u",
++                pdu->surfaceId, pdu->width, pdu->height);
++
++    pcRdpgfxCreateSurface orig =
++            (pcRdpgfxCreateSurface) rdp_client->orig_create_surface;
++    if (orig != NULL)
++        return orig(context, pdu);
++
++    return CHANNEL_RC_OK;
++
++}
++
++/**
++ * Wrapper for the RDPGFX DeleteSurface callback, which logs the deletion and
++ * then defers to FreeRDP's own handler. Paired with the creation log, this says
++ * whether the server tore down and rebuilt its surfaces mid-session.
++ */
++static UINT guac_rdp_gfx_delete_surface(RdpgfxClientContext* context,
++        const RDPGFX_DELETE_SURFACE_PDU* pdu) {
++
++    guac_client* client = guac_rdp_gfx_client(context);
++    guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
++
++    if (pdu != NULL)
++        guac_client_log(client, GUAC_LOG_INFO,
++                "RDPGFX DeleteSurface: surface=%u", pdu->surfaceId);
++
++    pcRdpgfxDeleteSurface orig =
++            (pcRdpgfxDeleteSurface) rdp_client->orig_delete_surface;
++    if (orig != NULL)
++        return orig(context, pdu);
++
++    return CHANNEL_RC_OK;
++
++}
++
+ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
+         ChannelConnectedEventArgs* args) {
+ 
+@@ -847,6 +1190,48 @@ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
+          * render via GDI and guacd simply re-encodes them.
+          *
+          * Testing what is actually installed, per callback, covers both. */
++        /* The surface operations below are wrapped for logging only, and
++         * unconditionally: whether the server uses them at all is the first
++         * thing worth knowing about a session that has gone black, and that
++         * question is not specific to H.264. Each is guarded by the same
++         * identity test as the handlers above, since gdi_graphics_pipeline_init()
++         * reinstalls FreeRDP's own on every channel reconnect and wrapping a
++         * wrapper would recurse until the stack is gone. */
++        if (rdpgfx->SolidFill != guac_rdp_gfx_solid_fill) {
++            rdp_client->orig_solid_fill = (void*) rdpgfx->SolidFill;
++            rdpgfx->SolidFill = guac_rdp_gfx_solid_fill;
++        }
++
++        if (rdpgfx->SurfaceToSurface != guac_rdp_gfx_surface_to_surface) {
++            rdp_client->orig_surface_to_surface = (void*) rdpgfx->SurfaceToSurface;
++            rdpgfx->SurfaceToSurface = guac_rdp_gfx_surface_to_surface;
++        }
++
++        if (rdpgfx->SurfaceToCache != guac_rdp_gfx_surface_to_cache) {
++            rdp_client->orig_surface_to_cache = (void*) rdpgfx->SurfaceToCache;
++            rdpgfx->SurfaceToCache = guac_rdp_gfx_surface_to_cache;
++        }
++
++        if (rdpgfx->CacheToSurface != guac_rdp_gfx_cache_to_surface) {
++            rdp_client->orig_cache_to_surface = (void*) rdpgfx->CacheToSurface;
++            rdpgfx->CacheToSurface = guac_rdp_gfx_cache_to_surface;
++        }
++
++        if (rdpgfx->ResetGraphics != guac_rdp_gfx_reset_graphics) {
++            rdp_client->orig_reset_graphics = (void*) rdpgfx->ResetGraphics;
++            rdpgfx->ResetGraphics = guac_rdp_gfx_reset_graphics;
++        }
++
++        if (rdpgfx->CreateSurface != guac_rdp_gfx_create_surface) {
++            rdp_client->orig_create_surface = (void*) rdpgfx->CreateSurface;
++            rdpgfx->CreateSurface = guac_rdp_gfx_create_surface;
++        }
++
++        if (rdpgfx->DeleteSurface != guac_rdp_gfx_delete_surface) {
++            rdp_client->orig_delete_surface = (void*) rdpgfx->DeleteSurface;
++            rdpgfx->DeleteSurface = guac_rdp_gfx_delete_surface;
++        }
++
+         if (rdp_client->settings->enable_h264) {
+ 
+             /* Wrap SurfaceCommand to intercept H.264 data after GDI decode.
+diff --git a/src/protocols/rdp/gdi.c b/src/protocols/rdp/gdi.c
+index 56cdbaaf..0d141663 100644
+--- a/src/protocols/rdp/gdi.c
++++ b/src/protocols/rdp/gdi.c
+@@ -195,6 +195,32 @@ BOOL guac_rdp_gdi_desktop_resize(rdpContext* context) {
+      * See sol1/rustguac#118. */
+     guac_rect_init(&current_context->dirty, 0, 0, gdi->width, gdi->height);
+ 
++    /* That full-layer repaint is encoded from gdi->primary_buffer, and under
++     * H.264 passthrough guacd never decodes into it: every region the server
++     * delivered as H.264 is blank there, however correct it looks in the
++     * browser, which painted it from its own decoder. So the repaint that
++     * fixes #118 for the tile path sends black over a working picture here,
++     * and the RefreshRect below cannot undo it -- the RDPGFX surface cache
++     * ignores RefreshRect, so nothing asks the server to re-encode. An idle
++     * desktop then has no damage to send and the black persists until the user
++     * forces a resize.
++     *
++     * Logged rather than fixed here so that a session that goes black can be
++     * matched against this line before deciding what the fix should be. */
++    if (rdp_client->h264_passthrough_frames > 0)
++        guac_client_log(client, GUAC_LOG_WARNING,
++                "Display resized to %ix%i while H.264 passthrough is active "
++                "(%i frames passed through undecoded). The full-layer repaint "
++                "for #118 is about to send guacd's own framebuffer, which "
++                "holds no pixels for any region delivered as H.264. Expect "
++                "those regions to go black in the browser until the server "
++                "repaints them.", gdi->width, gdi->height,
++                rdp_client->h264_passthrough_frames);
++    else
++        guac_client_log(client, GUAC_LOG_INFO,
++                "Display resized to %ix%i; flushing a full-layer repaint "
++                "(#118).", gdi->width, gdi->height);
++
+     /* Ask the server to re-send pixels for the full new desktop area. This
+      * covers the legacy bitmap update path. The RDPGFX surface cache ignores
+      * RefreshRect, so GFX sessions are not fixed by this and need a separate
+diff --git a/src/protocols/rdp/rdp.h b/src/protocols/rdp/rdp.h
+index f324312d..473b078f 100644
+--- a/src/protocols/rdp/rdp.h
++++ b/src/protocols/rdp/rdp.h
+@@ -154,6 +154,58 @@ typedef struct guac_rdp_client {
+      */
+     void* orig_end_frame;
+ 
++    /**
++     * The original RDPGFX callbacks for the surface operations that guacd does
++     * not otherwise touch, wrapped purely to log that they occurred. Under
++     * H.264 passthrough the decode is skipped, so FreeRDP's surfaces (and thus
++     * gdi->primary_buffer, which is what guacd encodes from) hold no pixels for
++     * any region delivered as H.264. Every one of these operations reads or
++     * writes those surfaces, so any of them can move never-decoded black
++     * pixels into a region the browser was painting correctly from its own
++     * decoder. Which of them a given host actually uses is otherwise invisible.
++     * See guac_rdp_gfx_op_summary().
++     */
++    void* orig_reset_graphics;
++    void* orig_create_surface;
++    void* orig_delete_surface;
++    void* orig_solid_fill;
++    void* orig_surface_to_surface;
++    void* orig_surface_to_cache;
++    void* orig_cache_to_surface;
++
++    /**
++     * Counts of each wrapped surface operation since the session began. The
++     * frequent operations are summarised periodically rather than logged
++     * individually, so that the trace can be left enabled on a session that
++     * has to run for hours before the fault appears.
++     */
++    int gfx_solid_fill_count;
++    int gfx_surface_to_surface_count;
++    int gfx_surface_to_cache_count;
++    int gfx_cache_to_surface_count;
++
++    /**
++     * Individual operation lines logged since the last summary. Bounded so
++     * that per-operation detail -- which is what identifies the region that
++     * went black -- can be left on at the default log level without a busy
++     * desktop writing a line per tile.
++     */
++    int gfx_op_lines;
++
++    /**
++     * When the periodic surface-operation summary was last logged, or zero if
++     * it never has been.
++     */
++    guac_timestamp gfx_op_summary_time;
++
++    /**
++     * The number of H.264 access units passed through to clients without being
++     * decoded by guacd. Non-zero means guacd's copy of the framebuffer is
++     * knowingly incomplete, which is what makes the surface operations above
++     * worth logging and what makes a full-layer flush on resize suspect.
++     */
++    int h264_passthrough_frames;
++
+     /**
+      * When the previous graphics frame ended, or zero before the first. The
+      * gap between frames is the spacing the server has already provided, which
