@@ -448,6 +448,13 @@
             // 30fps this is a bit over a minute rather than half of one.
             var DRAW_RING_MAX = 5000;
             var drawLiveLog = /[?&]debug=draw\b/.test(location.search);
+            // ?debug=nofit stops the window-resize handler from asking the
+            // server for a new framebuffer. Opening docked DevTools shrinks the
+            // viewport, which would otherwise trigger an RDP resize and repaint
+            // the whole screen -- destroying the very black region you opened
+            // DevTools to inspect. The display still scales to fit; only the
+            // sendSize is suppressed.
+            var debugNoFit = /[?&]debug=nofit\b/.test(location.search);
 
             // Decode the draw opcodes we care about into {op, layer, rect, note}.
             // Arg orders per the Guacamole protocol.
@@ -551,6 +558,96 @@
                              t: new Date(d.t).toISOString().substr(11, 12) };
                 }));
                 return rows;
+            };
+
+            // Find the black areas on screen so you don't have to guess a
+            // coordinate to hand rustguacDumpDraws(). Reads back the default
+            // layer, samples it on a coarse grid, and groups the black cells
+            // into connected regions. Legitimate black content (a terminal, an
+            // empty desktop) shows up too, so regions are returned largest
+            // first with their size — the failure is usually the big one.
+            var BLACK_GRID = 16;      // sample step, framebuffer pixels
+            var BLACK_LEVEL = 8;      // per-channel ceiling counted as black
+            var BLACK_MIN_CELLS = 16; // ignore specks (4x4 cells = 64x64 px)
+            window.rustguacFindBlack = function() {
+                var layer = client.getDisplay().getDefaultLayer();
+                var canvas = layer.getCanvas();
+                var w = canvas.width, h = canvas.height;
+                if (!w || !h) { console.warn('[rustguac] display has no size yet'); return []; }
+                var px;
+                try {
+                    px = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+                } catch (e) {
+                    console.warn('[rustguac] cannot read display pixels:', e);
+                    return [];
+                }
+                var cols = Math.ceil(w / BLACK_GRID), rows = Math.ceil(h / BLACK_GRID);
+                var dark = new Uint8Array(cols * rows);
+                for (var gy = 0; gy < rows; gy++) {
+                    for (var gx = 0; gx < cols; gx++) {
+                        // Sample the middle of the cell rather than its corner:
+                        // a one-pixel border on a black region shouldn't hide it.
+                        var sx = Math.min(w - 1, gx * BLACK_GRID + (BLACK_GRID >> 1));
+                        var sy = Math.min(h - 1, gy * BLACK_GRID + (BLACK_GRID >> 1));
+                        var o = (sy * w + sx) * 4;
+                        if (px[o] <= BLACK_LEVEL && px[o + 1] <= BLACK_LEVEL
+                                && px[o + 2] <= BLACK_LEVEL)
+                            dark[gy * cols + gx] = 1;
+                    }
+                }
+                // Flood fill the dark cells into regions (4-connected, explicit
+                // stack — a recursive fill blows the stack on a full screen).
+                var seen = new Uint8Array(cols * rows), out = [];
+                for (var i = 0; i < dark.length; i++) {
+                    if (!dark[i] || seen[i]) continue;
+                    var stack = [i], cells = 0;
+                    var minX = cols, minY = rows, maxX = -1, maxY = -1;
+                    seen[i] = 1;
+                    while (stack.length) {
+                        var c = stack.pop(), cx = c % cols, cy = (c - cx) / cols;
+                        cells++;
+                        if (cx < minX) minX = cx;
+                        if (cx > maxX) maxX = cx;
+                        if (cy < minY) minY = cy;
+                        if (cy > maxY) maxY = cy;
+                        var nb = [cx > 0 ? c - 1 : -1, cx < cols - 1 ? c + 1 : -1,
+                                  cy > 0 ? c - cols : -1, cy < rows - 1 ? c + cols : -1];
+                        for (var n = 0; n < 4; n++) {
+                            var j = nb[n];
+                            if (j >= 0 && dark[j] && !seen[j]) { seen[j] = 1; stack.push(j); }
+                        }
+                    }
+                    if (cells < BLACK_MIN_CELLS) continue;
+                    out.push({
+                        x: minX * BLACK_GRID, y: minY * BLACK_GRID,
+                        w: (maxX - minX + 1) * BLACK_GRID,
+                        h: (maxY - minY + 1) * BLACK_GRID,
+                        cells: cells,
+                        cx: Math.round((minX + maxX + 1) / 2 * BLACK_GRID),
+                        cy: Math.round((minY + maxY + 1) / 2 * BLACK_GRID)
+                    });
+                }
+                out.sort(function(a, b) { return b.cells - a.cells; });
+                console.log('[rustguac] ' + out.length + ' black region(s) in '
+                    + w + 'x' + h + ' framebuffer:');
+                console.table(out.map(function(r) {
+                    return { rect: r.x + ',' + r.y + ' ' + r.w + 'x' + r.h,
+                             centre: r.cx + ',' + r.cy,
+                             'px (approx)': r.cells * BLACK_GRID * BLACK_GRID };
+                }));
+                return out;
+            };
+
+            // One call for the whole diagnostic: find the largest black region
+            // and dump what painted its centre. Pass an index to look at the
+            // second-largest region instead, etc.
+            window.rustguacDumpBlack = function(index) {
+                var regions = window.rustguacFindBlack();
+                var r = regions[index || 0];
+                if (!r) { console.warn('[rustguac] no black region found'); return []; }
+                console.log('[rustguac] dumping draws at the centre of '
+                    + r.w + 'x' + r.h + ' region at ' + r.x + ',' + r.y);
+                return window.rustguacDumpDraws(r.cx, r.cy);
             };
 
             var displayEl = document.getElementById('display');
@@ -1473,8 +1570,123 @@
             });
 
             // ── State changes ──
+            // ── Session diagnostics ──
+            // Posted to the server so they land in its journal next to guacd's
+            // own logs. The faults these describe -- a decoder stuck waiting
+            // for a keyframe, regions of the desktop going black -- appear
+            // rarely, on someone else's machine, with no console open, so the
+            // browser has to report them at the time or the evidence is gone.
+            var _diagSent = 0;
+            var _diagMinute = 0;
+            function reportDiagnostic(event, detail) {
+
+                // Budgeted per minute here as well as on the server: a page
+                // that malfunctions should not be able to spend the server's
+                // whole allowance and hide other sessions' reports.
+                var minute = Math.floor(Date.now() / 60000);
+                if (minute !== _diagMinute) { _diagMinute = minute; _diagSent = 0; }
+                if (_diagSent >= 10) return;
+                _diagSent++;
+
+                var headers = { 'Content-Type': 'application/json' };
+                if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+                fetch('/api/sessions/' + sessionId + '/diagnostic', {
+                    method: 'POST',
+                    headers: headers,
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ event: event, detail: String(detail) })
+                }).catch(function() {}); // fire and forget
+
+            }
+
+            if (window.Guacamole && Guacamole.H264Decoder)
+                Guacamole.H264Decoder.onDiagnostic = reportDiagnostic;
+
             // ── Thumbnail capture (owner only, not shared viewers) ──
             var _thumbInterval = null;
+
+            // Fraction of the display that was black at the last check, and
+            // whether that has already been reported. The check rides on the
+            // thumbnail capture below rather than costing a readback of its
+            // own.
+            var _blackReported = false;
+
+            /**
+             * Reports the display going substantially black, and its
+             * recovering afterwards.
+             *
+             * A black region is the symptom users report, and until now it
+             * left no trace anywhere: guacd believes it sent pixels, the
+             * browser believes it drew them. Timestamping the transition is
+             * what makes the rest of the logs -- guacd's surface operations,
+             * the overpaint warnings, the decoder's own reports -- readable as
+             * one episode.
+             *
+             * The grid is included because which part went black is the whole
+             * question: a full screen points at a resize or a graphics reset,
+             * scattered blocks at cached or copied regions.
+             */
+            function checkForBlackDisplay(thumb) {
+
+                var data;
+                try {
+                    data = thumb.getContext('2d')
+                            .getImageData(0, 0, thumb.width, thumb.height).data;
+                }
+                catch (e) { return; } // tainted or zero-sized canvas
+
+                var cols = 8, rows = 4;
+                var cells = [];
+                var black = 0, total = 0;
+
+                for (var ry = 0; ry < rows; ry++) {
+                    var row = '';
+                    for (var rx = 0; rx < cols; rx++) {
+
+                        var x0 = Math.floor(rx * thumb.width / cols);
+                        var x1 = Math.floor((rx + 1) * thumb.width / cols);
+                        var y0 = Math.floor(ry * thumb.height / rows);
+                        var y1 = Math.floor((ry + 1) * thumb.height / rows);
+
+                        var cellBlack = 0, cellTotal = 0;
+                        for (var y = y0; y < y1; y += 2) {
+                            for (var x = x0; x < x1; x += 2) {
+                                var i = (y * thumb.width + x) * 4;
+                                cellTotal++;
+                                if (data[i] < 8 && data[i+1] < 8 && data[i+2] < 8)
+                                    cellBlack++;
+                            }
+                        }
+
+                        black += cellBlack;
+                        total += cellTotal;
+                        row += (cellTotal && cellBlack / cellTotal > 0.9) ? '#' : '.';
+
+                    }
+                    cells.push(row);
+                }
+
+                if (!total) return;
+                var fraction = black / total;
+
+                // Hysteresis, and a deliberately high bar: a dark wallpaper or
+                // a lock screen is legitimately black, so only a large area
+                // reports, and only on the way in and the way out.
+                if (!_blackReported && fraction > 0.4) {
+                    _blackReported = true;
+                    reportDiagnostic('display_black',
+                            (fraction * 100).toFixed(0) + '% of the display is '
+                            + 'black; grid ' + cells.join('/'));
+                }
+                else if (_blackReported && fraction < 0.15) {
+                    _blackReported = false;
+                    reportDiagnostic('display_black_cleared',
+                            'display recovered, now '
+                            + (fraction * 100).toFixed(0) + '% black');
+                }
+
+            }
+
             function captureAndUploadThumbnail() {
                 try {
                     var display = client.getDisplay();
@@ -1485,6 +1697,7 @@
                     thumb.width = 320;
                     thumb.height = Math.round(320 * canvas.height / canvas.width) || 180;
                     thumb.getContext('2d').drawImage(canvas, 0, 0, thumb.width, thumb.height);
+                    checkForBlackDisplay(thumb);
                     thumb.toBlob(function(blob) {
                         if (!blob) return;
                         var headers = {};
@@ -1973,6 +2186,7 @@
                 scaleDisplay();
                 // Debounce sendSize — RDP display updates are expensive
                 clearTimeout(resizeTimer);
+                if (debugNoFit) return;
                 resizeTimer = setTimeout(function() {
                     var anyPanelOpen = panelOpen || filePanelOpen;
                     var cssW = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
