@@ -120,8 +120,19 @@ Policy *"Use WDDM graphics display driver for Remote Desktop Connections"* must
 be **Disabled** or hardware H.264 encoding never engages (GPU 3D shows load
 while Video Encode stays at 0%). `AVC444ModePreferred=1` is also required *for
 hardware encoding*, and makes Windows send AVC444 — which is handled: both
-views are forwarded and only the main one is drawn, so chroma is 4:2:0. Full
+views are forwarded and combined in the browser into full 4:4:4 chroma. Full
 details, including verification commands, in `docs/rdp-h264.md`.
+
+**AVC444 4:4:4 combining** (`static/guac/Yuv444.js`) — a WebGL2 shader unpacks
+the auxiliary view's packed chroma (both MS-RDPEGFX layouts) and converts to
+RGB in one pass, inverting the encoder's chroma filter to recover the one
+sample per 2x2 block neither view carries. Frames are copied in the decoder's
+own pixel format: `copyTo()` will not convert NV12 (what hardware decoders
+give) to I420, so requesting a format throws before anything is copied. Two
+runtime overrides, as window global / query param / localStorage:
+`h264Chroma444` (off disables combining) and `h264ChromaFilter` (off, or a
+0-255 threshold; default 30, from FreeRDP's `CONDITIONAL_CLIP`). Falls back to
+4:2:0 on missing WebGL2, a lost context, or an unreadable pixel format.
 
 ### Native resolution (HiDPI)
 
