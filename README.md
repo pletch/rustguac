@@ -25,8 +25,19 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   AVC444 picture are forwarded and the main one drawn, so Windows hosts can use
   **hardware** H.264 encoding, which requires `AVC444ModePreferred=1`. Upstream
   forces `GfxAVC444` off to sidestep the colour corruption this used to cause.
-  Chroma is 4:2:0, as the auxiliary view is decoded for its references but not
-  composited (see [`docs/rdp-h264.md`](docs/rdp-h264.md)).
+  Both views are decoded and combined, giving full 4:4:4 chroma (see
+  [`docs/rdp-h264.md`](docs/rdp-h264.md)).
+- **4:4:4 chroma reconstruction** — the auxiliary view of an AVC444 picture is
+  not an image: its planes carry the chroma samples the main view's 4:2:0
+  subsampling discarded, packed by position. A WebGL2 shader
+  (`static/guac/Yuv444.js`) unpacks both MS-RDPEGFX chroma layouts and converts
+  to RGB in a single pass, and inverts the encoder's chroma filter to recover
+  the one sample per 2x2 block that neither view carries. This matters most for
+  text, since ClearType antialiases glyphs with per-pixel colour fringes —
+  precisely what 4:2:0 averages away. Frames are copied in whatever pixel
+  format the decoder produced, as hardware decoders generally give NV12 and
+  software ones I420. Falls back to 4:2:0 on its own where WebGL2 is missing,
+  the GL context is lost, or the frame carries no readable planes.
 - **Ordered drawing** — the `h264` instruction gains a `<view>` field and
   trailing region rects, and frames are painted through the display's task
   queue (`Display.drawH264`) rather than straight from the decoder's output
