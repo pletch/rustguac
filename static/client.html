@@ -560,6 +560,96 @@
                 return rows;
             };
 
+            // Find the black areas on screen so you don't have to guess a
+            // coordinate to hand rustguacDumpDraws(). Reads back the default
+            // layer, samples it on a coarse grid, and groups the black cells
+            // into connected regions. Legitimate black content (a terminal, an
+            // empty desktop) shows up too, so regions are returned largest
+            // first with their size — the failure is usually the big one.
+            var BLACK_GRID = 16;      // sample step, framebuffer pixels
+            var BLACK_LEVEL = 8;      // per-channel ceiling counted as black
+            var BLACK_MIN_CELLS = 16; // ignore specks (4x4 cells = 64x64 px)
+            window.rustguacFindBlack = function() {
+                var layer = client.getDisplay().getDefaultLayer();
+                var canvas = layer.getCanvas();
+                var w = canvas.width, h = canvas.height;
+                if (!w || !h) { console.warn('[rustguac] display has no size yet'); return []; }
+                var px;
+                try {
+                    px = canvas.getContext('2d').getImageData(0, 0, w, h).data;
+                } catch (e) {
+                    console.warn('[rustguac] cannot read display pixels:', e);
+                    return [];
+                }
+                var cols = Math.ceil(w / BLACK_GRID), rows = Math.ceil(h / BLACK_GRID);
+                var dark = new Uint8Array(cols * rows);
+                for (var gy = 0; gy < rows; gy++) {
+                    for (var gx = 0; gx < cols; gx++) {
+                        // Sample the middle of the cell rather than its corner:
+                        // a one-pixel border on a black region shouldn't hide it.
+                        var sx = Math.min(w - 1, gx * BLACK_GRID + (BLACK_GRID >> 1));
+                        var sy = Math.min(h - 1, gy * BLACK_GRID + (BLACK_GRID >> 1));
+                        var o = (sy * w + sx) * 4;
+                        if (px[o] <= BLACK_LEVEL && px[o + 1] <= BLACK_LEVEL
+                                && px[o + 2] <= BLACK_LEVEL)
+                            dark[gy * cols + gx] = 1;
+                    }
+                }
+                // Flood fill the dark cells into regions (4-connected, explicit
+                // stack — a recursive fill blows the stack on a full screen).
+                var seen = new Uint8Array(cols * rows), out = [];
+                for (var i = 0; i < dark.length; i++) {
+                    if (!dark[i] || seen[i]) continue;
+                    var stack = [i], cells = 0;
+                    var minX = cols, minY = rows, maxX = -1, maxY = -1;
+                    seen[i] = 1;
+                    while (stack.length) {
+                        var c = stack.pop(), cx = c % cols, cy = (c - cx) / cols;
+                        cells++;
+                        if (cx < minX) minX = cx;
+                        if (cx > maxX) maxX = cx;
+                        if (cy < minY) minY = cy;
+                        if (cy > maxY) maxY = cy;
+                        var nb = [cx > 0 ? c - 1 : -1, cx < cols - 1 ? c + 1 : -1,
+                                  cy > 0 ? c - cols : -1, cy < rows - 1 ? c + cols : -1];
+                        for (var n = 0; n < 4; n++) {
+                            var j = nb[n];
+                            if (j >= 0 && dark[j] && !seen[j]) { seen[j] = 1; stack.push(j); }
+                        }
+                    }
+                    if (cells < BLACK_MIN_CELLS) continue;
+                    out.push({
+                        x: minX * BLACK_GRID, y: minY * BLACK_GRID,
+                        w: (maxX - minX + 1) * BLACK_GRID,
+                        h: (maxY - minY + 1) * BLACK_GRID,
+                        cells: cells,
+                        cx: Math.round((minX + maxX + 1) / 2 * BLACK_GRID),
+                        cy: Math.round((minY + maxY + 1) / 2 * BLACK_GRID)
+                    });
+                }
+                out.sort(function(a, b) { return b.cells - a.cells; });
+                console.log('[rustguac] ' + out.length + ' black region(s) in '
+                    + w + 'x' + h + ' framebuffer:');
+                console.table(out.map(function(r) {
+                    return { rect: r.x + ',' + r.y + ' ' + r.w + 'x' + r.h,
+                             centre: r.cx + ',' + r.cy,
+                             'px (approx)': r.cells * BLACK_GRID * BLACK_GRID };
+                }));
+                return out;
+            };
+
+            // One call for the whole diagnostic: find the largest black region
+            // and dump what painted its centre. Pass an index to look at the
+            // second-largest region instead, etc.
+            window.rustguacDumpBlack = function(index) {
+                var regions = window.rustguacFindBlack();
+                var r = regions[index || 0];
+                if (!r) { console.warn('[rustguac] no black region found'); return []; }
+                console.log('[rustguac] dumping draws at the centre of '
+                    + r.w + 'x' + r.h + ' region at ' + r.x + ',' + r.y);
+                return window.rustguacDumpDraws(r.cx, r.cy);
+            };
+
             var displayEl = document.getElementById('display');
             displayEl.appendChild(client.getDisplay().getElement());
 
