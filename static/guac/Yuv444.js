@@ -612,6 +612,25 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
 
         gl.drawArrays(gl.TRIANGLES, 0, 3);
 
+        /* Checked again on the far side of the draw. The check at the top of
+         * this function has already passed by the time the context dies
+         * mid-frame, and a lost context makes drawArrays() a silent no-op --
+         * so the canvas returned would be the clear colour, which with
+         * alpha:false is opaque black, and the caller would blit that over
+         * whatever the frame's rects cover.
+         *
+         * This narrows the window rather than closing it: drawArrays() only
+         * queues work, so a draw that will never execute can still leave
+         * isContextLost() false here, and the webglcontextlost event arrives
+         * in a later task. Closing it properly needs a fence or a readback
+         * after every frame, which costs a GPU sync per frame -- more than the
+         * failure it guards against. */
+        if (gl.isContextLost()) {
+            console.warn('[rustguac] YUV444 context lost mid-frame;'
+                    + ' dropping frame and falling back to 4:2:0');
+            return null;
+        }
+
         return canvas;
 
     };
