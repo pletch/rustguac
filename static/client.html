@@ -448,6 +448,13 @@
             // 30fps this is a bit over a minute rather than half of one.
             var DRAW_RING_MAX = 5000;
             var drawLiveLog = /[?&]debug=draw\b/.test(location.search);
+            // ?debug=nofit stops the window-resize handler from asking the
+            // server for a new framebuffer. Opening docked DevTools shrinks the
+            // viewport, which would otherwise trigger an RDP resize and repaint
+            // the whole screen -- destroying the very black region you opened
+            // DevTools to inspect. The display still scales to fit; only the
+            // sendSize is suppressed.
+            var debugNoFit = /[?&]debug=nofit\b/.test(location.search);
 
             // Decode the draw opcodes we care about into {op, layer, rect, note}.
             // Arg orders per the Guacamole protocol.
@@ -1973,6 +1980,7 @@
                 scaleDisplay();
                 // Debounce sendSize — RDP display updates are expensive
                 clearTimeout(resizeTimer);
+                if (debugNoFit) return;
                 resizeTimer = setTimeout(function() {
                     var anyPanelOpen = panelOpen || filePanelOpen;
                     var cssW = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
