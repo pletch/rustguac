@@ -443,7 +443,10 @@
             // whose rectangle covers that pixel. Append ?debug=draw to the URL
             // for live per-op logging.
             var DRAW_RING = [];
-            var DRAW_RING_MAX = 2000;
+            // Deep enough to still hold the failure after you notice it and
+            // reach the console: AVC444 records two entries per picture, so at
+            // 30fps this is a bit over a minute rather than half of one.
+            var DRAW_RING_MAX = 5000;
             var drawLiveLog = /[?&]debug=draw\b/.test(location.search);
 
             // Decode the draw opcodes we care about into {op, layer, rect, note}.
@@ -469,6 +472,33 @@
                         return { op: 'dispose', layer: +a[0] };
                     case 'size':   // layer,w,h
                         return { op: 'size', layer: +a[0], note: a[1] + 'x' + a[2] };
+                    case 'h264': { // stream,layer,keyframe,x,y,w,h,view,numrects,[x,y,w,h]...
+                        // Returns one entry per region rect, so a dump filtered
+                        // by pixel finds the frame that painted it. Without the
+                        // rects this tells us nothing useful: the picture is
+                        // always full-surface sized, and it is the rects that
+                        // decide what actually reaches the layer.
+                        var view = a.length > 7 ? +a[7] : 0;
+                        var num = a.length > 8 ? +a[8] : 0;
+                        var note = (view === 0 ? 'main' : 'aux v' + view)
+                                 + (+a[2] ? ' KEY' : '')
+                                 + ' picture ' + a[5] + 'x' + a[6];
+                        if (!num)
+                            return { op: 'h264', layer: +a[1],
+                                     rect: [+a[3], +a[4], +a[5], +a[6]],
+                                     note: note + ' (no rects, whole picture)' };
+                        var frames = [];
+                        for (var hr = 0; hr < num; hr++) {
+                            var hb = 9 + hr * 4;
+                            if (hb + 3 >= a.length) break;
+                            frames.push({ op: 'h264', layer: +a[1],
+                                          rect: [+a[hb], +a[hb + 1],
+                                                 +a[hb + 2], +a[hb + 3]],
+                                          note: note + ' rect ' + (hr + 1)
+                                                + '/' + num });
+                        }
+                        return frames.length ? frames : null;
+                    }
                     default:
                         return null;
                 }
@@ -481,8 +511,12 @@
                     seenOpcodes[opcode] = true;
                     if (typeof console !== 'undefined') console.log('[rustguac] instruction: ' + opcode + (args.length ? ' (' + args.length + ' args)' : ''));
                 }
-                var d = decodeDraw(opcode, args);
-                if (d) {
+                var decoded = decodeDraw(opcode, args);
+                // An h264 frame decodes to one entry per region rect, so this
+                // takes either a single op or a list of them.
+                var ops = decoded ? (Array.isArray(decoded) ? decoded : [decoded]) : [];
+                for (var di = 0; di < ops.length; di++) {
+                    var d = ops[di];
                     d.t = Date.now();
                     DRAW_RING.push(d);
                     if (DRAW_RING.length > DRAW_RING_MAX) DRAW_RING.shift();
