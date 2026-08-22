@@ -106,6 +106,9 @@ Measured with 1080p video playing, guacd session CPU over 30s:
   the non-obvious Windows requirement that the *"Use WDDM graphics display
   driver for Remote Desktop Connections"* policy be **Disabled** or hardware
   encoding never engages.
+- [`docs/upstream-h264-issue.md`](docs/upstream-h264-issue.md) — draft write-up
+  for upstream: why `GfxAVC444 = FALSE` makes Windows hosts negotiate no H.264
+  at all, and why the server-side decode still runs on every frame.
 - [`docs/xrdp-dpi-scaling.md`](docs/xrdp-dpi-scaling.md) — what an xrdp patch
   would need in order to act on the DPI scale factor it already parses,
   validates and then discards.
