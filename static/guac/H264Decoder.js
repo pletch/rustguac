@@ -166,6 +166,20 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
+     * Cancels a frame's decode watchdog, if it is still armed.
+     *
+     * @private
+     * @param {object} frameState
+     *     The frame's pending state, or null.
+     */
+    function clearWatchdog(frameState) {
+        if (frameState && frameState.watchdog) {
+            clearTimeout(frameState.watchdog);
+            frameState.watchdog = null;
+        }
+    }
+
+    /**
      * Canvases available for reuse as frame snapshots. A snapshot is held from
      * decode until its draw task runs, so several are live at once and one
      * shared canvas will not do. Allocating a fresh canvas per frame instead
@@ -382,7 +396,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (value === null || value === undefined)
             return undefined;
 
-        if (value === 'off' || value === 'false' || value === '0')
+        /* '0' is deliberately not in that list: it is a valid threshold for
+         * h264ChromaFilter, and an override that takes a number has to be
+         * able to take zero. It still switches a boolean override off, since
+         * callers coerce, and 0 is falsy. */
+        if (value === 'off' || value === 'false')
             return false;
         if (value === 'on' || value === 'true')
             return true;
@@ -560,7 +578,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             if (frameState.settled)
                 return;
 
-            var snapshot = acquireCanvas(pictureW, pictureH);
+            /* Sized from the rendered canvas rather than from this frame:
+             * the v1 chroma layout pads the auxiliary view to a multiple of
+             * 16 rows, so an auxiliary frame's own dimensions can exceed the
+             * picture's. The renderer draws at the main view's size, leaving
+             * anything below that in a taller snapshot blank -- and with no
+             * rects the whole snapshot is blitted, painting that blank strip
+             * over the bottom of the display. */
+            var snapshot = acquireCanvas(rendered.width, rendered.height);
             snapshot.getContext('2d').drawImage(rendered, 0, 0);
             frameState.canvas = snapshot;
 
@@ -584,6 +609,10 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             }
 
             releaseBuffer(buffer);
+
+            /* The copy has settled, one way or the other; there is nothing
+             * left for the watchdog to cover. */
+            clearWatchdog(frameState);
 
             if (frameState.onReady)
                 frameState.onReady();
@@ -666,11 +695,6 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     if (!frameState)
                         return;
 
-                    if (frameState.watchdog) {
-                        clearTimeout(frameState.watchdog);
-                        frameState.watchdog = null;
-                    }
-
                     /* An auxiliary view means this is an AVC444 stream, so
                      * its chroma can be recovered. Switch over for the frames
                      * that follow; this one cannot be combined, because the
@@ -702,11 +726,6 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                         frame = null;
                         return;
                     }
-
-                    /* No auxiliary view in this stream, or combining is off:
-                     * the main view is a complete picture on its own. */
-                    if (frameState.view !== 0)
-                        return;
 
                     /* Snapshot to a canvas and release the VideoFrame before
                      * returning, rather than holding it until the draw task
@@ -742,8 +761,20 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     /* Null when combineFrame() took ownership: it closes the
                      * frame once its plane copy has settled, and releases the
                      * task itself. */
-                    if (frame)
+                    if (frame) {
+
+                        /* Cleared here rather than on the way in, because the
+                         * combine path holds the frame across an asynchronous
+                         * copyTo() that nothing else times out: clearing the
+                         * watchdog before handing the frame over would leave a
+                         * copy that never settles holding the ordered display
+                         * queue with nothing able to release it.
+                         * combineFrame() clears it once the copy settles. */
+                        clearWatchdog(frameState);
+
                         frame.close();
+
+                    }
 
                     /* Released here rather than after the try, because the
                      * early returns above exit the function once this finally
@@ -911,10 +942,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * frameState is undefined if the throw came from constructing the
              * chunk, before anything was registered. */
             if (frameState) {
-                if (frameState.watchdog) {
-                    clearTimeout(frameState.watchdog);
-                    frameState.watchdog = null;
-                }
+                clearWatchdog(frameState);
                 delete pendingFrames[token];
 
                 /* A snapshot already taken for this frame would otherwise be
@@ -957,10 +985,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         delete pendingFrames[token];
 
-        if (frameState.watchdog) {
-            clearTimeout(frameState.watchdog);
-            frameState.watchdog = null;
-        }
+        clearWatchdog(frameState);
 
         var snapshot = frameState.canvas;
         if (!snapshot) {
