@@ -93,6 +93,13 @@ guacd (C, from guacamole-server)
 | OIDC provider | Optional | For SSO. API-key auth works on its own. Authentik/Google/Okta/Keycloak/JumpCloud all tested. |
 | Docker | Optional | Only needed for VDI desktop containers. |
 
+### Supported browsers
+
+The client runs in any modern browser (Chrome, Firefox, Edge, Safari, Chromium, Brave). One caveat applies only to **H.264-accelerated RDP**, which is opt-in per connection (the per-entry H.264 toggle, off by default):
+
+- **Standard connections** (SSH, RDP, VNC, web sessions, VDI) work in every modern browser.
+- **H.264-accelerated connections** need a browser that can decode H.264 through the WebCodecs API. **Chrome** and **Firefox** work. Open-source **Chromium** and **Brave** builds without the bundled H.264 codec, and older Safari, render a blank display on those connections. Leave H.264 off (the default) for universal browser support, or use Chrome or Firefox where it is enabled.
+
 ## Quick start
 
 ### Debian 13 (.deb)
