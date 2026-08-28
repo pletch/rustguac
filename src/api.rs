@@ -3858,6 +3858,90 @@ pub async fn put_my_credentials(
     Json(json!({"ok": true, "count": count})).into_response()
 }
 
+/// Abstraction over the folder tree + per-folder access, used to gather
+/// credential variables. Kept as a trait so the traversal below is unit-
+/// testable without a live Vault.
+#[allow(async_fn_in_trait)]
+trait FolderSource {
+    /// Whether the user may directly access (enter) this folder.
+    async fn accessible(&self, scope: &str, path: &str) -> bool;
+    /// Full paths of this folder's immediate subfolders.
+    async fn subfolders(&self, scope: &str, path: &str) -> Vec<String>;
+    /// Credential-variable names referenced by entries in this folder.
+    async fn folder_var_names(&self, scope: &str, path: &str) -> Vec<String>;
+}
+
+/// Walk the folder tree from `roots`, collecting credential-variable names and
+/// their reference counts. Descends into every subfolder so a grant on a deep
+/// folder nested under an inaccessible ancestor is still reached (mirroring the
+/// connections tree, which shows a folder when a descendant is accessible), but
+/// only collects variables from folders the user can directly access.
+///
+/// This replaced an earlier walk that short-circuited the whole subtree on a
+/// directly-inaccessible ancestor, hiding credential variables from any entry
+/// nested under it (an operator granted access at a subfolder level saw "No
+/// credential variables" in My Credentials even though they could connect the
+/// entry).
+async fn gather_credential_variables<S: FolderSource>(
+    src: &S,
+    roots: Vec<(String, String)>,
+) -> std::collections::HashMap<String, u32> {
+    let mut all_vars: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut stack = roots;
+    while let Some((scope, path)) = stack.pop() {
+        if src.accessible(&scope, &path).await {
+            for var in src.folder_var_names(&scope, &path).await {
+                *all_vars.entry(var).or_insert(0) += 1;
+            }
+        }
+        // Always descend: a deeper folder may be directly granted even when
+        // this one is not.
+        for sub in src.subfolders(&scope, &path).await {
+            stack.push((scope.clone(), sub));
+        }
+    }
+    all_vars
+}
+
+/// Real [`FolderSource`] backed by Vault and the caller's identity.
+struct VaultFolderSource<'a> {
+    vault: &'a VaultBackends,
+    id: &'a AuthIdentity,
+}
+
+impl FolderSource for VaultFolderSource<'_> {
+    async fn accessible(&self, scope: &str, path: &str) -> bool {
+        check_folder_access(self.vault, scope, path, self.id)
+            .await
+            .is_ok()
+    }
+
+    async fn subfolders(&self, scope: &str, path: &str) -> Vec<String> {
+        match self.vault.list_subfolders(scope, path).await {
+            Ok(subs) => subs
+                .into_iter()
+                .map(|sub| sub.path.unwrap_or_else(|| format!("{}/{}", path, sub.name)))
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn folder_var_names(&self, scope: &str, path: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let entries = self
+            .vault
+            .list_entries(scope, path)
+            .await
+            .unwrap_or_default();
+        for entry_name in &entries {
+            if let Ok(entry) = self.vault.get_entry(scope, path, entry_name).await {
+                out.extend(crate::vault::entry_credential_variables(&entry));
+            }
+        }
+        out
+    }
+}
+
 /// GET /api/credential-variables — List all unique credential variables across address book entries.
 /// Returns grouped by domain prefix, with entry counts.
 pub async fn list_credential_variables(
@@ -3888,33 +3972,15 @@ pub async fn list_credential_variables(
         }
     };
 
-    let mut all_vars: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let mut stack: Vec<(String, String)> = folders.into_iter().map(|f| (f.scope, f.name)).collect();
-
-    while let Some((scope, path)) = stack.pop() {
-        if check_folder_access(&vault, &scope, &path, &id)
-            .await
-            .is_err()
-        {
-            continue;
-        }
-
-        let entries = vault.list_entries(&scope, &path).await.unwrap_or_default();
-        for entry_name in &entries {
-            if let Ok(entry) = vault.get_entry(&scope, &path, entry_name).await {
-                for var in crate::vault::entry_credential_variables(&entry) {
-                    *all_vars.entry(var).or_insert(0) += 1;
-                }
-            }
-        }
-
-        if let Ok(subs) = vault.list_subfolders(&scope, &path).await {
-            for sub in subs {
-                let sub_path = sub.path.unwrap_or_else(|| format!("{}/{}", path, sub.name));
-                stack.push((scope.clone(), sub_path));
-            }
-        }
-    }
+    let roots: Vec<(String, String)> = folders.into_iter().map(|f| (f.scope, f.name)).collect();
+    let all_vars = gather_credential_variables(
+        &VaultFolderSource {
+            vault: &vault,
+            id: &id,
+        },
+        roots,
+    )
+    .await;
 
     // Group by domain prefix (everything before the last _user/_password/_domain/_key suffix)
     let mut domains: std::collections::HashMap<String, Vec<serde_json::Value>> =
@@ -4769,6 +4835,81 @@ fn html_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    // ── Regression: credential-variable gathering must reach a folder the user
+    // can access even when it is nested under an inaccessible ancestor
+    // (operator "No credential variables" bug). ──
+    struct FakeFolders {
+        access: std::collections::HashSet<(String, String)>,
+        subs: std::collections::HashMap<(String, String), Vec<String>>,
+        vars: std::collections::HashMap<(String, String), Vec<String>>,
+    }
+    impl FolderSource for FakeFolders {
+        async fn accessible(&self, scope: &str, path: &str) -> bool {
+            self.access.contains(&(scope.to_string(), path.to_string()))
+        }
+        async fn subfolders(&self, scope: &str, path: &str) -> Vec<String> {
+            self.subs
+                .get(&(scope.to_string(), path.to_string()))
+                .cloned()
+                .unwrap_or_default()
+        }
+        async fn folder_var_names(&self, scope: &str, path: &str) -> Vec<String> {
+            self.vars
+                .get(&(scope.to_string(), path.to_string()))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn sp(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    #[tokio::test]
+    async fn credential_vars_reach_accessible_folder_under_inaccessible_parent() {
+        // shared/corp is NOT accessible; shared/corp/jumpcloud IS (a subfolder
+        // grant). The operator can connect that entry via the tree, so its
+        // credential variables must surface in My Credentials. Before the fix
+        // the walk short-circuited at "corp" and returned nothing.
+        let fake = FakeFolders {
+            access: std::collections::HashSet::from([sp("shared", "corp/jumpcloud")]),
+            subs: std::collections::HashMap::from([(
+                sp("shared", "corp"),
+                vec!["corp/jumpcloud".to_string()],
+            )]),
+            vars: std::collections::HashMap::from([(
+                sp("shared", "corp/jumpcloud"),
+                vec![
+                    "jumpcloud_username".to_string(),
+                    "jumpcloud_password".to_string(),
+                ],
+            )]),
+        };
+        // Seed only the top-level folder, exactly as list_all_folders does.
+        let got = gather_credential_variables(&fake, vec![sp("shared", "corp")]).await;
+        assert_eq!(got.get("jumpcloud_password").copied(), Some(1));
+        assert_eq!(got.get("jumpcloud_username").copied(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn credential_vars_not_collected_from_inaccessible_folders() {
+        // Descending past inaccessible folders must never surface THEIR
+        // variables — only pass through them to accessible descendants.
+        let fake = FakeFolders {
+            access: std::collections::HashSet::new(), // nothing accessible
+            subs: std::collections::HashMap::new(),
+            vars: std::collections::HashMap::from([(
+                sp("shared", "secret"),
+                vec!["secret_password".to_string()],
+            )]),
+        };
+        let got = gather_credential_variables(&fake, vec![sp("shared", "secret")]).await;
+        assert!(
+            got.is_empty(),
+            "must not collect variables from folders the user cannot access"
+        );
+    }
 
     #[test]
     fn test_html_escape_special_chars() {
