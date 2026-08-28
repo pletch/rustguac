@@ -117,6 +117,8 @@ pub struct RdpParams {
     pub password: Option<String>,
     pub domain: Option<String>,
     pub security: Option<String>,
+    /// RDP server keyboard layout (guacd `server-layout`). Empty = guacd default.
+    pub server_layout: Option<String>,
     pub width: u32,
     pub height: u32,
     pub dpi: u32,
@@ -340,7 +342,7 @@ pub async fn connect_and_handshake(
                 "disable-copy" => if p.disable_copy { "true" } else { "false" }.into(),
                 "disable-paste" => if p.disable_paste { "true" } else { "false" }.into(),
                 "console" => "false".into(),
-                "server-layout" => String::new(),
+                "server-layout" => p.server_layout.clone().unwrap_or_default(),
                 "timezone" => String::new(),
                 "disable-audio" => "false".into(),
                 "enable-audio-input" => "false".into(),

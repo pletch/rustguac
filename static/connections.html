@@ -515,6 +515,25 @@
                         <option value="rdp">RDP</option>
                     </select>
                 </label>
+                <label>Keyboard layout
+                    <select id="em-rdp-layout">
+                        <option value="">Server default (US)</option>
+                        <option value="en-us-qwerty">English (US)</option>
+                        <option value="en-gb-qwerty">English (UK)</option>
+                        <option value="de-de-qwertz">German</option>
+                        <option value="de-ch-qwertz">German (Swiss)</option>
+                        <option value="fr-fr-azerty">French</option>
+                        <option value="fr-be-azerty">French (Belgian)</option>
+                        <option value="fr-ch-qwertz">French (Swiss)</option>
+                        <option value="it-it-qwerty">Italian</option>
+                        <option value="es-es-qwerty">Spanish</option>
+                        <option value="pt-br-qwerty">Portuguese (Brazilian)</option>
+                        <option value="sv-se-qwerty">Swedish</option>
+                        <option value="ja-jp-qwerty">Japanese</option>
+                        <option value="tr-tr-qwerty">Turkish-Q</option>
+                        <option value="failsafe">Failsafe (Unicode)</option>
+                    </select>
+                </label>
                 <label style="margin-top:0.8em">
                     <input type="checkbox" id="em-rdp-ignore-cert" style="display:inline;width:auto;margin-right:0.4em"> Ignore certificate errors
                 </label>
@@ -3197,6 +3216,7 @@
             document.getElementById('em-rdp-password').value = '';
             document.getElementById('em-rdp-domain').value = '';
             document.getElementById('em-rdp-security').value = '';
+            document.getElementById('em-rdp-layout').value = '';
             document.getElementById('em-rdp-ignore-cert').checked = false;
             document.getElementById('em-rdp-auth-pkg').value = '';
             document.getElementById('em-rdp-kdc-url').value = '';
@@ -3345,6 +3365,7 @@
                     if (entryData.security) {
                         document.getElementById('em-rdp-security').value = entryData.security;
                     }
+                    document.getElementById('em-rdp-layout').value = entryData.server_layout || '';
                     document.getElementById('em-rdp-ignore-cert').checked = !!entryData.ignore_cert;
                     document.getElementById('em-rdp-auth-pkg').value = entryData.auth_pkg || '';
                     document.getElementById('em-rdp-kdc-url').value = entryData.kdc_url || '';
@@ -3549,6 +3570,8 @@
                 if (dom) entry.domain = dom;
                 var sec = document.getElementById('em-rdp-security').value;
                 if (sec) entry.security = sec;
+                var layout = document.getElementById('em-rdp-layout').value;
+                if (layout) entry.server_layout = layout;
                 entry.ignore_cert = document.getElementById('em-rdp-ignore-cert').checked;
                 var authPkg = document.getElementById('em-rdp-auth-pkg').value;
                 if (authPkg) entry.auth_pkg = authPkg;

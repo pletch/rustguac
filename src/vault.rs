@@ -82,6 +82,9 @@ pub struct AddressBookEntry {
     pub url: Option<String>,
     pub domain: Option<String>,
     pub security: Option<String>,
+    /// RDP server keyboard layout (guacd `server-layout`, e.g. "en-gb-qwerty").
+    /// None/empty lets guacd use its default (en-us-qwerty).
+    pub server_layout: Option<String>,
     pub ignore_cert: Option<bool>,
     pub display_name: Option<String>,
     /// Override drive/file transfer setting for this entry.
