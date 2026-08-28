@@ -2135,6 +2135,9 @@ pub async fn get_docs() -> impl IntoResponse {
 /// `inherit_from_parent` on the folder's config (a subfolder may inherit
 /// access from any ancestor whose `allowed_groups` matches the caller's
 /// OIDC groups). Admin role bypasses all checks.
+// The Err variant is an axum `Response` on purpose (callers `?` it straight
+// into a handler result), so its size is inherent, not a mistake.
+#[allow(clippy::result_large_err)]
 async fn check_folder_access(
     vault: &VaultBackends,
     scope: &str,
