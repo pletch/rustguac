@@ -9,7 +9,7 @@
 
 use russh::client;
 use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::{HashAlg, PublicKey};
+use russh::keys::{HashAlg, PublicKeyOrCertificate};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -128,8 +128,10 @@ impl client::Handler for TunnelHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        // russh 0.63 hands the callback a key-or-certificate; resolve to the key.
+        let server_public_key = server_public_key.public_key();
         let fingerprint = server_public_key.fingerprint(HashAlg::Sha256);
         let algorithm = server_public_key.algorithm();
 
@@ -162,7 +164,7 @@ impl client::Handler for TunnelHandler {
             }
         };
 
-        if *server_public_key == expected_pubkey {
+        if server_public_key == expected_pubkey {
             tracing::debug!(
                 hop = self.hop_index,
                 host = %self.jump_host,
@@ -196,8 +198,10 @@ impl client::Handler for ProbeHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
+        // russh 0.63 hands the callback a key-or-certificate; resolve to the key.
+        let server_public_key = server_public_key.public_key();
         let openssh = server_public_key
             .to_openssh()
             .map_err(|e| russh::Error::Keys(russh::keys::Error::SshKey(e)))?;
