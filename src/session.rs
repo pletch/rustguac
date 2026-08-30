@@ -50,6 +50,8 @@ pub struct CreateSessionRequest {
     // RDP fields
     pub domain: Option<String>,
     pub security: Option<String>,
+    /// RDP server keyboard layout (guacd `server-layout`).
+    pub server_layout: Option<String>,
     pub ignore_cert: Option<bool>,
     /// NLA auth package: "kerberos", "ntlm", or empty (negotiate).
     pub auth_pkg: Option<String>,
@@ -939,6 +941,7 @@ impl SessionManager {
                     password: req.password.clone(),
                     domain: req.domain.clone(),
                     security: rdp_security,
+                    server_layout: req.server_layout.clone(),
                     width,
                     height,
                     dpi,
@@ -1406,6 +1409,7 @@ impl SessionManager {
                     password: Some(vdi_password),
                     domain: None,
                     security: None,
+                    server_layout: None,
                     width,
                     height,
                     dpi,

@@ -128,6 +128,7 @@ pub async fn cmd_import_guacamole(
                 .get("domain")
                 .map(|s| apply_credential_maps(s, &cred_maps)),
             security: param_map.get("security").map(|s| s.to_string()),
+            server_layout: param_map.get("server-layout").map(|s| s.to_string()),
             ignore_cert: param_map
                 .get("ignore-cert")
                 .map(|s| s.eq_ignore_ascii_case("true")),

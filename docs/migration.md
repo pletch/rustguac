@@ -85,6 +85,7 @@ The importer maps Guacamole connection parameters to rustguac connections fields
 | `private-key` | `private_key` |
 | `domain` | `domain` |
 | `security` | `security` |
+| `server-layout` | `server_layout` |
 | `ignore-cert` | `ignore_cert` |
 | `color-depth` | `color_depth` |
 | `enable-drive` | `enable_drive` |
