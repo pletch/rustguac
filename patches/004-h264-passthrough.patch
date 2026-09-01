@@ -992,7 +992,7 @@ index 327e7c2b..c49737d7 100644
  /**
   * Callback which associates handlers specific to Guacamole with the
   * RdpgfxClientContext instance allocated by FreeRDP to deal with received
-@@ -63,13 +438,28 @@ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
+@@ -63,13 +438,45 @@ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
      RdpgfxClientContext* rdpgfx = (RdpgfxClientContext*) args->pInterface;
      rdpGdi* gdi = context->gdi;
  
@@ -1006,18 +1006,35 @@ index 327e7c2b..c49737d7 100644
          guac_client_log(client, GUAC_LOG_DEBUG, "RDPGFX channel will be used for "
                  "the RDP Graphics Pipeline Extension.");
  
-+        /* Wrap SurfaceCommand to intercept H.264 data after GDI decode.
-+         * Store the original callback per-connection to avoid clobbering
-+         * when multiple RDP sessions are active concurrently. */
 +        guac_rdp_client* rdp_client = (guac_rdp_client*) client->data;
-+        rdp_client->orig_surface_command = (void*) rdpgfx->SurfaceCommand;
-+        rdpgfx->SurfaceCommand = guac_rdp_gfx_surface_command;
 +
-+        rdp_client->orig_caps_confirm = (void*) rdpgfx->CapsConfirm;
-+        rdpgfx->CapsConfirm = guac_rdp_gfx_caps_confirm;
++        /* Installed only for a connection that asked for H.264, and only
++         * once. This handler runs again whenever the RDPGFX channel
++         * reconnects -- the display resize xrdp performs at login triggers
++         * exactly that -- and a second install reads back the wrapper the
++         * first one left behind, so orig_surface_command ends up pointing at
++         * guac_rdp_gfx_surface_command itself. Every surface command that is
++         * not H.264 then calls the wrapper from inside the wrapper and
++         * recurses until the stack is gone. H.264 commands take the
++         * skip_decode path and never make that call, so a server sending
++         * nothing but H.264 survives it, while one mixing in planar or
++         * progressive surfaces dies on the first of them. */
++        if (rdp_client->settings->enable_h264
++                && rdp_client->orig_surface_command == NULL) {
 +
-+        guac_client_log(client, GUAC_LOG_INFO,
-+                "H.264 passthrough enabled for RDPGFX channel.");
++            /* Wrap SurfaceCommand to intercept H.264 data after GDI decode.
++             * Store the original callback per-connection to avoid clobbering
++             * when multiple RDP sessions are active concurrently. */
++            rdp_client->orig_surface_command = (void*) rdpgfx->SurfaceCommand;
++            rdpgfx->SurfaceCommand = guac_rdp_gfx_surface_command;
++
++            rdp_client->orig_caps_confirm = (void*) rdpgfx->CapsConfirm;
++            rdpgfx->CapsConfirm = guac_rdp_gfx_caps_confirm;
++
++            guac_client_log(client, GUAC_LOG_INFO,
++                    "H.264 passthrough enabled for RDPGFX channel.");
++
++        }
 +    }
 +
  }
