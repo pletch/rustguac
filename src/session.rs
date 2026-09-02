@@ -479,6 +479,32 @@ fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16), Sess
     Ok((host, port))
 }
 
+/// Validate the network for the connection rustguac itself will make.
+///
+/// Without jump hosts that is the target host, so the target is checked against
+/// the protocol's allowlist. With a jump-host chain, rustguac only ever dials
+/// hop 0 -- the target's name is resolved by the last hop and need not resolve
+/// here at all, so resolving it locally would reject perfectly valid
+/// bastion-only names, and an address it did resolve to would say nothing
+/// about where the bastion connects. Hop 0 is fenced, for untrusted callers,
+/// where the chain is built (`fence_all_targets`); what lies beyond it is the
+/// bastion's to permit.
+fn check_session_network(
+    target_host: &str,
+    target_port: u16,
+    allowed: &[String],
+    jump_hops: &[tunnel::JumpHost],
+) -> Result<(), SessionError> {
+    if jump_hops.is_empty() {
+        return check_allowed_network(target_host, target_port, allowed);
+    }
+    tracing::debug!(
+        target = %target_host,
+        "Jump chain configured -- target resolved by the bastion, not checked here"
+    );
+    Ok(())
+}
+
 /// Check that a host resolves to an IP within the allowed CIDR networks.
 ///
 /// Passes if ANY resolved address is allowed. Callers that can connect by
@@ -851,11 +877,12 @@ impl SessionManager {
                 let port = req.port.unwrap_or(22);
                 let username = req.username.clone().unwrap_or_default();
 
-                let vetted = allowed_address(&hostname, port, &self.config.ssh_allowed_networks)?;
-                // With jump hosts the bastion resolves the target, so keep
-                // the name; otherwise guacd dials the address checked above.
+                // With jump hosts the bastion resolves the target, so keep the
+                // name, unchecked: resolving it here would refuse a name only
+                // the bastion can see. Otherwise guacd dials the address
+                // checked here.
                 let connect_host = if jump_hops.is_empty() {
-                    vetted.to_string()
+                    allowed_address(&hostname, port, &self.config.ssh_allowed_networks)?.to_string()
                 } else {
                     hostname.clone()
                 };
@@ -980,7 +1007,12 @@ impl SessionManager {
                 let port = req.port.unwrap_or(3389);
                 let username = req.username.clone().unwrap_or_default();
 
-                check_allowed_network(&hostname, port, &self.config.rdp_allowed_networks)?;
+                check_session_network(
+                    &hostname,
+                    port,
+                    &self.config.rdp_allowed_networks,
+                    &jump_hops,
+                )?;
 
                 tracing::info!(
                     session_id = %session_id,
@@ -1083,9 +1115,12 @@ impl SessionManager {
                 let port = req.port.unwrap_or(5900);
                 let username = req.username.clone().unwrap_or_default();
 
-                let vetted = allowed_address(&hostname, port, &self.config.vnc_allowed_networks)?;
+                // With jump hosts the bastion resolves the target, so keep the
+                // name, unchecked: resolving it here would refuse a name only
+                // the bastion can see. Otherwise guacd dials the address
+                // checked here.
                 let connect_host = if jump_hops.is_empty() {
-                    vetted.to_string()
+                    allowed_address(&hostname, port, &self.config.vnc_allowed_networks)?.to_string()
                 } else {
                     hostname.clone()
                 };
@@ -1121,7 +1156,12 @@ impl SessionManager {
                     SessionError::ValidationError("hostname is required for SPICE sessions".into())
                 })?;
                 let port = req.port.unwrap_or(5900);
-                check_allowed_network(&hostname, port, &self.config.vnc_allowed_networks)?;
+                check_session_network(
+                    &hostname,
+                    port,
+                    &self.config.vnc_allowed_networks,
+                    &jump_hops,
+                )?;
 
                 let spice = guacd::SpiceParams {
                     hostname: hostname.clone(),
@@ -1375,7 +1415,12 @@ impl SessionManager {
                         .port()
                         .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
 
-                check_allowed_network(url_host, url_port, &self.config.web_allowed_networks)?;
+                check_session_network(
+                    url_host,
+                    url_port,
+                    &self.config.web_allowed_networks,
+                    &jump_hops,
+                )?;
 
                 tracing::info!(
                     session_id = %session_id,
@@ -1615,6 +1660,29 @@ impl SessionManager {
                         p.port = final_addr.port();
                     }
                     guacd::ConnectionParams::Rdp(p) => {
+                        // guacd now dials loopback, so FreeRDP validates the
+                        // server's TLS cert against "127.0.0.1" and derives any
+                        // NLA SPN from it (TERMSRV/127.0.0.1). Neither matches
+                        // the real host, and RDP exposes no cert-name or SPN
+                        // override, so warn rather than fail obscurely later.
+                        if !p.ignore_cert {
+                            tracing::warn!(
+                                real_host = %p.hostname,
+                                tunnel_addr = %final_addr,
+                                "Tunnelled RDP with certificate checking on — FreeRDP will \
+                                 validate against the tunnel's loopback address, not the real \
+                                 host, and may reject it. Enable \"ignore certificate\" on this \
+                                 entry if the connection fails on a certificate name mismatch."
+                            );
+                        }
+                        if p.auth_pkg.as_deref() == Some("kerberos") {
+                            tracing::warn!(
+                                real_host = %p.hostname,
+                                "Tunnelled RDP with auth-pkg=kerberos — the SPN is built from \
+                                 the tunnel's loopback address, so Kerberos will not find a \
+                                 matching principal. Use negotiate or ntlm through a jump host."
+                            );
+                        }
                         p.hostname = final_addr.ip().to_string();
                         p.port = final_addr.port();
                     }
@@ -3139,6 +3207,45 @@ mod tests {
     fn test_dial_host_brackets_ipv6() {
         assert_eq!(dial_host("10.0.0.1".parse().unwrap()), "10.0.0.1");
         assert_eq!(dial_host("::1".parse().unwrap()), "[::1]");
+    }
+
+    fn hop(hostname: &str, port: u16) -> tunnel::JumpHost {
+        tunnel::JumpHost {
+            hostname: hostname.into(),
+            port,
+            username: "u".into(),
+            password: None,
+            private_key: None,
+            host_key: None,
+        }
+    }
+
+    #[test]
+    fn session_network_without_hops_checks_the_target() {
+        let cidrs = vec!["127.0.0.0/8".into()];
+        assert!(check_session_network("127.0.0.1", 3389, &cidrs, &[]).is_ok());
+        assert!(check_session_network("8.8.8.8", 3389, &cidrs, &[]).is_err());
+    }
+
+    #[test]
+    fn session_network_with_hops_skips_unresolvable_target() {
+        // The whole point of a bastion: the target name resolves only there.
+        let rdp = vec!["10.0.0.0/8".into()];
+        let hops = vec![hop("127.0.0.1", 22)];
+        assert!(
+            check_session_network("liva-z-remote", 3389, &rdp, &hops).is_ok(),
+            "bastion-only target name must not be resolved locally"
+        );
+    }
+
+    /// Hop 0 is fenced only for untrusted callers, where the chain is built
+    /// (see `fenced_jump_host_outside_allowlist_refused`); admins and
+    /// connection entries name their own bastions.
+    #[test]
+    fn session_network_leaves_hop_zero_to_the_fence() {
+        let rdp = vec!["10.0.0.0/8".into()];
+        let hops = vec![hop("192.0.2.10", 22), hop("unresolvable-second-hop", 22)];
+        assert!(check_session_network("liva-z-remote", 3389, &rdp, &hops).is_ok());
     }
 
     #[test]
