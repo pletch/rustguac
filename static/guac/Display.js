@@ -1055,8 +1055,24 @@ Guacamole.Display = function() {
          * immediately if it cannot be decoded at all -- an unblocked task is
          * required either way, or this frame and every frame behind it stalls
          * in the queue. */
-        token = decoder.decode(layer, x, y, width, height, nalData,
-                isKeyFrame, rects, unblock, view);
+        /* A throw here would otherwise leave the task blocked for good. The
+         * caller in Client.js catches the exception, so nothing fails
+         * visibly, but the display queue is ordered: that one task stops
+         * every later draw, the flush callback that acknowledges the frame
+         * never runs, and guacd drops the connection fifteen seconds later
+         * with "User is not responding". Losing one frame is the whole cost
+         * of surviving it. decoder.decode() guards its own submission, but
+         * it builds the VideoDecoder first, outside that guard. */
+        try {
+            token = decoder.decode(layer, x, y, width, height, nalData,
+                    isKeyFrame, rects, unblock, view);
+        }
+        catch (e) {
+            if (typeof console !== 'undefined')
+                console.error('[rustguac] H.264: decode submission threw,'
+                        + ' releasing frame:', e);
+            readyDuringDecode = true;
+        }
 
         decoding = false;
         if (readyDuringDecode)

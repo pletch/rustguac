@@ -673,6 +673,32 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             }
         }
 
+        /* Construction and configuration both throw synchronously on a
+         * configuration the browser will not accept, and this runs from
+         * decode(), outside its try. An escaping exception leaves the display
+         * queue's blocked draw task with nothing able to release it. Contain
+         * it here: leaving decoder null makes the next decode() take the "no
+         * decoder" path, which releases the task and drops the frame. */
+        try {
+            buildDecoder();
+        }
+        catch (e) {
+            console.error('[rustguac] H.264: decoder unavailable:',
+                    e.message);
+            decoder = null;
+            configured = false;
+        }
+
+    }
+
+    /**
+     * Constructs and configures the VideoDecoder, assigning it to `decoder`.
+     * Throws if the browser rejects the configuration.
+     *
+     * @private
+     */
+    function buildDecoder() {
+
         decoder = new VideoDecoder({
 
             output: function(frame) {
