@@ -461,6 +461,33 @@ fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16), Sess
     Ok((host, port))
 }
 
+/// Validate the network for the connection rustguac itself will make.
+///
+/// Without jump hosts that is the target host, so the target is checked against
+/// the protocol's allowlist. With a jump-host chain, rustguac only ever dials
+/// hop 0 — the target's name is resolved by the last hop (`tunnel.rs:460`) and
+/// need not resolve here at all — so hop 0 is what the allowlist must gate, and
+/// resolving the target locally would reject perfectly valid bastion-only names.
+/// Hops 1..N are reached through the previous hop's loopback listener and need
+/// no check.
+fn check_session_network(
+    target_host: &str,
+    target_port: u16,
+    allowed: &[String],
+    jump_hops: &[tunnel::JumpHost],
+    ssh_allowed: &[String],
+) -> Result<(), SessionError> {
+    let Some(hop) = jump_hops.first() else {
+        return check_allowed_network(target_host, target_port, allowed);
+    };
+    tracing::debug!(
+        jump_host = %hop.hostname,
+        target = %target_host,
+        "Jump chain configured — gating the allowlist on hop 0, target resolved remotely"
+    );
+    check_allowed_network(&hop.hostname, hop.port, ssh_allowed)
+}
+
 /// Check that a host resolves to an IP within the allowed CIDR networks.
 fn check_allowed_network(host: &str, port: u16, allowed: &[String]) -> Result<(), SessionError> {
     let networks: Vec<IpNetwork> = allowed
@@ -767,7 +794,13 @@ impl SessionManager {
                 let port = req.port.unwrap_or(22);
                 let username = req.username.clone().unwrap_or_default();
 
-                check_allowed_network(&hostname, port, &self.config.ssh_allowed_networks)?;
+                check_session_network(
+                    &hostname,
+                    port,
+                    &self.config.ssh_allowed_networks,
+                    &jump_hops,
+                    &self.config.ssh_allowed_networks,
+                )?;
 
                 tracing::info!(
                     session_id = %session_id,
@@ -887,7 +920,13 @@ impl SessionManager {
                 let port = req.port.unwrap_or(3389);
                 let username = req.username.clone().unwrap_or_default();
 
-                check_allowed_network(&hostname, port, &self.config.rdp_allowed_networks)?;
+                check_session_network(
+                    &hostname,
+                    port,
+                    &self.config.rdp_allowed_networks,
+                    &jump_hops,
+                    &self.config.ssh_allowed_networks,
+                )?;
 
                 tracing::info!(
                     session_id = %session_id,
@@ -991,7 +1030,13 @@ impl SessionManager {
                 let port = req.port.unwrap_or(5900);
                 let username = req.username.clone().unwrap_or_default();
 
-                check_allowed_network(&hostname, port, &self.config.vnc_allowed_networks)?;
+                check_session_network(
+                    &hostname,
+                    port,
+                    &self.config.vnc_allowed_networks,
+                    &jump_hops,
+                    &self.config.ssh_allowed_networks,
+                )?;
 
                 tracing::info!(
                     session_id = %session_id,
@@ -1024,7 +1069,13 @@ impl SessionManager {
                     SessionError::ValidationError("hostname is required for SPICE sessions".into())
                 })?;
                 let port = req.port.unwrap_or(5900);
-                check_allowed_network(&hostname, port, &self.config.vnc_allowed_networks)?;
+                check_session_network(
+                    &hostname,
+                    port,
+                    &self.config.vnc_allowed_networks,
+                    &jump_hops,
+                    &self.config.ssh_allowed_networks,
+                )?;
 
                 let spice = guacd::SpiceParams {
                     hostname: hostname.clone(),
@@ -1256,7 +1307,13 @@ impl SessionManager {
                         .port()
                         .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
 
-                check_allowed_network(url_host, url_port, &self.config.web_allowed_networks)?;
+                check_session_network(
+                    url_host,
+                    url_port,
+                    &self.config.web_allowed_networks,
+                    &jump_hops,
+                    &self.config.ssh_allowed_networks,
+                )?;
 
                 tracing::info!(
                     session_id = %session_id,
@@ -1497,6 +1554,29 @@ impl SessionManager {
                         p.port = final_addr.port();
                     }
                     guacd::ConnectionParams::Rdp(p) => {
+                        // guacd now dials loopback, so FreeRDP validates the
+                        // server's TLS cert against "127.0.0.1" and derives any
+                        // NLA SPN from it (TERMSRV/127.0.0.1). Neither matches
+                        // the real host, and RDP exposes no cert-name or SPN
+                        // override, so warn rather than fail obscurely later.
+                        if !p.ignore_cert {
+                            tracing::warn!(
+                                real_host = %p.hostname,
+                                tunnel_addr = %final_addr,
+                                "Tunnelled RDP with certificate checking on — FreeRDP will \
+                                 validate against the tunnel's loopback address, not the real \
+                                 host, and may reject it. Enable \"ignore certificate\" on this \
+                                 entry if the connection fails on a certificate name mismatch."
+                            );
+                        }
+                        if p.auth_pkg.as_deref() == Some("kerberos") {
+                            tracing::warn!(
+                                real_host = %p.hostname,
+                                "Tunnelled RDP with auth-pkg=kerberos — the SPN is built from \
+                                 the tunnel's loopback address, so Kerberos will not find a \
+                                 matching principal. Use negotiate or ntlm through a jump host."
+                            );
+                        }
                         p.hostname = final_addr.ip().to_string();
                         p.port = final_addr.port();
                     }
@@ -2785,6 +2865,58 @@ mod tests {
         assert!(check_allowed_network("10.1.1.1", 22, &cidrs).is_ok());
         assert!(check_allowed_network("192.168.1.1", 22, &cidrs).is_ok());
         assert!(check_allowed_network("172.16.0.1", 22, &cidrs).is_err());
+    }
+
+    fn hop(hostname: &str, port: u16) -> tunnel::JumpHost {
+        tunnel::JumpHost {
+            hostname: hostname.into(),
+            port,
+            username: "u".into(),
+            password: None,
+            private_key: None,
+            host_key: None,
+        }
+    }
+
+    #[test]
+    fn session_network_without_hops_checks_the_target() {
+        let cidrs = vec!["127.0.0.0/8".into()];
+        assert!(check_session_network("127.0.0.1", 3389, &cidrs, &[], &cidrs).is_ok());
+        assert!(check_session_network("8.8.8.8", 3389, &cidrs, &[], &cidrs).is_err());
+    }
+
+    #[test]
+    fn session_network_with_hops_skips_unresolvable_target() {
+        // The whole point of a bastion: the target name resolves only there.
+        // Previously this returned "failed to resolve host".
+        let rdp = vec!["10.0.0.0/8".into()];
+        let ssh = vec!["127.0.0.0/8".into()];
+        let hops = vec![hop("127.0.0.1", 22)];
+        assert!(
+            check_session_network("liva-z-remote", 3389, &rdp, &hops, &ssh).is_ok(),
+            "bastion-only target name must not be resolved locally"
+        );
+    }
+
+    #[test]
+    fn session_network_with_hops_still_gates_hop_zero() {
+        let rdp = vec!["10.0.0.0/8".into()];
+        let ssh = vec!["127.0.0.0/8".into()];
+        let hops = vec![hop("8.8.8.8", 22)];
+        let err = check_session_network("liva-z-remote", 3389, &rdp, &hops, &ssh);
+        assert!(
+            err.is_err(),
+            "hop 0 outside the SSH allowlist must be rejected"
+        );
+    }
+
+    #[test]
+    fn session_network_gates_only_the_first_hop() {
+        // Hops 1..N are dialled via the previous hop's loopback listener.
+        let rdp = vec!["10.0.0.0/8".into()];
+        let ssh = vec!["127.0.0.0/8".into()];
+        let hops = vec![hop("127.0.0.1", 22), hop("unresolvable-second-hop", 22)];
+        assert!(check_session_network("liva-z-remote", 3389, &rdp, &hops, &ssh).is_ok());
     }
 
     #[test]
