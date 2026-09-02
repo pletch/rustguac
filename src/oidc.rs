@@ -72,7 +72,10 @@ impl OidcState {
         }
         let client = discover_client(&self.config, &self.http_client).await?;
         *guard = Some(client.clone());
-        tracing::info!("OIDC provider metadata discovered for {}", self.config.issuer_url);
+        tracing::info!(
+            "OIDC provider metadata discovered for {}",
+            self.config.issuer_url
+        );
         Ok(client)
     }
 
@@ -384,8 +387,7 @@ pub async fn callback(
         }
     };
 
-    let claims: &CoreIdTokenClaims = match id_token.claims(&client.id_token_verifier(), &nonce)
-    {
+    let claims: &CoreIdTokenClaims = match id_token.claims(&client.id_token_verifier(), &nonce) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("OIDC ID token verification failed: {}", e);

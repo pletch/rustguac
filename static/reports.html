@@ -206,10 +206,18 @@
             return s + 's';
         }
 
+        // Render a backend timestamp in the viewer's local time. Session
+        // history comes from SQLite's datetime('now'), i.e. UTC formatted
+        // "YYYY-MM-DD HH:MM:SS" with no zone marker -- which the browser would
+        // otherwise parse as local time and display unshifted. Already-zoned
+        // values (e.g. recording mtimes, "...+00:00") pass through unchanged.
         function formatDate(iso) {
             if (!iso) return '--';
             try {
-                return new Date(iso).toLocaleString();
+                var s = iso.indexOf('T') === -1 ? iso.replace(' ', 'T') : iso;
+                if (!/[zZ]|[+-]\d\d:?\d\d$/.test(s)) s += 'Z';
+                var d = new Date(s);
+                return isNaN(d.getTime()) ? iso : d.toLocaleString();
             } catch(e) {
                 return iso;
             }
