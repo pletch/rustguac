@@ -992,7 +992,7 @@ index 327e7c2b..c49737d7 100644
  /**
   * Callback which associates handlers specific to Guacamole with the
   * RdpgfxClientContext instance allocated by FreeRDP to deal with received
-@@ -63,13 +438,58 @@ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
+@@ -63,13 +438,68 @@ static void guac_rdp_rdpgfx_channel_connected(rdpContext* context,
      RdpgfxClientContext* rdpgfx = (RdpgfxClientContext*) args->pInterface;
      rdpGdi* gdi = context->gdi;
  
@@ -1031,18 +1031,28 @@ index 327e7c2b..c49737d7 100644
 +         * for the rest of the session -- silently, since the frames still
 +         * render via GDI and guacd simply re-encodes them.
 +         *
-+         * Testing what is actually installed covers both. */
-+        if (rdp_client->settings->enable_h264
-+                && rdpgfx->SurfaceCommand != guac_rdp_gfx_surface_command) {
++         * Testing what is actually installed, per callback, covers both. */
++        if (rdp_client->settings->enable_h264) {
 +
 +            /* Wrap SurfaceCommand to intercept H.264 data after GDI decode.
 +             * Store the original callback per-connection to avoid clobbering
 +             * when multiple RDP sessions are active concurrently. */
-+            rdp_client->orig_surface_command = (void*) rdpgfx->SurfaceCommand;
-+            rdpgfx->SurfaceCommand = guac_rdp_gfx_surface_command;
++            if (rdpgfx->SurfaceCommand != guac_rdp_gfx_surface_command) {
++                rdp_client->orig_surface_command = (void*) rdpgfx->SurfaceCommand;
++                rdpgfx->SurfaceCommand = guac_rdp_gfx_surface_command;
++            }
 +
-+            rdp_client->orig_caps_confirm = (void*) rdpgfx->CapsConfirm;
-+            rdpgfx->CapsConfirm = guac_rdp_gfx_caps_confirm;
++            /* Guarded separately, because the two callbacks are restored on
++             * different schedules: gdi_graphics_pipeline_init() assigns
++             * SurfaceCommand but never touches CapsConfirm, so after a
++             * reconnect CapsConfirm is still ours while SurfaceCommand is
++             * FreeRDP's again. One shared guard therefore re-reads a wrapper
++             * we installed ourselves and points orig_caps_confirm at
++             * guac_rdp_gfx_caps_confirm. */
++            if (rdpgfx->CapsConfirm != guac_rdp_gfx_caps_confirm) {
++                rdp_client->orig_caps_confirm = (void*) rdpgfx->CapsConfirm;
++                rdpgfx->CapsConfirm = guac_rdp_gfx_caps_confirm;
++            }
 +
 +            guac_client_log(client, GUAC_LOG_INFO,
 +                    "H.264 passthrough enabled for RDPGFX channel.");
