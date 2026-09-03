@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/sol1/rustguac)](LICENSE)
 [![Docker](https://img.shields.io/docker/pulls/sol1/rustguac)](https://hub.docker.com/r/sol1/rustguac)
 
-> **Fork notice** — This is a personal fork of [sol1/rustguac](https://github.com/sol1/rustguac) maintained by [@pletch](https://github.com/pletch), with additional fixes and features layered on top of upstream **v1.9.9** (see [Fork changes](#fork-changes)). Badges and install instructions below still point at the upstream project; for canonical releases and commercial support, use the upstream repository.
+> **Fork notice** — This is a personal fork of [sol1/rustguac](https://github.com/sol1/rustguac) maintained by [@pletch](https://github.com/pletch), with additional fixes and features layered on top of upstream **v1.9.10** (see [Fork changes](#fork-changes)). Badges and install instructions below still point at the upstream project; for canonical releases and commercial support, use the upstream repository.
 
 A lightweight Rust replacement for the Apache Guacamole Java webapp. Browser-based SSH, RDP, VNC, SPICE, Proxmox VE consoles, web browsing, and VDI desktop containers through [guacd](https://github.com/apache/guacamole-server).
 
@@ -13,7 +13,7 @@ No Java. No Tomcat. Single binary + guacd.
 
 ## Fork changes
 
-This fork layers the following on top of upstream **v1.9.9**. Everything here
+This fork layers the following on top of upstream **v1.9.10**. Everything here
 is in `main-fork`; the guacd-side changes live in `patches/` and are applied by
 the build scripts.
 
