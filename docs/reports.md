@@ -65,8 +65,9 @@ All endpoints require authentication (API key, user token, or OIDC session cooki
 | `user` | Filter by username (partial match) |
 | `entry` | Filter by connections entry name (partial match) |
 | `type` | Filter by session type: `ssh`, `rdp`, `vnc`, `web` |
-| `from` | Start date filter (ISO 8601, e.g. `2025-01-01T00:00:00Z`) |
-| `to` | End date filter (ISO 8601) |
+| `from` | Start date filter: a whole day (`2025-01-01`) or an instant (`2025-01-01T00:00:00Z`) |
+| `to` | End date filter, same formats. A bare date includes that whole day |
+| `tz_offset` | Minutes to add to local time to reach UTC (JavaScript's `Date.getTimezoneOffset()`). Makes a zoneless `from`/`to` mean a local day; absent means UTC |
 | `limit` | Page size (default 100, max 1000; ignored for CSV export) |
 | `offset` | Page offset (default 0; ignored for CSV export) |
 
@@ -74,6 +75,24 @@ All endpoints require authentication (API key, user token, or OIDC session cooki
 
 ```bash
 curl -H "Authorization: Bearer YOUR_API_KEY" \
-  "https://console.example.com/api/reports/sessions/csv?type=ssh&from=2025-02-01T00:00:00Z&to=2025-03-01T00:00:00Z" \
+  "https://console.example.com/api/reports/sessions/csv?type=ssh&from=2025-02-01&to=2025-02-28" \
   -o ssh-sessions.csv
 ```
+
+Both bounds are inclusive, so `to=2025-02-28` covers all of the 28th.
+
+### Time zones
+
+Session history is stored in UTC. The reports page renders it in the browser's
+local time, and the CSV export writes RFC 3339 with an explicit `Z` so a
+spreadsheet cannot mistake it for local time.
+
+Date filters are read as UTC by default, which is what a script wants. Pass
+`tz_offset` to have zoneless values read as *local* days instead — matching the
+times shown on the page. A caller in UTC+10 asking for the 4th sends
+`from=2026-09-04&to=2026-09-04&tz_offset=-600`, which selects
+`2026-09-03 14:00:00` through `2026-09-04 13:59:59` UTC. Values carrying their
+own zone (`...Z` or `...+10:00`) are converted from it and ignore `tz_offset`.
+
+An unreadable `from`/`to` is now a `400` rather than a filter that silently
+matched the wrong rows.

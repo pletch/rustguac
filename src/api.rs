@@ -1033,8 +1033,77 @@ pub struct ReportQuery {
     pub session_type: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// The caller's `Date.getTimezoneOffset()`: minutes to add to local time to
+    /// reach UTC. Makes a zoneless `from`/`to` mean a *local* day, matching the
+    /// local times the Reports page displays. Absent (the scripted case) means
+    /// UTC, so existing callers are unaffected.
+    pub tz_offset: Option<i32>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+/// Normalize a report date filter into the shape `session_history` stores
+/// ("YYYY-MM-DD HH:MM:SS", UTC), so the string comparison in SQL means what the
+/// caller intended. Returns `Err` with the offending value if it can't be read.
+///
+/// A bare "YYYY-MM-DD" is a whole day: its first second for the lower bound,
+/// its last for the upper, so `to=2026-09-04` includes the 4th rather than
+/// excluding it (the DB values sort after a bare date, so they used to fall
+/// outside). Zoneless values are shifted by `tz_offset_mins`; a value carrying
+/// its own zone is converted from that and ignores the offset.
+fn normalize_report_bound(
+    value: &str,
+    tz_offset_mins: i32,
+    end_of_day: bool,
+) -> Result<String, String> {
+    const STORED: &str = "%Y-%m-%d %H:%M:%S";
+    let v = value.trim();
+    if v.is_empty() {
+        return Err(value.to_string());
+    }
+
+    // Zoned: RFC 3339 / ISO 8601 with Z or an explicit offset.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
+        return Ok(dt.with_timezone(&chrono::Utc).format(STORED).to_string());
+    }
+
+    let local: chrono::NaiveDateTime =
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(v, "%Y-%m-%d") {
+            let time = if end_of_day {
+                chrono::NaiveTime::from_hms_opt(23, 59, 59)
+            } else {
+                chrono::NaiveTime::from_hms_opt(0, 0, 0)
+            };
+            d.and_time(time.expect("literal time is valid"))
+        } else if let Some(dt) = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M"]
+            .iter()
+            .find_map(|f| chrono::NaiveDateTime::parse_from_str(v, f).ok())
+        {
+            dt
+        } else {
+            return Err(value.to_string());
+        };
+
+    // A local wall clock plus its offset-to-UTC is the UTC instant.
+    let utc = local + chrono::Duration::minutes(tz_offset_mins as i64);
+    Ok(utc.format(STORED).to_string())
+}
+
+/// Read `from`/`to` off a report query as stored-format UTC bounds, or name the
+/// parameter that could not be parsed.
+fn report_bounds(q: &ReportQuery) -> Result<(Option<String>, Option<String>), String> {
+    // Beyond any real zone (UTC-12..UTC+14), so a junk value can't shift a
+    // filter into a different year.
+    let tz = q.tz_offset.unwrap_or(0).clamp(-840, 840);
+    let from = match q.from.as_deref() {
+        Some(v) => Some(normalize_report_bound(v, tz, false).map_err(|v| format!("from={}", v))?),
+        None => None,
+    };
+    let to = match q.to.as_deref() {
+        Some(v) => Some(normalize_report_bound(v, tz, true).map_err(|v| format!("to={}", v))?),
+        None => None,
+    };
+    Ok((from, to))
 }
 
 /// GET /api/reports/sessions — Paginated session history with filters. Poweruser+ only.
@@ -1056,13 +1125,23 @@ pub async fn report_sessions(
     }
     let limit = q.limit.unwrap_or(100).min(1000);
     let offset = q.offset.unwrap_or(0);
+    let (from, to) = match report_bounds(&q) {
+        Ok(b) => b,
+        Err(bad) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unparseable date filter: {}", bad)})),
+            )
+                .into_response();
+        }
+    };
     match db::query_session_history(
         &database,
         q.user.as_deref(),
         q.entry.as_deref(),
         q.session_type.as_deref(),
-        q.from.as_deref(),
-        q.to.as_deref(),
+        from.as_deref(),
+        to.as_deref(),
         limit,
         offset,
     ) {
@@ -1095,13 +1174,23 @@ pub async fn report_sessions_csv(
         )
             .into_response();
     }
+    let (from, to) = match report_bounds(&q) {
+        Ok(b) => b,
+        Err(bad) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("unparseable date filter: {}", bad)})),
+            )
+                .into_response();
+        }
+    };
     match db::query_session_history(
         &database,
         q.user.as_deref(),
         q.entry.as_deref(),
         q.session_type.as_deref(),
-        q.from.as_deref(),
-        q.to.as_deref(),
+        from.as_deref(),
+        to.as_deref(),
         100_000,
         0,
     ) {
@@ -4946,6 +5035,61 @@ fn html_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn report_bounds_read_a_bare_date_as_a_whole_local_day() {
+        // Sydney in September: UTC+10, so getTimezoneOffset() is -600.
+        let tz = -600;
+        assert_eq!(
+            normalize_report_bound("2026-09-04", tz, false).unwrap(),
+            "2026-09-03 14:00:00"
+        );
+        assert_eq!(
+            normalize_report_bound("2026-09-04", tz, true).unwrap(),
+            "2026-09-04 13:59:59"
+        );
+        // No offset given (the scripted case) means UTC, unchanged behaviour.
+        assert_eq!(
+            normalize_report_bound("2026-09-04", 0, false).unwrap(),
+            "2026-09-04 00:00:00"
+        );
+    }
+
+    #[test]
+    fn report_bounds_convert_zoned_values_and_reject_junk() {
+        // A value carrying its own zone is converted from it, offset ignored.
+        assert_eq!(
+            normalize_report_bound("2026-09-04T02:14:07Z", -600, false).unwrap(),
+            "2026-09-04 02:14:07"
+        );
+        assert_eq!(
+            normalize_report_bound("2026-09-04T12:14:07+10:00", 0, false).unwrap(),
+            "2026-09-04 02:14:07"
+        );
+        // Zoneless datetimes are shifted like a bare date.
+        assert_eq!(
+            normalize_report_bound("2026-09-04T12:14:07", -600, false).unwrap(),
+            "2026-09-04 02:14:07"
+        );
+        assert!(normalize_report_bound("last tuesday", 0, false).is_err());
+        assert!(normalize_report_bound("", 0, false).is_err());
+    }
+
+    #[test]
+    fn report_bounds_clamp_a_nonsense_offset() {
+        let q = ReportQuery {
+            user: None,
+            entry: None,
+            session_type: None,
+            from: Some("2026-09-04".into()),
+            to: None,
+            tz_offset: Some(999_999),
+            limit: None,
+            offset: None,
+        };
+        // Clamped to +840, not applied verbatim.
+        assert_eq!(report_bounds(&q).unwrap().0.unwrap(), "2026-09-04 14:00:00");
+    }
 
     #[test]
     fn mark_utc_tags_zoneless_sqlite_timestamps() {
