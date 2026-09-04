@@ -269,7 +269,18 @@ async fn handle_ws(
 
     // Run the bidirectional proxy
     let start = Instant::now();
-    let proxy_outcome = proxy_ws_guacd(ws, guacd_stream, recording_file, cancel).await;
+    let frame_stats = manager
+        .frame_stats(session_id)
+        .await
+        .unwrap_or_else(|| Arc::new(crate::frame_stats::FrameStats::new()));
+    let proxy_outcome = proxy_ws_guacd(
+        ws,
+        guacd_stream,
+        recording_file,
+        cancel,
+        frame_stats.clone(),
+    )
+    .await;
     let elapsed = start.elapsed();
     let server_disconnected = proxy_outcome.server_disconnected;
     let proxy_result = proxy_outcome.result;
@@ -378,6 +389,25 @@ async fn handle_ws(
         }
     }
 
+    // Frame telemetry summary. Logged at session end so every connection
+    // leaves a record of what the browser could actually keep up with, without
+    // a periodic task per session.
+    let stats = frame_stats.snapshot();
+    if stats.frames_sent > 0 {
+        tracing::info!(
+            session_id = %session_id,
+            frames_sent = stats.frames_sent,
+            frames_acked = stats.frames_acked,
+            avg_lag_ms = stats.avg_lag_ms,
+            max_lag_ms = stats.max_lag_ms,
+            max_outstanding = stats.max_outstanding,
+            h264_frames = stats.h264_frames,
+            h264_keyframes = stats.h264_keyframes,
+            bytes_to_browser = stats.bytes_to_browser,
+            "Frame telemetry"
+        );
+    }
+
     tracing::info!(session_id = %session_id, client_ip = %client_addr, "Session disconnected");
 }
 
@@ -387,6 +417,7 @@ async fn proxy_ws_guacd(
     guacd: GuacdStream,
     recording_file: Option<tokio::fs::File>,
     cancel: CancellationToken,
+    frame_stats: Arc<crate::frame_stats::FrameStats>,
 ) -> ProxyOutcome {
     let (guacd_read, guacd_write) = tokio::io::split(guacd);
     let (ws_write, ws_read) = ws.split();
@@ -405,15 +436,16 @@ async fn proxy_ws_guacd(
     let recording_clone = recording.clone();
     let sd_flag = server_disconnected.clone();
     let ws_sink_g = ws_sink.clone();
-    let guacd_to_browser =
-        tokio::spawn(
-            async move { guacd_to_ws(guacd_read, ws_sink_g, recording_clone, sd_flag).await },
-        );
+    let stats_g = frame_stats.clone();
+    let guacd_to_browser = tokio::spawn(async move {
+        guacd_to_ws(guacd_read, ws_sink_g, recording_clone, sd_flag, stats_g).await
+    });
 
     // browser → guacd
     let ws_sink_b = ws_sink.clone();
+    let stats_b = frame_stats.clone();
     let browser_to_guacd =
-        tokio::spawn(async move { ws_to_guacd(ws_read, guacd_write, ws_sink_b).await });
+        tokio::spawn(async move { ws_to_guacd(ws_read, guacd_write, ws_sink_b, stats_b).await });
 
     // Wait for either direction to finish, or cancellation
     let result = tokio::select! {
@@ -467,6 +499,7 @@ async fn guacd_to_ws(
     ws: WsSink,
     recording: Option<Arc<tokio::sync::Mutex<tokio::fs::File>>>,
     server_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    frame_stats: Arc<crate::frame_stats::FrameStats>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 65536];
     let mut carry: Vec<u8> = Vec::new();
@@ -520,6 +553,11 @@ async fn guacd_to_ws(
             server_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
+        // Frame telemetry is taken here, on a chunk that is guaranteed to end
+        // at an instruction boundary, and before the send so a slow socket is
+        // counted as lag rather than hiding it.
+        frame_stats.observe_to_browser(&text);
+
         let mut sink = ws.lock().await;
         sink.send(Message::Text(text.into())).await?;
     }
@@ -539,6 +577,7 @@ async fn ws_to_guacd(
     mut ws_read: futures_util::stream::SplitStream<WebSocket>,
     mut guacd: tokio::io::WriteHalf<GuacdStream>,
     ws_sink: WsSink,
+    frame_stats: Arc<crate::frame_stats::FrameStats>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     while let Some(msg) = ws_read.next().await {
         let msg = msg?;
@@ -560,6 +599,8 @@ async fn ws_to_guacd(
                         }
                     }
                 }
+
+                frame_stats.observe_to_guacd(&text);
 
                 // Log clipboard instructions from browser → guacd
                 if text.contains(".clipboard,") {

@@ -4,6 +4,7 @@ mod browser;
 mod config;
 mod db;
 mod drive;
+mod frame_stats;
 mod guacd;
 mod import;
 mod migrate;
@@ -984,6 +985,10 @@ async fn run_server(config: Config, database: Db) {
             put(api::put_session_thumbnail).get(api::get_session_thumbnail),
         )
         .route("/api/sessions/{id}/shadow", post(api::shadow_session))
+        .route(
+            "/api/sessions/{id}/frame-stats",
+            get(api::get_session_frame_stats),
+        )
         .route(
             "/api/vdi/containers/{name}/thumbnail",
             get(api::get_vdi_container_thumbnail),

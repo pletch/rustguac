@@ -185,6 +185,47 @@ pub async fn list_sessions(
 
 /// GET /api/sessions/:id — Get session info.
 /// Non-admins can only inspect their own sessions (GitHub #102).
+/// Live frame telemetry for a session — the render lag and backlog the
+/// browser is actually reporting, plus H.264 passthrough volume.
+///
+/// Visible to the session owner and to admins, on the same terms as
+/// `get_session`: a session you cannot see reads as absent rather than
+/// forbidden, so the endpoint cannot be used to probe for session ids.
+pub async fn get_session_frame_stats(
+    State(manager): State<AppState>,
+    Path(id): Path<Uuid>,
+    identity: Option<Extension<AuthIdentity>>,
+) -> impl IntoResponse {
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "session not found" })),
+        )
+            .into_response()
+    };
+
+    let Some(info) = manager.get_session(id).await else {
+        return not_found();
+    };
+
+    let is_admin = identity
+        .as_ref()
+        .map(|Extension(id)| id.has_role("admin"))
+        .unwrap_or(false);
+    let is_owner = identity
+        .as_ref()
+        .map(|Extension(ident)| info.created_by == ident.display_name())
+        .unwrap_or(false);
+    if !is_admin && !is_owner {
+        return not_found();
+    }
+
+    match manager.frame_stats(id).await {
+        Some(stats) => (StatusCode::OK, Json(json!(stats.snapshot()))).into_response(),
+        None => not_found(),
+    }
+}
+
 pub async fn get_session(
     State(manager): State<AppState>,
     Path(id): Path<Uuid>,
