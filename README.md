@@ -43,14 +43,24 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   queue (`Display.drawH264`) rather than straight from the decoder's output
   callback. Upstream draws on completion, so on a server mixing H.264 with
   other codecs a late frame repaints stale video over newer content.
-- **Frame lifetime fixes** — decoded frames are snapshotted synchronously and
-  closed on every path out of the decoder callback. Holding a `VideoFrame`
-  across a promise exhausts the hardware decoder's output-surface pool as soon
-  as the display queue falls behind, which shows up as brief video freezes.
-  The decoder is also rebuilt after a terminal error rather than being left
-  closed, which otherwise blanks the session permanently.
-- **Latency tuning** — bounded decode pipeline with sync gating, so stream lag
-  cannot grow without limit.
+- **Frame lifetime** — ordered drawing defers the paint, so a decoded frame is
+  snapshotted to a canvas and closed before its draw task runs. Holding a
+  `VideoFrame` across a promise exhausts the hardware decoder's output-surface
+  pool as soon as the display queue falls behind, which shows up as brief video
+  freezes. (Upstream draws straight from the output callback, so it has no
+  frame to hold open — and no frame ordering either.)
+- **Recovery from a terminal decode error** — the decoder is rebuilt and frames
+  held until the next keyframe. Upstream decrements its counter and logs, but
+  the `VideoDecoder` is closed by then and `decode()` returns early forever
+  after, so the session stays blank until the user reconnects.
+- **Decode pipeline depth** — upstream's sync gate waits for `pendingDecodes`
+  to reach zero, serializing network RTT against decode time on every frame.
+  This fork allows a bounded depth of 2 so the two overlap, with a 200ms
+  safety timeout and a rate-limited warning, since logging from a struggling
+  decoder makes the latency it reports worse.
+- **Codec configuration** — the decoder is configured as `avc1.640029` (High,
+  4.1) with `hardwareAcceleration: 'prefer-hardware'`, matching what xrdp and
+  Windows actually send. Upstream declares `avc1.42001f` (Baseline, 3.1).
 - **Survives an RDPGFX reconnect** — the SurfaceCommand and CapsConfirm
   wrappers are installed once, only for connections with H.264 enabled, and
   each is guarded on its own callback. They are reinstalled when the channel is
