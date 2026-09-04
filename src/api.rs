@@ -2749,8 +2749,10 @@ pub async fn ab_connect_entry(
 
     let (width, height, desktop_scale) = if native_factor > 1.0 {
         (
-            req.width.map(|w| ((w as f64 * native_factor).round() as u32) & !0x7),
-            req.height.map(|h| (h as f64 * native_factor).round() as u32),
+            req.width
+                .map(|w| ((w as f64 * native_factor).round() as u32) & !0x7),
+            req.height
+                .map(|h| (h as f64 * native_factor).round() as u32),
             Some((native_factor * 100.0).round() as u32),
         )
     } else {
