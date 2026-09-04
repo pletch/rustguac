@@ -275,3 +275,62 @@ the session (for example via `xfconf-query -c xsettings -p
 **Client side.** `static/client.html` sends `desktop_scale` on the connect
 request, and only when it actually asked for a device-pixel framebuffer — see
 `localStorage.rgNativeRes`, which is off by default.
+
+## 012-rdpgfx-frame-ack-backpressure.patch
+
+**Problem:** H.264 passthrough has no adaptive quality, because guacd is not
+the encoder.
+
+Everywhere else it is. `guac_display_suggest_quality()` scales JPEG/WebP
+quality from 90 down to 30 as client processing lag rises from 20ms to 80ms,
+and the render thread waits that lag out before starting the next frame
+(`display-worker.c`, `display-render-thread.c`). Both read the same signal: the
+round trip of the Guacamole `sync` handshake.
+
+In passthrough guacd re-encodes nothing, so there is no quality to lower. The
+RDP server keeps sending at whatever rate it chose, frames pile up on the
+layer's H.264 queue, and at 120 frames `guac_display_layer_set_h264()` drops
+the oldest. A drop breaks the decoder's reference chain, so every later frame
+is discarded until the next IDR — the overload surfaces as a stall seconds
+after the moment that caused it, and costs far more than slowing down would
+have.
+
+**Mechanism:** the party that *can* slow down is the server, and MS-RDPEGFX
+already provides the lever. A server applies flow control to unacknowledged
+graphics frames, and FreeRDP sends `RDPGFX_FRAME_ACKNOWLEDGE` from
+`rdpgfx_recv_end_frame_pdu()` immediately after `context->EndFrame` returns.
+Wrapping `EndFrame` therefore controls when the acknowledgement goes out.
+
+Patch 004 found this by accident and from the wrong side: queueing frames under
+the display-level `pending_frame.lock` blocked the same thread, and the
+resulting throttle looked like a low source frame rate rather than a stall in
+guacd. This patch does it deliberately and with a bound.
+
+| File | Change |
+|------|--------|
+| `src/libguac/guacamole/display.h` | Declare `guac_display_layer_h264_backlog()` |
+| `src/libguac/display-layer.c` | Implement it — queue length under `h264_queue_lock` |
+| `src/protocols/rdp/rdp.h` | Add `orig_end_frame` |
+| `src/protocols/rdp/channels/rdpgfx.c` | Wrap `EndFrame`, hold the ack while clients are behind |
+
+**Tuning.** Acknowledgement is held while more than `GUAC_RDP_H264_BACKLOG_TARGET`
+(4) frames are queued — a little over 60ms of video at 60fps, enough to absorb
+an ordinary burst without the server noticing, and far short of the 120-frame
+drop cap. The wait is capped at `GUAC_RDP_H264_ACK_MAX_DELAY` (500ms) and
+abandoned if the client stops running: an unbounded stall is indistinguishable
+to the server from a client that has gone away, so a pathologically slow client
+must cost frame rate rather than the session. The render thread drains the
+queue on its own, so blocking here does not prevent the backlog from clearing.
+
+**Installed like `SurfaceCommand`**, by testing what is currently installed
+rather than a once-only flag: `gdi_graphics_pipeline_init()` reinstalls its own
+`EndFrame` on every RDPGFX reconnect (xrdp's login resize causes one), so a
+once-only guard would silently stop applying backpressure for the rest of the
+session.
+
+**Scope — this throttles frame rate, not bitrate.** Whether the server also
+lowers its quantiser is a decision its own encoder makes from its own view of
+the link, and that view is of the guacd↔server leg, which is typically a LAN.
+Influencing it means answering the MS-RDPBCGR network auto-detect PDUs with an
+end-to-end figure instead (`rdpAutoDetect`'s `RTTMeasureResponse` and
+`ClientBandwidthMeasureResult` are hookable the same way) — a separate patch.
