@@ -43,8 +43,6 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   queue (`Display.drawH264`) rather than straight from the decoder's output
   callback. Upstream draws on completion, so on a server mixing H.264 with
   other codecs a late frame repaints stale video over newer content.
-- **No environment variables** — the per-connection `enable-h264` checkbox is
-  the only switch. Upstream's build is configured through env vars.
 - **Frame lifetime fixes** — decoded frames are snapshotted synchronously and
   closed on every path out of the decoder callback. Holding a `VideoFrame`
   across a promise exhausts the hardware decoder's output-surface pool as soon
