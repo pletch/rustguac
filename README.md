@@ -53,6 +53,18 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   closed, which otherwise blanks the session permanently.
 - **Latency tuning** — bounded decode pipeline with sync gating, so stream lag
   cannot grow without limit.
+- **Survives an RDPGFX reconnect** — the SurfaceCommand and CapsConfirm
+  wrappers are installed once, only for connections with H.264 enabled, and
+  each is guarded on its own callback. They are reinstalled when the channel is
+  re-opened, because FreeRDP restores its own handlers on a reconnect — which
+  xrdp triggers at the login resize, so without this a session delivered one
+  keyframe and then went silent.
+- **Recording playback** — the recordings player loads the H.264 decoder and
+  the 4:4:4 shader, so sessions recorded with passthrough replay as video
+  instead of a black display.
+- **Runtime overrides for the chroma path** — `h264Chroma444` (off falls back
+  to 4:2:0) and `h264ChromaFilter` (off, or a 0-255 threshold; default 30),
+  settable as a window global, query param, or `localStorage` key.
 
 Measured with 1080p video playing, guacd session CPU over 30s:
 
@@ -82,6 +94,10 @@ Measured with 1080p video playing, guacd session CPU over 30s:
 - **Per-entry Wake-on-LAN** — sends a magic packet via guacd and polls the
   target before connecting (SSH/RDP/VNC); configurable MAC, broadcast address,
   UDP port, and wait time.
+- **Jump-host-aware network allowlist** — with a jump chain configured, the
+  per-protocol CIDR allowlist is checked against hop 0, the only host rustguac
+  itself dials. The target's name is resolved by the last hop, so resolving it
+  locally rejected valid bastion-only names outright.
 
 ### OIDC
 
@@ -112,6 +128,19 @@ Measured with 1080p video playing, guacd session CPU over 30s:
 - [`docs/xrdp-dpi-scaling.md`](docs/xrdp-dpi-scaling.md) — what an xrdp patch
   would need in order to act on the DPI scale factor it already parses,
   validates and then discards.
+- [`BUILD-CONTAINER.md`](BUILD-CONTAINER.md) — building, installing and
+  updating guacd and rustguac on a deployment container, against the pinned
+  guacamole-server commit the patches are verified on.
+- **Installer**: guacd's environment lives in `/opt/rustguac/guacd.env`, which
+  is created once and never overwritten, so `GUACD_LOG_LEVEL` survives a
+  reinstall — the unit files themselves are rewritten every run. The installer
+  also warns about existing systemd drop-ins, which silently override the unit
+  it just wrote.
+- **Client-side H.264 diagnostics** — `rustguacFindBlack()` locates black
+  regions on the display, `rustguacDumpDraws()` reports what painted a given
+  pixel from a ring of recent draws, and `rustguacDumpBlack()` does both in one
+  call; `?debug=nofit` suppresses resize requests so opening DevTools cannot
+  repaint the region being inspected.
 - `contrib/measure-guacd-cpu.sh`, `contrib/setup-rdp-performance.ps1`.
 
 ### Merged upstream

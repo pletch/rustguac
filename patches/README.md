@@ -98,7 +98,7 @@ An AVC444 picture is split across two views inside **one** H.264 sequence — Fr
 | 1 | AVC444 auxiliary chroma, v1 layout | no |
 | 2 | AVC444 auxiliary chroma, v2 layout | no |
 
-The client decodes every view and draws only view 0, so chroma renders 4:2:0 rather than 4:4:4. On the test host auxiliary views were 3.6% of frames, so the visible cost is small.
+The client decodes every view and draws view 0, combining the auxiliary view's chroma into it for full 4:4:4 (`static/guac/Yuv444.js`); it falls back to drawing view 0 alone, at 4:2:0 chroma, where WebGL2 is unavailable. On the test host auxiliary views were 3.6% of frames.
 
 **Threading.** The frame queue has its own lock, deliberately **not** the display's `pending_frame.lock`. The render thread holds that one across the whole flush including image encoding, so queueing under it blocked the protocol thread — which for RDP is the thread that sends `RDPGFX_FRAME_ACKNOWLEDGE`, and a server throttles when frames go unacknowledged. The NAL copy happens before locking, and the flush detaches the queue and sends outside it.
 
