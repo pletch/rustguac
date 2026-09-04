@@ -1106,7 +1106,7 @@ pub async fn report_sessions_csv(
         0,
     ) {
         Ok((rows, _total)) => {
-            let mut csv = String::from("Session ID,Type,Hostname,Username,User,Entry,Folder,Started,Ended,Duration (secs),Status,Recording\n");
+            let mut csv = String::from("Session ID,Type,Hostname,Username,User,Entry,Folder,Started (UTC),Ended (UTC),Duration (secs),Status,Recording\n");
             for row in &rows {
                 let fields = [
                     row["session_id"].as_str().unwrap_or(""),
@@ -1119,14 +1119,18 @@ pub async fn report_sessions_csv(
                         .or_else(|| row["address_book_entry"].as_str())
                         .unwrap_or(""),
                     row["address_book_folder"].as_str().unwrap_or(""),
-                    row["started_at"].as_str().unwrap_or(""),
-                    row["ended_at"].as_str().unwrap_or(""),
                 ];
                 for (i, f) in fields.iter().enumerate() {
                     if i > 0 {
                         csv.push(',');
                     }
                     csv_escape_into(&mut csv, f);
+                }
+                // Timestamps, marked as UTC. The DB stores them zoneless, which
+                // a spreadsheet reads as local time and silently shifts.
+                for key in ["started_at", "ended_at"] {
+                    csv.push(',');
+                    csv_escape_into(&mut csv, &mark_utc(row[key].as_str().unwrap_or("")));
                 }
                 // duration_secs (numeric)
                 csv.push(',');
@@ -1161,6 +1165,18 @@ pub async fn report_sessions_csv(
 }
 
 /// Escape a field for CSV output: wrap in double quotes if it contains commas, quotes, or newlines.
+/// Tag a zoneless SQLite timestamp ("YYYY-MM-DD HH:MM:SS", always UTC via
+/// `datetime('now')`) as RFC 3339 UTC. Values that already carry a zone, and
+/// anything that doesn't match the expected shape, pass through unchanged.
+fn mark_utc(ts: &str) -> String {
+    let bytes = ts.as_bytes();
+    if bytes.len() == 19 && bytes[10] == b' ' {
+        format!("{}T{}Z", &ts[..10], &ts[11..])
+    } else {
+        ts.to_string()
+    }
+}
+
 fn csv_escape_into(buf: &mut String, field: &str) {
     if field.contains(',') || field.contains('"') || field.contains('\n') {
         buf.push('"');
@@ -4928,6 +4944,18 @@ fn html_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn mark_utc_tags_zoneless_sqlite_timestamps() {
+        assert_eq!(mark_utc("2026-09-04 02:14:07"), "2026-09-04T02:14:07Z");
+        // Already zoned, or not the SQLite shape at all: left alone.
+        assert_eq!(mark_utc("2026-09-04T02:14:07Z"), "2026-09-04T02:14:07Z");
+        assert_eq!(
+            mark_utc("2026-09-04T02:14:07+00:00"),
+            "2026-09-04T02:14:07+00:00"
+        );
+        assert_eq!(mark_utc(""), "");
+    }
 
     // ── Regression: credential-variable gathering must reach a folder the user
     // can access even when it is nested under an inaccessible ancestor
