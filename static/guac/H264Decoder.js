@@ -134,12 +134,26 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var flushResolvers = [];
 
     /**
-     * If the backlog has drained, fire and clear all flush resolvers.
+     * If the backlog is back within the pipeline depth, fire and clear all
+     * flush resolvers.
+     *
+     * The threshold has to be the one waitForPending() gates on. Releasing
+     * only at zero meant that once the backlog exceeded the depth it had to
+     * drain completely before a sync could go out, and a session decoding
+     * continuously never reaches zero -- so every sync waited out its full
+     * timeout instead, reporting that much processing lag however fast the
+     * client was actually going. guacd paces frames against that figure, so
+     * the session runs slow while the client is not in fact behind.
+     *
+     * It shows up first on AVC444, where a picture is two access units and
+     * the backlog is therefore twice as deep for the same frame rate, far
+     * less likely to touch zero between frames -- which looks like AVC444
+     * being expensive rather than like a threshold mismatch.
      *
      * @private
      */
     function resolveIfIdle() {
-        if (pendingDecodes <= 0 && flushResolvers.length > 0) {
+        if (pendingDecodes <= MAX_PIPELINE_DEPTH && flushResolvers.length > 0) {
             var resolvers = flushResolvers;
             flushResolvers = [];
             for (var i = 0; i < resolvers.length; i++)
