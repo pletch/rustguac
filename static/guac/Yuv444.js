@@ -345,14 +345,14 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
          * renders visibly flatter than the 4:2:0 one beside it -- the same
          * session, two different colours, depending only on which codec the
          * server happened to choose. setColorSpace() supplies these. */
-        '    float y = (Y - uRange.x) * uRange.y;',
+        '    float luma = (Y - uRange.x) * uRange.y;',
         '    float u = (U - 0.50196078) * uCScale;',  /* 128/255 */
         '    float v = (V - 0.50196078) * uCScale;',
 
         '    vec3 rgb = vec3(',
-        '        y + uCoef.x * v,',
-        '        y - uCoef.y * u - uCoef.z * v,',
-        '        y + uCoef.w * u);',
+        '        luma + uCoef.x * v,',
+        '        luma - uCoef.y * u - uCoef.z * v,',
+        '        luma + uCoef.w * u);',
 
         '    fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);',
         '}'
