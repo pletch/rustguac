@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod binary_blob;
 mod browser;
 mod config;
 mod db;
