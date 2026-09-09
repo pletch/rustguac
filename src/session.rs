@@ -329,6 +329,10 @@ pub struct Session {
     /// Surfaced in `SessionInfo` so client.html can auto-hide the
     /// clipboard/files side tabs.
     pub autohide_side_tabs: bool,
+    /// Live frame timing for this session, shared with its WebSocket proxy.
+    /// Held as an `Arc` so the proxy can record into it without holding the
+    /// session lock on every chunk.
+    pub frame_stats: Arc<crate::frame_stats::FrameStats>,
 }
 
 /// A short-lived viewer token issued by an admin to shadow an active session.
@@ -1804,6 +1808,7 @@ impl SessionManager {
             display_scale: req.display_scale,
             fullscreen_on_connect: req.fullscreen_on_connect.unwrap_or(false),
             autohide_side_tabs: req.autohide_side_tabs.unwrap_or(false),
+            frame_stats: Arc::new(crate::frame_stats::FrameStats::new()),
         };
 
         let info = session.info();
@@ -2089,6 +2094,14 @@ impl SessionManager {
     }
 
     /// Get session type and container metadata for a session (used for VDI cleanup).
+    /// Live frame telemetry for a session, if it still exists.
+    pub async fn frame_stats(&self, id: Uuid) -> Option<Arc<crate::frame_stats::FrameStats>> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(&id)?;
+        let session = session.lock().await;
+        Some(session.frame_stats.clone())
+    }
+
     pub async fn get_vdi_info(
         &self,
         id: Uuid,
@@ -2711,6 +2724,7 @@ mod tests {
             display_scale: None,
             fullscreen_on_connect: false,
             autohide_side_tabs: false,
+            frame_stats: Arc::new(crate::frame_stats::FrameStats::new()),
         }
     }
 

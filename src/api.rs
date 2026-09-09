@@ -185,6 +185,47 @@ pub async fn list_sessions(
 
 /// GET /api/sessions/:id — Get session info.
 /// Non-admins can only inspect their own sessions (GitHub #102).
+/// Live frame telemetry for a session — the render lag and backlog the
+/// browser is actually reporting, plus H.264 passthrough volume.
+///
+/// Visible to the session owner and to admins, on the same terms as
+/// `get_session`: a session you cannot see reads as absent rather than
+/// forbidden, so the endpoint cannot be used to probe for session ids.
+pub async fn get_session_frame_stats(
+    State(manager): State<AppState>,
+    Path(id): Path<Uuid>,
+    identity: Option<Extension<AuthIdentity>>,
+) -> impl IntoResponse {
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "session not found" })),
+        )
+            .into_response()
+    };
+
+    let Some(info) = manager.get_session(id).await else {
+        return not_found();
+    };
+
+    let is_admin = identity
+        .as_ref()
+        .map(|Extension(id)| id.has_role("admin"))
+        .unwrap_or(false);
+    let is_owner = identity
+        .as_ref()
+        .map(|Extension(ident)| info.created_by == ident.display_name())
+        .unwrap_or(false);
+    if !is_admin && !is_owner {
+        return not_found();
+    }
+
+    match manager.frame_stats(id).await {
+        Some(stats) => (StatusCode::OK, Json(json!(stats.snapshot()))).into_response(),
+        None => not_found(),
+    }
+}
+
 pub async fn get_session(
     State(manager): State<AppState>,
     Path(id): Path<Uuid>,
@@ -283,6 +324,101 @@ pub async fn delete_session(
 /// PUT /api/sessions/:id/thumbnail — Upload a session thumbnail (JPEG).
 /// Called by the client periodically to update the session preview.
 /// Only the session owner (or an admin) can upload.
+/// A diagnostic observation reported by the browser.
+///
+/// The browser sees things nothing on the server can: what its H.264 decoder
+/// did with a frame, whether the picture on screen has gone black. Those are
+/// the other half of an intermittent fault, and a console message is no use
+/// for one that shows itself once in days on a user's machine — so the browser
+/// posts them here and they land in the journal beside guacd's own logs.
+#[derive(Deserialize)]
+pub struct ClientDiagnostic {
+    /// Short machine-readable event name, e.g. `decoder_rebuild`.
+    pub event: String,
+    /// Free text describing the occurrence.
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// The number of client diagnostics logged in the current minute, and when
+/// that minute started, as seconds since the epoch.
+///
+/// A page that malfunctions can post in a loop, and this endpoint writes to the
+/// system journal, so the budget is global rather than per session: it bounds
+/// what any number of misbehaving tabs can write.
+static DIAGNOSTIC_BUDGET: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((0, 0));
+
+/// Diagnostics logged per minute across all sessions before the rest are
+/// dropped. Generous next to what the browser is rate-limited to sending, and
+/// small next to anything that could fill a disk.
+const DIAGNOSTIC_BUDGET_PER_MINUTE: u32 = 120;
+
+/// POST /api/sessions/{id}/diagnostic — record a browser-side observation.
+///
+/// Owner or admin only, on the same terms as the thumbnail endpoint: the text
+/// describes the contents of someone's session.
+pub async fn post_session_diagnostic(
+    State(manager): State<AppState>,
+    Path(id): Path<Uuid>,
+    identity: Option<Extension<AuthIdentity>>,
+    Json(diag): Json<ClientDiagnostic>,
+) -> impl IntoResponse {
+    let Some(info) = manager.get_session(id).await else {
+        return StatusCode::NOT_FOUND;
+    };
+
+    let is_admin = identity
+        .as_ref()
+        .map(|Extension(id)| id.has_role("admin"))
+        .unwrap_or(false);
+    let is_owner = identity
+        .as_ref()
+        .map(|Extension(id)| info.created_by == id.display_name())
+        .unwrap_or(false);
+    if !is_admin && !is_owner {
+        return StatusCode::NOT_FOUND;
+    }
+
+    // Truncate rather than reject: a diagnostic that arrives clipped is still
+    // evidence, and one rejected for length is none.
+    let event: String = diag
+        .event
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect();
+    let detail: String = diag
+        .detail
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(512)
+        .collect();
+
+    let now_min = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 60)
+        .unwrap_or(0);
+
+    {
+        let mut budget = DIAGNOSTIC_BUDGET.lock().unwrap();
+        if budget.0 != now_min {
+            *budget = (now_min, 0);
+        }
+        if budget.1 >= DIAGNOSTIC_BUDGET_PER_MINUTE {
+            return StatusCode::TOO_MANY_REQUESTS;
+        }
+        budget.1 += 1;
+    }
+
+    tracing::warn!(
+        session_id = %id,
+        event = %event,
+        "Client diagnostic: {}", detail
+    );
+
+    StatusCode::NO_CONTENT
+}
+
 pub async fn put_session_thumbnail(
     State(manager): State<AppState>,
     Path(id): Path<Uuid>,
