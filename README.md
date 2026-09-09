@@ -70,6 +70,28 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
 - **Recording playback** — the recordings player loads the H.264 decoder and
   the 4:4:4 shader, so sessions recorded with passthrough replay as video
   instead of a black display.
+- **Per-connection AVC444 request** (`patches/013-rdp-avc420-only.patch`) —
+  which H.264 codecs are offered, per entry: **AVC444 + AVC420** (the default;
+  the server chooses), **AVC444 + AVC420, never combined**, or **AVC420
+  only**. Never combined leaves the offer alone and tells the browser to paint
+  4:2:0: the second view is still sent and decoded, but each update reaches
+  the screen 12-17ms sooner, which suits a target used mainly for typing. AVC444 + AVC420 is required for
+  Windows targets: they offer no H.264 below RDPGFX v10, and FreeRDP emits
+  those capability sets only when AVC444 is requested, so AVC420 only loses
+  H.264 there altogether rather than downgrading its chroma. AVC420 only is
+  for xrdp targets where bandwidth or decode work matters more than chroma. This says what the
+  server is asked to send, not what the browser draws -- whether the two views
+  are combined is decided per picture in the browser. (An Automatic option
+  that dropped AVC444 under Native Resolution was removed: on Windows it lost
+  H.264 outright. Entries saved with it are treated as AVC444 + AVC420.)
+- **Frame-acknowledgement back-pressure**
+  (`patches/012-rdpgfx-frame-ack-backpressure.patch`) — guacd holds the RDPGFX
+  frame acknowledgement by the amount the client's processing lag exceeds its
+  target, *minus* the spacing the server has already provided since the
+  previous frame. That subtraction makes it a floor rather than a second
+  controller: a server that paces itself from the same round trip would read an
+  additive hold as client latency and hunt against it on a roughly one-second
+  cycle.
 - **Runtime overrides for the chroma path** — `h264Chroma444` (off falls back
   to 4:2:0) and `h264ChromaFilter` (off, or a 0-255 threshold; default 30),
   settable as a window global, query param, or `localStorage` key.
