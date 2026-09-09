@@ -180,6 +180,11 @@ pub struct AddressBookEntry {
     /// Requires GFX enabled and xrdp with x264 on the target. Default: true when GFX enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_h264: Option<bool>,
+    /// Advertise AVC444 alongside AVC420 (RDP). Unset lets guacd decide from
+    /// the desktop scale; set true for Windows hosts, which offer no H.264
+    /// below RDPGFX version 10.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avc444: Option<bool>,
     /// Request the framebuffer in the browser's physical pixels rather than its
     /// CSS pixels, so text renders sharply on a HiDPI display.
     ///
@@ -420,6 +425,11 @@ pub struct EntryInfo {
     /// Enable H.264 passthrough.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_h264: Option<bool>,
+    /// Advertise AVC444 alongside AVC420 (RDP). Unset lets guacd decide from
+    /// the desktop scale; set true for Windows hosts, which offer no H.264
+    /// below RDPGFX version 10.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avc444: Option<bool>,
     /// Request the framebuffer in physical rather than CSS pixels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_resolution: Option<bool>,
@@ -560,6 +570,7 @@ impl From<(&str, &AddressBookEntry)> for EntryInfo {
             enable_full_window_drag: e.enable_full_window_drag,
             force_lossless: e.force_lossless,
             enable_h264: e.enable_h264,
+            avc444: e.avc444,
             native_resolution: e.native_resolution,
             container_image: e.container_image.clone(),
             container_cpu_limit: e.container_cpu_limit,
@@ -2155,6 +2166,35 @@ mod tests {
         let json3 = r#"{"type":"rdp","hostname":"test","enable_h264":false}"#;
         let entry3: AddressBookEntry = serde_json::from_str(json3).unwrap();
         assert_eq!(entry3.enable_h264, Some(false));
+    }
+
+    #[test]
+    fn test_avc444_is_tri_state() {
+        // Absent means automatic, and must not be serialised as a value --
+        // guacd reads an empty argument as "decide from the desktop scale".
+        let json = r#"{"type":"rdp","hostname":"test","enable_h264":true}"#;
+        let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.avc444, None);
+        let out = serde_json::to_string(&entry).unwrap();
+        assert!(!out.contains("avc444"));
+
+        // Forced on, as a Windows host requires: it offers no H.264 below
+        // RDPGFX version 10, which is advertised only when AVC444 is.
+        let json = r#"{"type":"rdp","hostname":"test","avc444":true}"#;
+        let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.avc444, Some(true));
+        assert!(serde_json::to_string(&entry)
+            .unwrap()
+            .contains("\"avc444\":true"));
+
+        // Forced off is distinct from absent, and must survive as false
+        // rather than collapsing back to automatic.
+        let json = r#"{"type":"rdp","hostname":"test","avc444":false}"#;
+        let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.avc444, Some(false));
+        assert!(serde_json::to_string(&entry)
+            .unwrap()
+            .contains("\"avc444\":false"));
     }
 
     // ── Path-traversal regression tests (v1.5.4 fix) ──────────────────────

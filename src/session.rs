@@ -126,6 +126,10 @@ pub struct CreateSessionRequest {
     pub force_lossless: Option<bool>,
     /// Enable H.264 passthrough for RDP.
     pub enable_h264: Option<bool>,
+    /// Advertise AVC444 alongside AVC420 (RDP). `None` lets guacd decide from
+    /// the session's desktop scale; `Some(true)` is needed for Windows hosts,
+    /// which offer no H.264 below RDPGFX version 10.
+    pub avc444: Option<bool>,
     // VDI fields
     /// Docker image for VDI sessions (e.g. "myregistry/desktop:latest").
     pub container_image: Option<String>,
@@ -1011,6 +1015,7 @@ impl SessionManager {
                     enable_full_window_drag: req.enable_full_window_drag.unwrap_or(false),
                     force_lossless: req.force_lossless.unwrap_or(false),
                     enable_h264: req.enable_h264.unwrap_or(false),
+                    avc444: req.avc444,
                     desktop_scale,
                     secondary_monitors: req.max_monitors.unwrap_or(1).saturating_sub(1),
                     wol: wol.clone(),
@@ -1495,6 +1500,7 @@ impl SessionManager {
                     enable_full_window_drag: false,
                     force_lossless: false,
                     enable_h264: true,
+                    avc444: None,
                     desktop_scale,
                     secondary_monitors: req.max_monitors.unwrap_or(1).saturating_sub(1),
                     // VDI container on the Docker host — WoL not applicable.
