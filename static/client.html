@@ -281,6 +281,36 @@
             };
         }
 
+        // Whether asking the server for this size would actually change
+        // anything, keyed by monitor index.
+        //
+        // The RDP display patch rounds both dimensions down to a multiple of
+        // 16 (patch 007-rdp-disp-mod16), so two viewport sizes inside the same
+        // 16px band resolve to the same framebuffer. A resize between them is
+        // a no-op on the wire -- but not a free one: a resolution change tears
+        // down and rebuilds the browser's hardware H.264 decoder, measured at
+        // ~6 seconds of stalled video on D3D11. Dragging a window across a
+        // hundred pixels in pauses could buy several of those for nothing.
+        //
+        // Only the decision is taken on the rounded value; the size sent is
+        // the true one, since the client cannot tell an RDP session from a VNC
+        // one and a VNC server does no such rounding -- it should not be handed
+        // a framebuffer up to 15px short.
+        var lastRequestedSize = {};
+
+        function sizeWouldChange(width, height, index) {
+
+            var key = (index === undefined || index === null) ? 0 : index;
+            var rounded = (width - width % 16) + 'x' + (height - height % 16);
+
+            if (lastRequestedSize[key] === rounded)
+                return false;
+
+            lastRequestedSize[key] = rounded;
+            return true;
+
+        }
+
         var statusEl = document.getElementById('status');
         var urlParams = new URLSearchParams(window.location.search);
         var shareToken = urlParams.get('token');
@@ -1081,9 +1111,10 @@
                     popResizeTimer = win.setTimeout(function() {
                         var rs = deviceSize(win.innerWidth || 0,
                                 win.innerHeight || 0);
-                        if (rs.width >= 8 && rs.height >= 8)
+                        if (rs.width >= 8 && rs.height >= 8
+                                && sizeWouldChange(rs.width, rs.height, index))
                             client.sendSize(rs.width, rs.height, index, 0);
-                    }, 300);
+                    }, 500);
                 });
 
                 // Mouse: map the pointer from popup-window pixels to this
@@ -1740,14 +1771,27 @@
                         // silently dropped. Retry a few times past that window — guacd
                         // coalesces to a single resize since the requested size is
                         // unchanged, so the redundant sends are cheap no-ops.
+                        // A fresh connection knows nothing about what the
+                        // server is already displaying.
+                        lastRequestedSize = {};
                         (function() {
                             var fitToWindow = function() {
                                 scaleDisplay();
                                 var anyPanelOpen = panelOpen || filePanelOpen;
                                 var cssW = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
                                 var fit = deviceSize(cssW, window.innerHeight);
-                                if (fit.width > 0 && fit.height > 0)
+                                if (fit.width > 0 && fit.height > 0) {
+                                    // Sent whether or not it would change
+                                    // anything: the repeats above are
+                                    // deliberate, covering a window where the
+                                    // server drops the size silently, and
+                                    // suppressing them would defeat that.
+                                    // Recorded all the same, so that a user
+                                    // resize inside the same 16px band
+                                    // afterwards is correctly skipped.
+                                    sizeWouldChange(fit.width, fit.height);
                                     client.sendSize(fit.width, fit.height);
+                                }
                             };
                             setTimeout(fitToWindow, 800);
                             setTimeout(fitToWindow, 2000);
@@ -2068,15 +2112,18 @@
             var resizeTimer = null;
             window.addEventListener('resize', function() {
                 scaleDisplay();
-                // Debounce sendSize — RDP display updates are expensive
+                // Debounce sendSize. Half a second rather than a quarter
+                // because the cost of a resolution change is a decoder
+                // rebuild, not just an RDP display update.
                 clearTimeout(resizeTimer);
                 if (debugNoFit) return;
                 resizeTimer = setTimeout(function() {
                     var anyPanelOpen = panelOpen || filePanelOpen;
                     var cssW = anyPanelOpen ? window.innerWidth - 380 : window.innerWidth;
                     var rz = deviceSize(cssW, window.innerHeight);
-                    client.sendSize(rz.width, rz.height);
-                }, 250);
+                    if (sizeWouldChange(rz.width, rz.height))
+                        client.sendSize(rz.width, rz.height);
+                }, 500);
             });
 
             var connectData = shareToken ? 'token=' + encodeURIComponent(shareToken) : '';
