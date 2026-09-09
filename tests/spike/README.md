@@ -71,13 +71,49 @@ video at two orders of magnitude more traffic, where the same loss rate
 produces proportionally more head-of-line stalls and the prize is
 correspondingly larger.
 
-**So the spike has answered its question and raised a sharper one.** The
-mechanism works: ARQ with reliable fallback and a deadline of roughly 8x RTT
-recovers everything at LAN latencies, and the drop policy must never be built.
-Whether it is *worth* building depends entirely on a workload this recording
-does not contain. Before Stage 3, capture a sustained-video session and re-run;
-if head-of-line blocking there is still under 1%, the honest answer is that
-Stages 1-2 are the whole project.
+### The video workload, which is the one that decides it
+
+A second capture of the same host playing sustained video (`win-video.guac`,
+167s, 9178 access units, 3.88 Mbps, 431 datagrams/s -- roughly ten times the
+idle desktop on every axis). Only 20% of its access units now fit in a single
+datagram, against 72% before, so almost every picture is exposed to loss.
+
+| RTT | loss | missed | corrupt (drop) | late/min (fallback) | TCP blocked |
+|-----|------|--------|----------------|---------------------|-------------|
+| 10ms | 2% | 0.00% | 0.0% | 0.0 | 1.94% |
+| 30ms | 0.5% | 0.01% | 10.9% | 0.4 | 1.54% |
+| 30ms | 2% | 0.05% | 27.6% | 1.8 | 5.74% |
+| 30ms | 5% | 0.27% | 85.5% | 9.0 | 13.8% |
+| 100ms | 2% | 0.66% | 92.9% | 21.9 | 17.5% |
+| 100ms | 5% | 1.88% | 96.2% | 62.0 | 35.9% |
+
+Head-of-line blocking against the idle capture, same conditions:
+
+| workload | @30ms/2% | @100ms/2% |
+|----------|----------|-----------|
+| idle desktop, 0.36 Mbps, 45 dg/s | 0.53% | 2.4% |
+| video, 3.88 Mbps, 431 dg/s | **5.74%** | **17.5%** |
+
+**This is the case for the split.** On a remote link at 100ms and 2% loss, one
+ordered stream spends 17.5% of the session head-of-line blocked -- and every
+one of those stalls delays input, clipboard and control, not just the picture
+they were waiting for. That is worth a fragmentation layer. At LAN latency it
+is 2-6%, real but not compelling on its own.
+
+The drop policy stays dead even here. Windows emitted keyframes at 37.8s,
+97.8s, 138.3s and 157.7s -- gaps of 20 to 60 seconds -- so a 0.05% miss rate
+still leaves the session corrupt 27.6% of the time. Reliable fallback is what
+makes the numbers above achievable, and it costs 1.8 late frames per minute at
+30ms/2%.
+
+Note the TCP baseline is conservative in TCP's favour: each loss is charged one
+round trip of stall and nothing more, where real TCP would also collapse its
+congestion window. The blocked percentages are a floor.
+
+**Conclusion: Stage 3 is justified, on this workload and this shape.** ARQ with
+reliable fallback, a deadline near 8x RTT, and no drop policy at any point. The
+win is concentrated on high-RTT links carrying real video, which is exactly
+where the current transport is worst.
 
 ### Feeding it a real recording — `guac-h264-trace.mjs`
 

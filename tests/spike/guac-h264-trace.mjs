@@ -34,22 +34,39 @@ import { readFile, writeFile } from 'node:fs/promises';
  * desynchronise a parser that counted wrong -- taking every instruction after
  * it with it. Counting codepoints costs nothing here and removes the whole
  * class of failure. */
+/*
+ * Advances `count` codepoints from UTF-16 index `start`, returning the index
+ * just past them, or -1 if the string ends first.
+ *
+ * Walking indices rather than materialising an array of characters is not a
+ * micro-optimisation: a recording of a video session runs to hundreds of
+ * megabytes, and Array.from() on a string that size exceeds the maximum array
+ * length outright. This costs one pass and no allocation.
+ */
+function advance(text, start, count) {
+    let i = start;
+    for (let n = 0; n < count; n++) {
+        if (i >= text.length) return -1;
+        const c = text.charCodeAt(i);
+        i += (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length) ? 2 : 1;
+    }
+    return i;
+}
+
 function* instructions(text) {
     let i = 0;
-    const chars = Array.from(text);
-    while (i < chars.length) {
+    while (i < text.length) {
         const elements = [];
         for (;;) {
-            let dot = i;
-            while (dot < chars.length && chars[dot] !== '.') dot++;
-            if (dot >= chars.length) return;
-            const length = parseInt(chars.slice(i, dot).join(''), 10);
-            if (!Number.isFinite(length)) return;
+            const dot = text.indexOf('.', i);
+            if (dot < 0) return;
+            const length = parseInt(text.slice(i, dot), 10);
+            if (!Number.isFinite(length) || length < 0) return;
             const start = dot + 1;
-            const end = start + length;
-            if (end > chars.length) return;
-            elements.push(chars.slice(start, end).join(''));
-            const sep = chars[end];
+            const end = advance(text, start, length);
+            if (end < 0 || end >= text.length) return;
+            elements.push(text.slice(start, end));
+            const sep = text[end];
             i = end + 1;
             if (sep === ';') break;
             if (sep !== ',') return;
