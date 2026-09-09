@@ -1601,8 +1601,123 @@
             });
 
             // ── State changes ──
+            // ── Session diagnostics ──
+            // Posted to the server so they land in its journal next to guacd's
+            // own logs. The faults these describe -- a decoder stuck waiting
+            // for a keyframe, regions of the desktop going black -- appear
+            // rarely, on someone else's machine, with no console open, so the
+            // browser has to report them at the time or the evidence is gone.
+            var _diagSent = 0;
+            var _diagMinute = 0;
+            function reportDiagnostic(event, detail) {
+
+                // Budgeted per minute here as well as on the server: a page
+                // that malfunctions should not be able to spend the server's
+                // whole allowance and hide other sessions' reports.
+                var minute = Math.floor(Date.now() / 60000);
+                if (minute !== _diagMinute) { _diagMinute = minute; _diagSent = 0; }
+                if (_diagSent >= 10) return;
+                _diagSent++;
+
+                var headers = { 'Content-Type': 'application/json' };
+                if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+                fetch('/api/sessions/' + sessionId + '/diagnostic', {
+                    method: 'POST',
+                    headers: headers,
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ event: event, detail: String(detail) })
+                }).catch(function() {}); // fire and forget
+
+            }
+
+            if (window.Guacamole && Guacamole.H264Decoder)
+                Guacamole.H264Decoder.onDiagnostic = reportDiagnostic;
+
             // ── Thumbnail capture (owner only, not shared viewers) ──
             var _thumbInterval = null;
+
+            // Fraction of the display that was black at the last check, and
+            // whether that has already been reported. The check rides on the
+            // thumbnail capture below rather than costing a readback of its
+            // own.
+            var _blackReported = false;
+
+            /**
+             * Reports the display going substantially black, and its
+             * recovering afterwards.
+             *
+             * A black region is the symptom users report, and until now it
+             * left no trace anywhere: guacd believes it sent pixels, the
+             * browser believes it drew them. Timestamping the transition is
+             * what makes the rest of the logs -- guacd's surface operations,
+             * the overpaint warnings, the decoder's own reports -- readable as
+             * one episode.
+             *
+             * The grid is included because which part went black is the whole
+             * question: a full screen points at a resize or a graphics reset,
+             * scattered blocks at cached or copied regions.
+             */
+            function checkForBlackDisplay(thumb) {
+
+                var data;
+                try {
+                    data = thumb.getContext('2d')
+                            .getImageData(0, 0, thumb.width, thumb.height).data;
+                }
+                catch (e) { return; } // tainted or zero-sized canvas
+
+                var cols = 8, rows = 4;
+                var cells = [];
+                var black = 0, total = 0;
+
+                for (var ry = 0; ry < rows; ry++) {
+                    var row = '';
+                    for (var rx = 0; rx < cols; rx++) {
+
+                        var x0 = Math.floor(rx * thumb.width / cols);
+                        var x1 = Math.floor((rx + 1) * thumb.width / cols);
+                        var y0 = Math.floor(ry * thumb.height / rows);
+                        var y1 = Math.floor((ry + 1) * thumb.height / rows);
+
+                        var cellBlack = 0, cellTotal = 0;
+                        for (var y = y0; y < y1; y += 2) {
+                            for (var x = x0; x < x1; x += 2) {
+                                var i = (y * thumb.width + x) * 4;
+                                cellTotal++;
+                                if (data[i] < 8 && data[i+1] < 8 && data[i+2] < 8)
+                                    cellBlack++;
+                            }
+                        }
+
+                        black += cellBlack;
+                        total += cellTotal;
+                        row += (cellTotal && cellBlack / cellTotal > 0.9) ? '#' : '.';
+
+                    }
+                    cells.push(row);
+                }
+
+                if (!total) return;
+                var fraction = black / total;
+
+                // Hysteresis, and a deliberately high bar: a dark wallpaper or
+                // a lock screen is legitimately black, so only a large area
+                // reports, and only on the way in and the way out.
+                if (!_blackReported && fraction > 0.4) {
+                    _blackReported = true;
+                    reportDiagnostic('display_black',
+                            (fraction * 100).toFixed(0) + '% of the display is '
+                            + 'black; grid ' + cells.join('/'));
+                }
+                else if (_blackReported && fraction < 0.15) {
+                    _blackReported = false;
+                    reportDiagnostic('display_black_cleared',
+                            'display recovered, now '
+                            + (fraction * 100).toFixed(0) + '% black');
+                }
+
+            }
+
             function captureAndUploadThumbnail() {
                 try {
                     var display = client.getDisplay();
@@ -1613,6 +1728,7 @@
                     thumb.width = 320;
                     thumb.height = Math.round(320 * canvas.height / canvas.width) || 180;
                     thumb.getContext('2d').drawImage(canvas, 0, 0, thumb.width, thumb.height);
+                    checkForBlackDisplay(thumb);
                     thumb.toBlob(function(blob) {
                         if (!blob) return;
                         var headers = {};
