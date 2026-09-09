@@ -47,6 +47,11 @@ struct ProxyOutcome {
 #[derive(Deserialize)]
 pub struct WsQuery {
     pub token: Option<String>,
+    /// Set by a client that can decode binary blob frames. Absent means the
+    /// client is older than this feature (or is not our client at all), and
+    /// it receives base64 text exactly as before. See `docs/binary-blobs.md`.
+    #[serde(rename = "binaryBlobs")]
+    pub binary_blobs: Option<String>,
 }
 
 /// GET /ws/:session_id — Upgrade to WebSocket and proxy to guacd.
@@ -134,6 +139,8 @@ pub async fn ws_handler(
     let identity_name = identity.as_ref().map(|id| id.display_name().to_string());
     let database = database.map(|Extension(db)| db);
 
+    let binary_blobs = query.binary_blobs.as_deref().is_some_and(|v| v != "0");
+
     ws.protocols(["guacamole"])
         .on_upgrade(move |socket| {
             handle_ws(
@@ -141,6 +148,7 @@ pub async fn ws_handler(
                 session_id,
                 is_owner,
                 query.token,
+                binary_blobs,
                 socket,
                 ip,
                 identity_name,
@@ -156,6 +164,7 @@ async fn handle_ws(
     session_id: Uuid,
     owner_verified: bool,
     token: Option<String>,
+    binary_blobs: bool,
     ws: WebSocket,
     client_addr: IpAddr,
     identity_name: Option<String>,
@@ -243,7 +252,12 @@ async fn handle_ws(
         }
     };
 
-    tracing::info!(session_id = %session_id, client_ip = %client_addr, "Starting proxy");
+    tracing::info!(
+        session_id = %session_id,
+        client_ip = %client_addr,
+        binary_blobs,
+        "Starting proxy"
+    );
 
     // Set up recording file (only for owner connections, and only if recording is enabled)
     let is_recording_enabled = manager.is_recording_enabled(session_id).await;
@@ -302,7 +316,8 @@ async fn handle_ws(
 
     // Run the bidirectional proxy
     let start = Instant::now();
-    let proxy_outcome = proxy_ws_guacd(ws, guacd_stream, recording_file, cancel).await;
+    let proxy_outcome =
+        proxy_ws_guacd(ws, guacd_stream, recording_file, cancel, binary_blobs).await;
     let elapsed = start.elapsed();
     let server_disconnected = proxy_outcome.server_disconnected;
     let proxy_result = proxy_outcome.result;
@@ -420,6 +435,7 @@ async fn proxy_ws_guacd(
     guacd: GuacdStream,
     recording_file: Option<tokio::fs::File>,
     cancel: CancellationToken,
+    binary_blobs: bool,
 ) -> ProxyOutcome {
     let (guacd_read, guacd_write) = tokio::io::split(guacd);
     let (ws_write, ws_read) = ws.split();
@@ -438,10 +454,16 @@ async fn proxy_ws_guacd(
     let recording_clone = recording.clone();
     let sd_flag = server_disconnected.clone();
     let ws_sink_g = ws_sink.clone();
-    let guacd_to_browser =
-        tokio::spawn(
-            async move { guacd_to_ws(guacd_read, ws_sink_g, recording_clone, sd_flag).await },
-        );
+    let guacd_to_browser = tokio::spawn(async move {
+        guacd_to_ws(
+            guacd_read,
+            ws_sink_g,
+            recording_clone,
+            sd_flag,
+            binary_blobs,
+        )
+        .await
+    });
 
     // browser → guacd
     let ws_sink_b = ws_sink.clone();
@@ -500,9 +522,14 @@ async fn guacd_to_ws(
     ws: WsSink,
     recording: Option<Arc<tokio::sync::Mutex<tokio::fs::File>>>,
     server_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    binary_blobs: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 65536];
     let mut carry: Vec<u8> = Vec::new();
+
+    // Only allocated when the client asked for binary blobs; without it the
+    // send path below stays the byte-for-byte passthrough it has always been.
+    let mut splitter = binary_blobs.then(crate::binary_blob::BlobSplitter::new);
 
     loop {
         let n = guacd.read(&mut buf).await?;
@@ -553,8 +580,26 @@ async fn guacd_to_ws(
             server_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
+        // The recording above saw the text form; only what goes to the
+        // browser is rewritten. WebSocket delivers text and binary frames in
+        // one order, so a blob lifted out of the run still arrives between
+        // the same neighbours it had.
         let mut sink = ws.lock().await;
-        sink.send(Message::Text(text.into())).await?;
+        match splitter.as_mut() {
+            Some(splitter) => {
+                for frame in splitter.split(&text) {
+                    match frame {
+                        crate::binary_blob::OutFrame::Text(s) => {
+                            sink.send(Message::Text(s.into())).await?
+                        }
+                        crate::binary_blob::OutFrame::Binary(b) => {
+                            sink.send(Message::Binary(b.into())).await?
+                        }
+                    }
+                }
+            }
+            None => sink.send(Message::Text(text.into())).await?,
+        }
     }
 
     Ok(())
