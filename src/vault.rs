@@ -4059,7 +4059,9 @@ mod tests {
         let json = r#"{"type":"rdp","hostname":"test","enable_h264":true}"#;
         let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
         assert_eq!(entry.h264_combine, None);
-        assert!(!serde_json::to_string(&entry).unwrap().contains("h264_combine"));
+        assert!(!serde_json::to_string(&entry)
+            .unwrap()
+            .contains("h264_combine"));
     }
 
     // ── Path-traversal regression tests (v1.5.4 fix) ──────────────────────
