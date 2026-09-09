@@ -29,31 +29,55 @@ same mean arriving in bursts of four takes out four fragments of one picture
 and leaves its neighbours untouched. Assuming independence would flatter the
 design.
 
-### What it says so far (synthetic trace, pending a real recording)
+### What it says, on a real Windows capture
 
-The `drop` policy is not viable at any loss rate tested. With a 60s keyframe
-interval — the *optimistic* end of Windows behaviour — a 0.17% miss rate
-leaves the session corrupt 87% of the time, because one miss costs a minute.
-That is not a tuning problem; it is what a rare IDR does to an unreliable
-transport, and it is why "just drop late frames" has to be ruled out early.
+Measured from a 339s RDP session against a Windows host (`windows-run.guac`,
+3470 access units, 15.3MB of H.264). Two facts from the recording itself
+decide most of what follows.
 
-Deadline-bounded ARQ *does* work, but only with headroom over the round trip:
+**Windows sent five keyframes, all inside the first 2.12 seconds, then none
+for the remaining 337.** That is the documented behaviour finally measured
+rather than inferred, and it is fatal to the drop policy: an access unit
+abandoned at any point after the first two seconds leaves the picture wrong
+until the session ends. The simulator reports exactly that -- 96% of the
+session corrupt even at 0.5% loss, longest episode 326 seconds.
 
-| RTT | deadline | missed | corrupt | TCP blocked |
-|-----|----------|--------|---------|-------------|
-| 30ms | 250ms | 0.00% | 0.0% | 3.0% |
-| 30ms | 100ms | 1.01% | 98.0% | 3.5% |
-| 100ms | 250ms | 1.01% | 98.0% | 10.1% |
+**The size distribution is extremely skewed.** 72% of access units fit in a
+single 1200-byte datagram, but the largest is 305 datagrams and the top 2% of
+units carry 37% of all bytes. Loss exposure is concentrated almost entirely in
+that tail: the tiny majority are one-datagram all-or-nothing, and the rare
+large ones are near-certain to lose a fragment under burst loss.
 
-At 30ms with a 250ms deadline every loss is recovered, nothing corrupts, and
-TCP would have blocked 3% of the session — that 3% is the whole prize. Halve
-the deadline, or triple the RTT, and it collapses. A deadline shorter than
-1.5x RTT permits no retransmission at all.
+At a 250ms deadline, ARQ recovers everything up to 2% loss:
 
-**Provisional conclusion: the fallback path is mandatory, not an optimisation,
-and the deadline must be roughly 8x RTT.** Since `fallback` costs nothing when
-ARQ is succeeding, the sane design is ARQ with reliable fallback and no drop
-policy at all.
+| RTT | loss | deadline | missed | corrupt | TCP blocked |
+|-----|------|----------|--------|---------|-------------|
+| 30ms | 0.5% | 250ms | 0.00% | 0.0% | 0.12% |
+| 30ms | 2%   | 250ms | 0.00% | 0.0% | 0.53% |
+| 30ms | 5%   | 250ms | 0.32% | 83.1% | 1.38% |
+| 30ms | 2%   | 100ms | 0.35% | 97.0% | 0.59% |
+
+**But look at the last column, because it is the whole case for doing this.**
+Head-of-line blocking costs 0.12-0.59% of the session at plausible loss rates
+-- a fifth of a second per minute. That is what the fragmentation layer, the
+NACK protocol, the cross-channel ordering gate and the reliable fallback would
+be bought for.
+
+The reason is in the workload: this capture runs at **0.36 Mbps and 45
+datagrams per second**, a mostly-idle desktop with 6% of its seconds carrying
+real damage. Few packets means few losses means little blocking. It is not the
+case `CLAUDE.md` describes as taking guacd to 100% of a core -- sustained 1080p
+video at two orders of magnitude more traffic, where the same loss rate
+produces proportionally more head-of-line stalls and the prize is
+correspondingly larger.
+
+**So the spike has answered its question and raised a sharper one.** The
+mechanism works: ARQ with reliable fallback and a deadline of roughly 8x RTT
+recovers everything at LAN latencies, and the drop policy must never be built.
+Whether it is *worth* building depends entirely on a workload this recording
+does not contain. Before Stage 3, capture a sustained-video session and re-run;
+if head-of-line blocking there is still under 1%, the honest answer is that
+Stages 1-2 are the whole project.
 
 ### Feeding it a real recording — `guac-h264-trace.mjs`
 
