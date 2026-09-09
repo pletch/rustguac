@@ -99,6 +99,13 @@ struct Inner {
     h264_keyframes: u64,
     bytes_to_browser: u64,
     bytes_to_guacd: u64,
+    /// Blob payloads rewritten as binary WebSocket frames, and the base64
+    /// overhead that rewriting avoided. Zero on a session whose client did not
+    /// ask for binary blobs, which is what makes these the quickest way to
+    /// tell whether the feature is actually in use.
+    binary_blob_frames: u64,
+    binary_blob_bytes: u64,
+    binary_blob_saved_bytes: u64,
     /// Layers that have carried at least one H.264 access unit, keyed by layer
     /// index. guacd holds no pixels of its own for these, so anything else it
     /// draws there is drawing over a picture only the browser has.
@@ -143,6 +150,14 @@ pub struct FrameStatsSnapshot {
     pub h264_keyframes: u64,
     pub bytes_to_browser: u64,
     pub bytes_to_guacd: u64,
+    /// Blob payloads sent as binary frames rather than base64 text. Non-zero
+    /// means the client negotiated `binaryBlobs=1` and the conversion is
+    /// running; zero on an older client, which still receives base64.
+    pub binary_blob_frames: u64,
+    /// Payload bytes carried by those frames.
+    pub binary_blob_bytes: u64,
+    /// Bytes of base64 encoding overhead avoided by sending them as binary.
+    pub binary_blob_saved_bytes: u64,
     /// Drawing instructions guacd sent for a layer that H.264 was passing
     /// through. Any non-zero value here is worth explaining; see
     /// `FrameStats::observe_to_browser`.
@@ -255,6 +270,19 @@ impl FrameStats {
     }
 
     /// Account for a chunk of browser → guacd traffic.
+    /// Records one blob payload sent as a binary frame instead of base64.
+    ///
+    /// The saving is computed rather than estimated: base64 emits four
+    /// characters per three bytes, padded, so the overhead avoided is exactly
+    /// the difference between that and the payload.
+    pub fn observe_binary_blob(&self, payload_len: usize) {
+        let base64_len = payload_len.div_ceil(3) * 4;
+        let mut inner = self.inner.lock().unwrap();
+        inner.binary_blob_frames += 1;
+        inner.binary_blob_bytes += payload_len as u64;
+        inner.binary_blob_saved_bytes += (base64_len - payload_len) as u64;
+    }
+
     pub fn observe_to_guacd(&self, text: &str) {
         let mut acks: Vec<i64> = Vec::new();
         for instr in instruction_starts(text) {
@@ -318,6 +346,9 @@ impl FrameStats {
             h264_keyframes: inner.h264_keyframes,
             bytes_to_browser: inner.bytes_to_browser,
             bytes_to_guacd: inner.bytes_to_guacd,
+            binary_blob_frames: inner.binary_blob_frames,
+            binary_blob_bytes: inner.binary_blob_bytes,
+            binary_blob_saved_bytes: inner.binary_blob_saved_bytes,
             overpaint_ops: inner.overpaint.total,
             overpaint_by_op: inner
                 .overpaint
