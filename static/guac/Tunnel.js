@@ -782,6 +782,25 @@ Guacamole.WebSocketTunnel = function(tunnelURL) {
     var BINARY_FRAME_BLOB = 0;
 
     /**
+     * Binary blob frames received on this tunnel, and their payload bytes.
+     * Present so that whether the conversion is actually running can be read
+     * off a live session in one line, rather than inferred from the shape of
+     * frames in a network panel:
+     *
+     *     __guac_tunnel.binaryFrames        // 0 means base64 is still in use
+     *
+     * @type {!number}
+     */
+    this.binaryFrames = 0;
+
+    /**
+     * Payload bytes received in binary blob frames.
+     *
+     * @type {!number}
+     */
+    this.binaryBytes = 0;
+
+    /**
      * Reference to this WebSocket tunnel.
      *
      * @private
@@ -1052,6 +1071,9 @@ Guacamole.WebSocketTunnel = function(tunnelURL) {
                 return;
 
             var index = header.getUint32(4, true);
+
+            tunnel.binaryFrames++;
+            tunnel.binaryBytes += buffer.byteLength - BINARY_HEADER_LENGTH;
 
             if (tunnel.onbinary)
                 tunnel.onbinary(index, buffer.slice(BINARY_HEADER_LENGTH));

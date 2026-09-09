@@ -442,6 +442,19 @@ mod tests {
     }
 
     #[test]
+    fn saving_matches_what_base64_would_have_cost() {
+        // The reported saving has to be the real one, since it is what tells
+        // an operator the feature is working. base64 emits four characters per
+        // three bytes, padded.
+        for len in [0usize, 1, 2, 3, 4, 100, 4096] {
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(vec![0u8; len])
+                .len();
+            assert_eq!(len.div_ceil(3) * 4, encoded, "len {}", len);
+        }
+    }
+
+    #[test]
     fn frame_header_is_the_documented_shape() {
         let f = frame(0x01020304, &[0xAA, 0xBB]);
         assert_eq!(f[0], FRAME_VERSION);

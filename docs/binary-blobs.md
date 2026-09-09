@@ -97,6 +97,31 @@ This matters more than usual here: `index.html` and `client.html` are cached in
 memory at startup, so a browser can hold an older client than the server. The
 default has to be the old behaviour.
 
+## Verifying it is actually on
+
+Three ways, in order of how little work they are.
+
+**From the browser console**, on a live session:
+
+    __guac_tunnel.binaryFrames    // frames received; 0 means base64 is in use
+    __guac_tunnel.binaryBytes     // payload bytes carried by them
+
+**From the API**, which needs no browser at all:
+
+    curl -s .../api/sessions/<id>/frame-stats | jq '{binary_blob_frames,
+        binary_blob_bytes, binary_blob_saved_bytes}'
+
+`binary_blob_saved_bytes` is the base64 overhead avoided, computed exactly
+rather than estimated.
+
+**From the journal**: `Starting proxy` logs `binary_blobs=true|false` per
+connection, and the end-of-session `Frame telemetry` line carries
+`binary_blob_frames` and `binary_blob_saved_bytes`.
+
+Zero frames on a session that is otherwise working means the client did not
+negotiate it -- almost always a cached `client.html` or `Tunnel.js`, since the
+server falls back to base64 for any client that does not ask.
+
 ## What this is not
 
 It is not the UDP transport split. That was measured and declined: on a video

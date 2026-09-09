@@ -220,7 +220,12 @@ async fn handle_ws(
         }
     };
 
-    tracing::info!(session_id = %session_id, client_ip = %client_addr, "Starting proxy");
+    tracing::info!(
+        session_id = %session_id,
+        client_ip = %client_addr,
+        binary_blobs,
+        "Starting proxy"
+    );
 
     // Set up recording file (only for owner connections, and only if recording is enabled)
     let is_recording_enabled = manager.is_recording_enabled(session_id).await;
@@ -417,6 +422,8 @@ async fn handle_ws(
             h264_keyframes = stats.h264_keyframes,
             overpaint_ops = stats.overpaint_ops,
             bytes_to_browser = stats.bytes_to_browser,
+            binary_blob_frames = stats.binary_blob_frames,
+            binary_blob_saved_bytes = stats.binary_blob_saved_bytes,
             "Frame telemetry"
         );
     }
@@ -614,6 +621,8 @@ async fn guacd_to_ws(
                             sink.send(Message::Text(s.into())).await?
                         }
                         crate::binary_blob::OutFrame::Binary(b) => {
+                            frame_stats
+                                .observe_binary_blob(b.len() - crate::binary_blob::HEADER_LEN);
                             sink.send(Message::Binary(b.into())).await?
                         }
                     }
