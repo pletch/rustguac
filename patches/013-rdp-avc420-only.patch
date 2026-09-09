@@ -1,0 +1,222 @@
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index f40bd892..fe7dd626 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -398,11 +398,13 @@ static UINT guac_rdp_gfx_caps_confirm(RdpgfxClientContext* context,
+         /* 0x000A0003 is RDPGFX_CAPVERSION_103 */
+         if (version < 0x000A0003)
+             guac_client_log(client, GUAC_LOG_WARNING,
+-                    "Server confirmed an RDPGFX capability version below 10.3, "
+-                    "which predates the AVC_THINCLIENT flag. The request for "
+-                    "AVC420 was never sent, so the server may send AVC444. Set "
+-                    "GUAC_RDP_H264_CAPS_FILTER=1 to advertise only 10.3 and "
+-                    "later.");
++                    "Server confirmed an RDPGFX capability version below "
++                    "10.3, which predates the AVC_THINCLIENT flag, so no "
++                    "preference for AVC420 was ever sent and the server may "
++                    "send AVC444. Note that xrdp ignores AVC_THINCLIENT in any "
++                    "case. Set GUAC_RDP_DISABLE_AVC444=1 to advertise AVC420 "
++                    "alone, which xrdp honours but which costs H.264 entirely "
++                    "against Windows.");
+ 
+     }
+ 
+diff --git a/src/protocols/rdp/settings.c b/src/protocols/rdp/settings.c
+index 23dbe035..1e890a39 100644
+--- a/src/protocols/rdp/settings.c
++++ b/src/protocols/rdp/settings.c
+@@ -100,6 +100,7 @@ const char* GUAC_RDP_CLIENT_ARGS[] = {
+     "disable-glyph-caching",
+     "disable-gfx",
+     "enable-h264",
++    "avc444",
+     "desktop-scale",
+     "preconnection-id",
+     "preconnection-blob",
+@@ -449,6 +450,12 @@ enum RDP_ARGS_IDX {
+      */
+     IDX_ENABLE_H264,
+ 
++    /**
++     * Whether AVC444 should be advertised alongside AVC420: 1 to always
++     * advertise it, 0 never to, or -1 to decide from the desktop scale.
++     */
++    IDX_AVC444,
++
+     /**
+      * The DPI scaling percentage the RDP session should render its UI at, or
+      * 0 to leave the server's default (100%) alone.
+@@ -1337,6 +1344,12 @@ guac_rdp_settings* guac_rdp_parse_args(guac_user* user,
+         guac_user_parse_args_boolean(user, GUAC_RDP_CLIENT_ARGS, argv,
+                 IDX_ENABLE_H264, 0);
+ 
++    /* Whether AVC444 is advertised. Absent (-1) leaves the decision to the
++     * desktop scale; see guac_rdp_avc444_enabled(). */
++    settings->avc444 =
++        guac_user_parse_args_int_bounded(user, GUAC_RDP_CLIENT_ARGS, argv,
++                IDX_AVC444, GUAC_RDP_AVC444_AUTO, GUAC_RDP_AVC444_AUTO, 1);
++
+     /* DPI scaling percentage requested for the remote session. Zero leaves
+      * FreeRDP's defaults untouched, which is a plain 100% session. */
+     settings->desktop_scale =
+@@ -1675,6 +1688,76 @@ int guac_rdp_normalize_desktop_scale(int desktop_scale) {
+ 
+ }
+ 
++/**
++ * Returns non-zero if AVC444 should be advertised alongside AVC420 for a
++ * session with the given per-connection setting and desktop scale.
++ *
++ * AVC444 encodes each picture as two views, so the client pays a second decode
++ * per frame and, if it recovers the 4:4:4 chroma rather than discarding it, a
++ * further per-frame combine. At 1x that buys real chroma resolution. At 1.4x
++ * or 1.8x it buys much less: a 4:2:0 chroma block already covers close to a
++ * single logical pixel at that density, so most of what 4:4:4 offers has been
++ * paid for in pixels instead -- and paid for on the same decoder that is now
++ * being asked to do twice the work.
++ *
++ * Which way that trade falls also depends on the server, which is why the
++ * decision is per connection rather than per guacd. A server offering H.264
++ * from the RDPGFX 8.1 capability set, such as xrdp, simply sends AVC420 when
++ * AVC444 is not advertised. One offering it only from version 10 and later,
++ * such as Windows, sends no H.264 at all, because FreeRDP emits those sets
++ * only when GfxAVC444 is set -- so a Windows entry wants AVC444 forced on
++ * regardless of scale, while an xrdp entry beside it does not.
++ *
++ * GUAC_RDP_AVC444_AUTO defers to the desktop scale, which is non-zero only
++ * when the client asked for its framebuffer in physical pixels and reported a
++ * HiDPI device pixel ratio.
++ *
++ * The GUAC_RDP_DISABLE_AVC444 environment variable sets the default for
++ * connections that do not specify: 1 never advertises, 0 always does. It is
++ * read once and cached; two threads racing to initialise it write the same
++ * value, so no lock is needed.
++ *
++ * @param avc444
++ *     The per-connection setting: 1 to advertise, 0 not to, or
++ *     GUAC_RDP_AVC444_AUTO to decide from the desktop scale.
++ *
++ * @param desktop_scale
++ *     The desktop scale requested for this connection, as a percentage, or
++ *     zero if none was requested.
++ *
++ * @return
++ *     Non-zero if AVC444 should be advertised, zero otherwise.
++ */
++static int guac_rdp_avc444_enabled(int avc444, int desktop_scale) {
++
++    /* An explicit per-connection setting wins outright. */
++    if (avc444 != GUAC_RDP_AVC444_AUTO)
++        return avc444;
++
++    /* -1 unset, 0 forced off, 1 forced on */
++    static int override = -1;
++
++    if (override < 0) {
++
++        const char* raw = getenv("GUAC_RDP_DISABLE_AVC444");
++
++        if (raw == NULL || *raw == '\0')
++            override = GUAC_RDP_AVC444_AUTO;
++        else if (strcmp(raw, "1") == 0)
++            override = 0;
++        else
++            override = 1;
++
++    }
++
++    if (override != GUAC_RDP_AVC444_AUTO)
++        return override;
++
++    /* Automatic: the pixel density has already bought most of the chroma. */
++    return desktop_scale <= GUAC_RDP_AVC444_SCALE_THRESHOLD;
++
++}
++
+ void guac_rdp_push_settings(guac_client* client,
+         guac_rdp_settings* guac_settings, freerdp* rdp) {
+ 
+@@ -1755,12 +1838,23 @@ void guac_rdp_push_settings(guac_client* client,
+ 
+             freerdp_settings_set_bool(rdp_settings, FreeRDP_GfxH264, TRUE);
+ 
+-            /* AVC444 must be advertised even though AVC420 is preferred:
+-             * FreeRDP emits the RDPGFX V10 capability sets only when GfxAVC444
+-             * is set, and Windows offers no H.264 at all below V10. A server
+-             * that then chooses AVC444 is handled -- both of its views are
+-             * forwarded and the client draws only the main one. */
+-            freerdp_settings_set_bool(rdp_settings, FreeRDP_GfxAVC444, TRUE);
++            /* AVC444 is advertised by default even though AVC420 is
++             * preferred: FreeRDP emits the RDPGFX V10 capability sets only
++             * when GfxAVC444 is set, and Windows offers no H.264 at all below
++             * V10. A server that then chooses AVC444 is handled -- both of its
++             * views are forwarded and the client draws only the main one. */
++            if (guac_rdp_avc444_enabled(guac_settings->avc444,
++                        guac_settings->desktop_scale))
++                freerdp_settings_set_bool(rdp_settings, FreeRDP_GfxAVC444, TRUE);
++            else
++                guac_client_log(client, GUAC_LOG_INFO, "AVC444 will not be "
++                        "advertised (desktop scale %i%%). Servers that offer "
++                        "H.264 from the RDPGFX 8.1 capability set, such as "
++                        "xrdp, will send AVC420; those that offer it only from "
++                        "version 10 and later, such as Windows, will send no "
++                        "H.264 at all -- set GUAC_RDP_DISABLE_AVC444=0 to "
++                        "always advertise AVC444.",
++                        guac_settings->desktop_scale);
+ 
+         }
+ 
+@@ -2047,7 +2141,13 @@ void guac_rdp_push_settings(guac_client* client,
+             rdp_settings->GfxH264 = TRUE;
+ 
+             /* See the FreeRDP 3 path above. */
+-            rdp_settings->GfxAVC444 = TRUE;
++            if (guac_rdp_avc444_enabled(guac_settings->avc444,
++                        guac_settings->desktop_scale))
++                rdp_settings->GfxAVC444 = TRUE;
++            else
++                guac_client_log(client, GUAC_LOG_INFO, "AVC444 will not be "
++                        "advertised (desktop scale %i%%).",
++                        guac_settings->desktop_scale);
+ 
+         }
+ 
+diff --git a/src/protocols/rdp/settings.h b/src/protocols/rdp/settings.h
+index 7913c40d..2d124281 100644
+--- a/src/protocols/rdp/settings.h
++++ b/src/protocols/rdp/settings.h
+@@ -209,6 +209,20 @@ typedef enum guac_rdp_resize_method {
+  */
+ int guac_rdp_normalize_desktop_scale(int desktop_scale);
+ 
++/**
++ * The value of the "avc444" parameter meaning "decide from the desktop scale"
++ * rather than forcing AVC444 on or off for this connection.
++ */
++#define GUAC_RDP_AVC444_AUTO -1
++
++/**
++ * The desktop scale, as a percentage, above which a session is treated as
++ * HiDPI and AVC444 is not advertised. Any scale at all is only ever requested
++ * for a client rendering in physical pixels, so this admits the 100% case and
++ * excludes the 140% and 180% ones FreeRDP can actually apply.
++ */
++#define GUAC_RDP_AVC444_SCALE_THRESHOLD 100
++
+ typedef struct guac_rdp_settings {
+ 
+     /**
+@@ -715,6 +729,13 @@ typedef struct guac_rdp_settings {
+      * HiDPI display -- does not simply get a desktop whose every element is
+      * half the size it should be.
+      */
++    /**
++     * Whether AVC444 should be advertised alongside AVC420: 1 to always
++     * advertise it, 0 never to, or GUAC_RDP_AVC444_AUTO to decide from the
++     * desktop scale.
++     */
++    int avc444;
++
+     int desktop_scale;
+ 
+     /**
