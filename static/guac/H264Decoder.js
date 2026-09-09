@@ -41,6 +41,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var configured = false;
 
     /**
+     * The codec string most recently configured, so that a change is logged
+     * once rather than on every decoder rebuild.
+     *
+     * @private
+     * @type {?string}
+     */
+    var lastCodec = null;
+
+    /**
      * Whether the next access unit submitted must be a keyframe. Set after a
      * terminal decoder error, since a rebuilt decoder holds no reference
      * frames and a delta frame would only error it again immediately.
@@ -116,6 +125,114 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var lastTimeoutWarn = 0;
 
     /**
+     * When each diagnostic event was last reported, keyed by event name.
+     *
+     * Diagnostics go to the server and end up in its journal, so they are
+     * deduplicated here as well as rate limited there: the conditions being
+     * reported (a decoder waiting for a keyframe, frames being abandoned) last
+     * for as long as the fault does, and would otherwise report on every frame
+     * for the duration.
+     *
+     * @private
+     * @type {Object.<string, number>}
+     */
+    var diagLastSent = {};
+
+    /**
+     * Minimum spacing between reports of the same diagnostic event, in ms.
+     *
+     * @private
+     * @constant
+     * @type {number}
+     */
+    var DIAG_INTERVAL_MS = 30000;
+
+    /**
+     * Reports a diagnostic observation to whatever the page has installed as
+     * Guacamole.H264Decoder.onDiagnostic, if anything, and to the console
+     * either way.
+     *
+     * What the decoder knows -- that it rebuilt itself, that it is holding
+     * every frame until a keyframe the server may not send for minutes, that
+     * it gave up on frames -- is invisible from the server, and a console
+     * message is no use for a fault that appears once in days on someone
+     * else's machine. This is how it reaches the session log.
+     *
+     * @private
+     * @param {!string} event
+     *     Short machine-readable event name.
+     *
+     * @param {!string} detail
+     *     Human-readable description.
+     *
+     * @param {boolean} [always]
+     *     Send even if this event was reported within DIAG_INTERVAL_MS. Used
+     *     for one-shot transitions, which are meaningful individually.
+     */
+    function diagnostic(event, detail, always) {
+
+        var now = nowMs();
+        if (!always && diagLastSent[event]
+                && now - diagLastSent[event] < DIAG_INTERVAL_MS)
+            return;
+
+        diagLastSent[event] = now;
+        console.warn('[rustguac] H.264 ' + event + ': ' + detail);
+
+        var sink = Guacamole.H264Decoder.onDiagnostic;
+        if (sink) {
+            try { sink(event, detail); }
+            catch (e) { /* a broken sink must not break decoding */ }
+        }
+
+    }
+
+    /**
+     * Counts of abandoned frames already reported, so that each report covers
+     * only what has happened since the last one.
+     *
+     * @private
+     */
+    var diagReportedWatchdog = 0;
+    var diagReportedSync = 0;
+
+    /**
+     * When the decoder started holding frames for want of a keyframe, and how
+     * many it has dropped since. A decoder in this state paints nothing at all
+     * while the server has no reason to send a keyframe unprompted, so the
+     * duration is the length of time the screen was frozen.
+     *
+     * @private
+     */
+    var keyframeWaitSince = 0;
+    var keyframeWaitDropped = 0;
+
+    /**
+     * Reports frames given up on, if any have been since the last report. Both
+     * counters are also consumed by the console stats block, which may be off,
+     * so this tracks what it has reported rather than resetting them.
+     *
+     * @private
+     */
+    function reportAbandoned() {
+
+        var watchdog = watchdogFires - diagReportedWatchdog;
+        var sync = syncTimeouts - diagReportedSync;
+
+        if (watchdog <= 0 && sync <= 0)
+            return;
+
+        diagReportedWatchdog = watchdogFires;
+        diagReportedSync = syncTimeouts;
+
+        diagnostic('frames_abandoned', watchdog + ' frame(s) past the '
+                + DECODE_WATCHDOG_MS + 'ms decode watchdog, ' + sync
+                + ' sync gate timeout(s). Damage carried by an abandoned '
+                + 'frame is never repainted: the server only sends it once.');
+
+    }
+
+    /**
      * Per-frame state keyed by token, from submission until the frame is drawn
      * or abandoned.
      *
@@ -134,12 +251,28 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var flushResolvers = [];
 
     /**
-     * If the backlog has drained, fire and clear all flush resolvers.
+     * If the backlog is back within the pipeline depth, fire and clear all
+     * flush resolvers.
+     *
+     * The threshold has to be the one waitForPending() gates on. Releasing
+     * only at zero meant that once the backlog exceeded the depth it had to
+     * drain completely to let a sync through, and a session decoding
+     * continuously never reaches zero -- so every sync waited out its full
+     * 200ms timeout instead. That reports ~200ms of processing lag upstream
+     * whatever the client is actually doing, which guacd answers by holding
+     * frame acknowledgements and a self-pacing server answers by stretching
+     * its capture interval. The symptom is a stuttering session whose client
+     * is not in fact behind, and a console full of sync wait timeouts.
+     *
+     * It bites AVC444 first because a picture is two access units there, so
+     * the backlog is twice as deep for the same frame rate and far less
+     * likely to touch zero between frames -- which looks like AVC444 being
+     * expensive rather than like a threshold mismatch.
      *
      * @private
      */
     function resolveIfIdle() {
-        if (pendingDecodes <= 0 && flushResolvers.length > 0) {
+        if (pendingDecodes <= MAX_PIPELINE_DEPTH && flushResolvers.length > 0) {
             var resolvers = flushResolvers;
             flushResolvers = [];
             for (var i = 0; i < resolvers.length; i++)
@@ -238,6 +371,34 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
+     * Releases a frame's snapshot, whatever kind it is. The 4:2:0 path
+     * snapshots into a pooled canvas; the combine path renders offscreen and
+     * hands the drawing buffer over as an ImageBitmap, which owns GPU memory
+     * until it is closed and belongs to no pool.
+     *
+     * @private
+     * @param {HTMLCanvasElement|ImageBitmap} snapshot - The snapshot, if any.
+     */
+    function releaseSnapshot(snapshot) {
+
+        if (!snapshot)
+            return;
+
+        if (typeof ImageBitmap !== 'undefined'
+                && snapshot instanceof ImageBitmap) {
+            try {
+                snapshot.close();
+            } catch (ignore) {
+                /* Already closed */
+            }
+            return;
+        }
+
+        releaseCanvas(snapshot);
+
+    }
+
+    /**
      * Combines the two views of an AVC444 picture into 4:4:4, or null when the
      * stream carries no auxiliary view, the browser cannot support it, or it
      * has been switched off. Created lazily, on first sight of an auxiliary
@@ -258,6 +419,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var yuv444Unavailable = false;
 
     /**
+     * Whether the renderer has been told this stream's colour space. Applied
+     * from the first main-view frame and not revisited: a decoder replaced
+     * mid-session re-runs this, but the stream's signalling does not change
+     * frame to frame, and reading it per frame would be pure overhead.
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var colorSpaceApplied = false;
+
+    /**
      * Whether the current stream is being combined to 4:4:4. False until an
      * auxiliary view actually arrives: an AVC420 stream has no second view to
      * combine, and reading planes back costs a copy per frame that would buy
@@ -268,17 +440,201 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     var combining = false;
 
+
     /**
-     * Serialises plane read-back across frames. Both views of a picture write
-     * into the same set of textures, and the auxiliary view refines what the
-     * main view uploaded, so the copies have to complete in decode order --
-     * copyTo() promises settling out of order would combine one picture's
-     * chroma into another's luma.
+     * Whether the picture currently being combined had to upload whole planes
+     * because the textures were stale. Such a picture is the most expensive
+     * kind of combine there is, so it is not representative of what combining
+     * costs in the steady state and is left out of the diagnostic.
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var combineResynced = false;
+
+    /**
+     * Whether the renderer's textures no longer hold the previous picture, so
+     * the next combine must upload whole planes rather than the damaged rows.
+     *
+     * Banded upload assumes every row outside the damage still holds what it
+     * held last picture. That stops being true the moment a picture is painted
+     * without being combined: the screen moved on and the textures did not.
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var resyncNeeded = true;
+
+    /**
+     * Work already done for the current picture's main view, carried across to
+     * the auxiliary view that completes it so the gate is charged once per
+     * picture rather than once per view.
+     *
+     * @private
+     * @type {!number}
+     */
+    var combineWorkMs = 0;
+
+    /**
+     * Per-picture combine cost, split by whether the picture carried an
+     * auxiliary view. Off unless h264CombineLog is set.
+     *
+     * The gate averages every picture into one figure, which is the right
+     * input for deciding whether combining is affordable but the wrong one
+     * for finding a stutter. A server sending chroma every Nth picture makes
+     * one picture in N several times dearer than its neighbours, and a mean
+     * taken across both hides exactly that: throughput looks healthy while
+     * the session hitches N times a second. Splitting the two says whether a
+     * long tail lives in the chroma pictures or is spread across all of them
+     * -- the first is the combine's fault and can be gated, the second is the
+     * decode's and cannot.
+     *
+     * @private
+     */
+    var stats = null;
+
+    /**
+     * Events since the last diagnostic report: plane read-backs and the two
+     * ways a frame can be given up on.
+     *
+     * The read-back wait is the gap this instrument was missing. Combine cost
+     * is deliberately timed as work and not wait, so that the gate cannot feed
+     * on its own backlog -- which also means a slow copyTo(), a GPU-to-CPU
+     * transfer at HiDPI rather than the memcpy a software decoder makes it,
+     * does not appear in it at all. The wait includes queueing behind earlier
+     * pictures on purpose: that is what a backlog looks like from here.
+     *
+     * @private
+     */
+    var copyWait = null;
+    var watchdogFires = 0;
+    var syncTimeouts = 0;
+
+    /**
+     * Records one sample against a named stage, split by whether the picture
+     * carried an auxiliary view, and reports every few seconds. Cheap enough
+     * to leave in the path: one comparison when off.
+     *
+     * Three stages between the wire and the screen, so that time unaccounted
+     * for by one is visible in the next rather than inferred:
+     *
+     *   decode   decode() submitted to the frame arriving in output(). The
+     *            decoder's own cost plus anything queued inside it. An
+     *            auxiliary view is coded full-frame while a main view codes
+     *            damage only, so this is where that asymmetry would show.
+     *   combine  read-back, plane upload, conversion and transfer.
+     *   draw     the frame being ready to it reaching the layer, which is
+     *            time spent in the display's ordered task queue rather than
+     *            doing work.
+     *
+     * @private
+     * @param {!string} stage - 'decode', 'combine' or 'draw'.
+     * @param {!boolean} hadAux - Whether the picture carried an auxiliary view.
+     * @param {!number} ms - The sample.
+     */
+    function recordStat(stage, hadAux, ms) {
+
+        if (!override('h264CombineLog'))
+            return;
+
+        var now = nowMs();
+
+        if (!stats)
+            stats = { since: now };
+
+        var key = stage + (hadAux ? ':chroma' : ':luma');
+        var bucket = stats[key] || (stats[key] = { n: 0, sum: 0, max: 0 });
+
+        bucket.n++;
+        bucket.sum += ms;
+        if (ms > bucket.max)
+            bucket.max = ms;
+
+        if (now - stats.since < 5000)
+            return;
+
+        function one(b) {
+            if (!b || !b.n)
+                return 'none';
+            return b.n + ' mean ' + (b.sum / b.n).toFixed(1)
+                    + ' max ' + b.max.toFixed(1);
+        }
+
+        var lines = ['[rustguac] H.264 over '
+                + ((now - stats.since) / 1000).toFixed(1) + 's, ms:'];
+
+        ['decode', 'combine', 'draw'].forEach(function(name) {
+            lines.push('  ' + (name + '     ').slice(0, 8)
+                    + 'chroma ' + one(stats[name + ':chroma'])
+                    + '  |  luma ' + one(stats[name + ':luma']));
+        });
+
+        var tail = [];
+        if (copyWait && copyWait.n)
+            tail.push('read-back wait mean '
+                    + (copyWait.sum / copyWait.n).toFixed(1) + ' max '
+                    + copyWait.max.toFixed(1));
+        if (watchdogFires || syncTimeouts)
+            tail.push('GIVEN UP: ' + watchdogFires + ' watchdog, '
+                    + syncTimeouts + ' sync timeout');
+        if (tail.length)
+            lines.push('  ' + tail.join('  |  '));
+
+        console.log(lines.join('\n'));
+
+        stats = null;
+        copyWait = null;
+        watchdogFires = 0;
+        syncTimeouts = 0;
+
+    }
+
+    /**
+     * A monotonic clock in milliseconds, falling back where performance is
+     * absent.
+     *
+     * @private
+     * @returns {!number}
+     */
+    function nowMs() {
+        return (typeof performance !== 'undefined' && performance.now)
+            ? performance.now() : Date.now();
+    }
+
+
+    /**
+     * Serialises the work that follows plane read-back. Both views of a
+     * picture write into the same set of textures, and the auxiliary view
+     * refines what the main view uploaded, so the uploads have to happen in
+     * decode order -- out of order, one picture's chroma is combined into
+     * another's luma.
+     *
+     * Only the uploads are ordered, not the copies themselves. Each copyTo()
+     * is issued as soon as its frame arrives, into a buffer of its own, and
+     * this chain merely waits for it in turn. Chaining the call instead left
+     * the two views of a picture strictly sequential, so every picture paid
+     * two round trips to the GPU end to end rather than overlapping them.
      *
      * @private
      * @type {!Promise}
      */
     var copyChain = Promise.resolve();
+
+    /**
+     * Whether a main view has been uploaded and deferred, awaiting the
+     * auxiliary view that will paint the picture, and the regions that main
+     * view declared valid -- null meaning the whole picture.
+     *
+     * The two views carry separate region rects, and the picture they combine
+     * to is valid wherever either one says it is. While both views painted,
+     * each painted its own; with the main view's paint dropped, its regions
+     * would go unpainted unless they are carried over to the view that does
+     * paint.
+     *
+     * @private
+     */
+    var deferredMain = false;
+    var deferredMainRects = null;
 
     /**
      * Buffers available for reuse when reading planes back out of a frame,
@@ -345,14 +701,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         if (typeof Guacamole.Yuv444Renderer === 'undefined'
                 || !Guacamole.Yuv444Renderer.isSupported()) {
-            console.warn('[rustguac] H.264: 4:4:4 chroma unavailable'
-                    + ' (needs WebGL2 and VideoFrame.copyTo); AVC444 will'
-                    + ' render at 4:2:0');
+            diagnostic('chroma_unavailable', '4:4:4 combining unavailable '
+                    + '(needs WebGL2 and VideoFrame.copyTo); AVC444 will '
+                    + 'render at 4:2:0', true);
             yuv444Unavailable = true;
             return null;
         }
 
         yuv444 = new Guacamole.Yuv444Renderer();
+        colorSpaceApplied = false;
 
         if (!yuv444.supported) {
             yuv444 = null;
@@ -364,6 +721,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         return yuv444;
 
     }
+
+    /**
+     * Overrides already read from the query string or localStorage, by name.
+     * Neither source can change without a reload, so each is read once.
+     *
+     * @private
+     * @type {!Object.<string, *>}
+     */
+    var storedOverrides = {};
 
     /**
      * Reads a runtime override, from a window global, a query parameter, or
@@ -383,6 +749,20 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (window['__' + name] !== undefined)
             return window['__' + name];
 
+        /* The window global above is a property read and is checked every
+         * time, so setting one still takes effect mid-session -- which is the
+         * point of these, since one build is meant to compare 4:2:0, combined
+         * and combined-plus-filtered without a reload.
+         *
+         * The query string and localStorage cannot change without a reload,
+         * and reading them is not free: URLSearchParams parses the whole query
+         * on construction and localStorage is a synchronous, disk-backed read.
+         * On the combine path this ran twice per picture -- 60 times a second
+         * on the main thread -- for a value that was fixed before the first
+         * frame arrived. */
+        if (name in storedOverrides)
+            return storedOverrides[name];
+
         var value = null;
 
         try {
@@ -394,19 +774,19 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         }
 
         if (value === null || value === undefined)
-            return undefined;
+            return (storedOverrides[name] = undefined);
 
         /* '0' is deliberately not in that list: it is a valid threshold for
          * h264ChromaFilter, and an override that takes a number has to be
          * able to take zero. It still switches a boolean override off, since
          * callers coerce, and 0 is falsy. */
         if (value === 'off' || value === 'false')
-            return false;
+            return (storedOverrides[name] = false);
         if (value === 'on' || value === 'true')
-            return true;
+            return (storedOverrides[name] = true);
 
         var number = parseFloat(value);
-        return isNaN(number) ? true : number;
+        return (storedOverrides[name] = isNaN(number) ? true : number);
 
     }
 
@@ -444,6 +824,37 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @private
      * @returns {!(number|boolean)}
      */
+
+    /**
+     * Reports one whole picture's combine cost to the diagnostic.
+     *
+     * Once per picture rather than once per view: a main view accumulates and
+     * the auxiliary view that refines it closes the picture out, or the next
+     * main view does when none followed. Splitting a picture across two
+     * samples would halve every figure it reports.
+     *
+     * @private
+     * @param {!number} ms - Wall time the picture's combine work took.
+     */
+    function flushCombineCost(hadAux) {
+
+        var ms = combineWorkMs;
+        var resynced = combineResynced;
+
+        combineWorkMs = 0;
+        combineResynced = false;
+
+        if (ms <= 0)
+            return;
+
+        /* A picture that had to resync uploaded whole planes, so it says
+         * nothing about the steady state. */
+        if (!resynced)
+            recordStat('combine', hadAux, ms);
+
+    }
+
+
     function chromaFilter() {
         var value = override('h264ChromaFilter');
         if (value === undefined || value === true)
@@ -456,6 +867,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     /**
      * Reads the three planes out of a decoded frame and hands them to the
      * renderer, then renders and snapshots the result.
+     *
+     * A main view whose auxiliary view is still to come is uploaded but not
+     * rendered: the auxiliary view is about to re-render the same picture with
+     * real chroma, so rendering here would draw the 4:2:0 version of a picture
+     * that is overwritten microseconds later -- a shader pass and a blit per
+     * picture, thrown away. The server says which pictures those are
+     * (MS-RDPEGFX LC=0), since only it knows before the second access unit
+     * arrives. Its regions are carried over to the view that does paint.
      *
      * The frame is held across copyTo(), which is asynchronous and has no
      * synchronous equivalent -- there is no other way to reach the raw planes,
@@ -532,9 +951,48 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         }
 
+        /* Issued here rather than inside the chain, so that the two views of
+         * a picture are in flight at once; only what follows is ordered. */
+        var copy;
+        try {
+            copy = frame.copyTo(buffer, options);
+        } catch (e) {
+            copy = Promise.reject(e);
+        }
+
+        /* The chain below is this copy's real error handler, but it may not
+         * attach for some time, and a rejection with nothing attached yet is
+         * reported as unhandled. */
+        copy.catch(function() { /* handled by the chain */ });
+
+        var copyIssuedAt = nowMs();
+
         copyChain = copyChain.then(function() {
-            return frame.copyTo(buffer, options);
+            return copy;
         }).then(function(layout) {
+
+            /* Times the work, not the wait. The awaits above queue behind
+             * whatever else is in flight, so including them would measure the
+             * backlog and feed the suspension decision with its own output. */
+            var startedAt = nowMs();
+
+            if (override('h264CombineLog')) {
+                if (!copyWait)
+                    copyWait = { n: 0, sum: 0, max: 0 };
+                var waited = startedAt - copyIssuedAt;
+                copyWait.n++;
+                copyWait.sum += waited;
+                if (waited > copyWait.max)
+                    copyWait.max = waited;
+            }
+
+            /* A main view opens a picture, so anything still accumulated
+             * belongs to the previous one -- which evidently carried no
+             * auxiliary view, or that view would have closed it. Done before
+             * this picture's uploads so the resync flag they may set is not
+             * charged to the picture before it. */
+            if (view === 0)
+                flushCombineCost(false);
 
             /* NV12 has two planes rather than three; a null V plane is how
              * the renderer is told the chroma is interleaved into U. */
@@ -549,18 +1007,94 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 ? [layout[0].stride, layout[1].stride]
                 : [layout[0].stride, layout[1].stride, layout[2].stride];
 
-            if (view === 0)
-                renderer.uploadLuma(y, u, v, strides, pictureW, pictureH);
-            else
-                renderer.uploadAux(y, u, v, strides, planeW, planeH);
+            if (view === 0) {
 
-            /* The main view renders on its own as an ordinary 4:2:0 picture,
-             * exactly as a luma-only (LC=1) update does for FreeRDP; the
-             * auxiliary view then re-renders the same picture with its chroma
-             * applied. Two paints per picture is the reference behaviour, not
-             * an accident. */
+                /* Adopt whatever the decoder says this stream is, once. The
+                 * 4:2:0 path never reaches the shader -- the browser draws
+                 * that VideoFrame and applies its colour space itself -- so
+                 * converting here on an assumption is how the two paths come
+                 * out different colours on the same session. */
+                if (!colorSpaceApplied && renderer.setColorSpace) {
+                    console.log('[rustguac] H.264: 4:4:4 colour space is '
+                            + renderer.setColorSpace(frame.colorSpace));
+                    colorSpaceApplied = true;
+                }
+
+                /* This view's own regions, not the union built below: a
+                 * region the other view did not update has no new samples in
+                 * this plane either, and uploading over it would replace
+                 * valid rows with the same rows. */
+                if (resyncNeeded)
+                    combineResynced = true;
+
+                renderer.uploadLuma(y, u, v, strides, pictureW, pictureH,
+                        resyncNeeded ? null : frameState.rects);
+
+            }
+            else {
+
+                if (resyncNeeded)
+                    combineResynced = true;
+
+                renderer.uploadAux(y, u, v, strides, planeW, planeH, view,
+                        resyncNeeded ? null : frameState.rects);
+
+            }
+
+            /* An auxiliary view paints the picture its main view did not, so
+             * it paints both views' regions. A null list on either side means
+             * that view called the whole picture valid, which the union of the
+             * two must then be as well. */
+            if (view !== 0 && deferredMain) {
+
+                frameState.rects =
+                    (!deferredMainRects || !frameState.rects) ? null
+                        : deferredMainRects.concat(frameState.rects);
+
+                deferredMain = false;
+                deferredMainRects = null;
+
+            }
+
+            /* Nothing more to do for a main view that an auxiliary view is
+             * about to refine: its planes are uploaded, and the auxiliary
+             * view's render reads them. Its draw task is released below with
+             * no snapshot, which draws nothing -- the picture is painted once,
+             * by the task immediately behind this one.
+             *
+             * The cost of being wrong is one skipped picture: if that
+             * auxiliary view then fails to combine, this update is not painted
+             * at all rather than painted at 4:2:0, and the screen catches up
+             * on the next update. Every path that can fail there also
+             * abandons combining, so it is one picture, not a permanent
+             * regression -- and the server only sets the flag when it has
+             * already queued both views. */
+            if (view === 0 && frameState.paired) {
+                deferredMain = true;
+                deferredMainRects = frameState.rects;
+                combineWorkMs += nowMs() - startedAt;
+                return;
+            }
+
+            /* Whole planes have now been uploaded for whichever views this
+             * picture carries, so the textures match the screen again and the
+             * next picture may go back to uploading only its damaged rows. */
+            resyncNeeded = false;
+
+            /* A main view that paints its own picture leaves nothing for a
+             * later auxiliary view to inherit. Cleared here rather than only
+             * on consumption, so that a picture whose auxiliary view never
+             * arrived cannot hand its regions to an unrelated one. */
+            if (view === 0) {
+                deferredMain = false;
+                deferredMainRects = null;
+            }
+
+            /* A main view with no auxiliary view behind it renders on its own
+             * as an ordinary 4:2:0 picture, exactly as a luma-only (LC=1)
+             * update does for FreeRDP. */
             var rendered = renderer.render(view === 0 ? 0 : view,
-                    chromaFilter());
+                    chromaFilter(), frameState.rects);
 
             /* Nothing to snapshot means the renderer has given up -- a lost
              * context, most likely. Returning alone would leave every frame
@@ -573,21 +1107,30 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
             /* The watchdog may have released this frame's task while the
              * copy was in flight, in which case drawDecoded() has already run
-             * and nothing will ever paint this snapshot -- keeping it would
-             * strand a canvas outside the pool. */
-            if (frameState.settled)
+             * and nothing will ever paint this picture -- keeping it would
+             * leak the bitmap's GPU memory. */
+            if (frameState.settled) {
+                releaseSnapshot(rendered);
                 return;
+            }
 
-            /* Sized from the rendered canvas rather than from this frame:
-             * the v1 chroma layout pads the auxiliary view to a multiple of
-             * 16 rows, so an auxiliary frame's own dimensions can exceed the
-             * picture's. The renderer draws at the main view's size, leaving
-             * anything below that in a taller snapshot blank -- and with no
-             * rects the whole snapshot is blitted, painting that blank strip
-             * over the bottom of the display. */
-            var snapshot = acquireCanvas(rendered.width, rendered.height);
-            snapshot.getContext('2d').drawImage(rendered, 0, 0);
-            frameState.canvas = snapshot;
+            /* The renderer hands over its drawing buffer whole, so there is no
+             * copy to make here and no size to choose. That matters for the v1
+             * chroma layout, which pads the auxiliary view to a multiple of 16
+             * rows: the bitmap is the size the renderer drew at, which is the
+             * main view's, not this frame's taller one. Copying at the frame's
+             * size instead left a blank strip below the picture, blitted over
+             * the bottom of the display whenever the server sent no rects. */
+            frameState.canvas = rendered;
+
+            combineWorkMs += nowMs() - startedAt;
+
+            /* An auxiliary view completes the picture it refines, so the gate
+             * is charged here for both views at once -- suspending drops both.
+             * A main view cannot know whether one follows, so it only
+             * accumulates; the next main view closes it out if none did. */
+            if (view !== 0)
+                flushCombineCost(true);
 
         }).catch(function(e) {
 
@@ -599,6 +1142,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * rather than failing once per frame for the rest of the session. */
             combining = false;
             yuv444Unavailable = true;
+            combineWorkMs = 0;
+            combineResynced = false;
 
         }).then(function() {
 
@@ -624,19 +1169,100 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     /**
      * Releases any frame snapshot still held awaiting its draw task. Snapshots
      * live here between decode and draw, so discarding the map without
-     * reclaiming them throws away the pool's canvases.
+     * reclaiming them throws away the pool's canvases and leaks the GPU memory
+     * behind any combined frame's ImageBitmap.
      *
      * @private
      */
     function releaseHeldFrames() {
+
+        /* Nothing will paint the deferred main view's regions now, and holding
+         * them would apply one picture's regions to another. */
+        deferredMain = false;
+        deferredMainRects = null;
+        combineWorkMs = 0;
+        combineResynced = false;
+
+        /* Whatever is uploaded no longer corresponds to what is on screen, so
+         * the next combine uploads whole planes. */
+        resyncNeeded = true;
+
         for (var key in pendingFrames) {
             var frameState = pendingFrames[key];
             if (frameState && frameState.canvas) {
-                releaseCanvas(frameState.canvas);
+                releaseSnapshot(frameState.canvas);
                 frameState.canvas = null;
             }
         }
         pendingFrames = {};
+    }
+
+    /**
+     * The codec string to configure the decoder with, when no sequence
+     * parameter set has been seen yet. High profile at level 5.2, which
+     * covers every picture size this decoder is asked for, rather than the
+     * level 4.1 that used to be hardcoded here.
+     *
+     * The level in a codec string is not advisory: Chrome sizes its hardware
+     * decoder from it, and a stream whose frames exceed the declared level
+     * silently falls back to software, because hardwareAcceleration is a
+     * preference rather than a requirement. Level 4.1 permits 8192
+     * macroblocks, so it holds for 1920x944 (7080) and fails for 2688x1488
+     * (15624) -- which decoded in software at roughly twenty times the
+     * latency, and under AVC444 for two pictures per frame.
+     *
+     * @private
+     * @constant {string}
+     */
+    var DEFAULT_CODEC = 'avc1.640034';
+
+    /**
+     * Reads the codec string out of a sequence parameter set, if the given
+     * access unit carries one.
+     *
+     * The three bytes following an SPS NAL header are profile_idc,
+     * constraint_flags and level_idc, which are exactly the three bytes of an
+     * avc1 codec string. Taking them from the stream keeps the decoder's
+     * configuration in step with whatever the server chose, and the server
+     * does vary it: the level follows the picture size, so one session's
+     * stream may be 4.2 and the next 5.1.
+     *
+     * @private
+     * @param {!ArrayBuffer} nalData
+     *     A complete access unit in Annex B format.
+     *
+     * @returns {?string}
+     *     The codec string, or null if this access unit carries no SPS.
+     */
+    function codecFromSps(nalData) {
+
+        var bytes = new Uint8Array(nalData);
+        var i;
+
+        /* Annex B start codes are three or four bytes; scanning for the
+         * three-byte form finds both, since the four-byte form ends with it. */
+        for (i = 0; i + 4 < bytes.length; i++) {
+
+            if (bytes[i] !== 0 || bytes[i + 1] !== 0 || bytes[i + 2] !== 1)
+                continue;
+
+            /* nal_unit_type is the low five bits of the header byte. 7 is a
+             * sequence parameter set. */
+            if ((bytes[i + 3] & 0x1F) !== 7)
+                continue;
+
+            if (i + 6 >= bytes.length)
+                return null;
+
+            return 'avc1.'
+                + ('0' + bytes[i + 4].toString(16)).slice(-2)
+                + ('0' + bytes[i + 5].toString(16)).slice(-2)
+                + ('0' + bytes[i + 6].toString(16)).slice(-2);
+
+        }
+
+        return null;
+
     }
 
     /**
@@ -645,8 +1271,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @private
      * @param {number} width - Expected frame width.
      * @param {number} height - Expected frame height.
+     * @param {ArrayBuffer} [nalData]
+     *     The access unit about to be decoded, read for its sequence
+     *     parameter set if it carries one.
      */
-    function ensureDecoder(width, height) {
+    function ensureDecoder(width, height, nalData) {
 
         /* A decoder that has hit a terminal error is left closed. Treating it
          * as usable because `configured` is still set means every later frame
@@ -694,6 +1323,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                      * belongs to a decoder that has since been replaced. */
                     if (!frameState)
                         return;
+
+                    /* Submitted to arrived. Stamped before anything else here
+                     * so no work of ours is counted as the decoder's. */
+                    frameState.decodedAt = nowMs();
+                    if (frameState.submittedAt)
+                        recordStat('decode', frameState.view !== 0,
+                                frameState.decodedAt - frameState.submittedAt);
 
                     /* An auxiliary view means this is an AVC444 stream, so
                      * its chroma can be recovered. Switch over for the frames
@@ -799,6 +1435,10 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
                 console.error('[rustguac] H.264 decode error:', e.message);
 
+                diagnostic('decoder_rebuild', 'decode error: ' + e.message
+                        + '. Every queued frame is discarded and nothing is '
+                        + 'painted until the next keyframe.', true);
+
                 /* Terminal: the decoder is now closed and will never accept
                  * another chunk. Force ensureDecoder() to build a replacement,
                  * and hold frames until the next keyframe, the earliest point
@@ -821,8 +1461,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         });
 
+        var codec = (nalData && codecFromSps(nalData)) || DEFAULT_CODEC;
+
+        if (codec !== lastCodec) {
+            console.info('[rustguac] H.264: decoding as ' + codec);
+            lastCodec = codec;
+        }
+
         decoder.configure({
-            codec: 'avc1.640029', // High profile, level 4.1
+            codec: codec,
             hardwareAcceleration: 'prefer-hardware',
             optimizeForLatency: true
         });
@@ -865,14 +1512,21 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *     non-zero an AVC444 auxiliary chroma view, which is decoded for its
      *     references but never drawn.
      *
+     * @param {boolean} [paired=false]
+     *     Whether an auxiliary chroma view for this same picture follows
+     *     immediately. Only a main view can be paired, and only the server
+     *     knows: the auxiliary view is a separate access unit that has not
+     *     arrived yet. When it is combined, a paired main view is uploaded but
+     *     never painted, since the auxiliary view repaints the same picture.
+     *
      * @returns {?number}
      *     A token identifying this frame, to be passed to drawDecoded(), or
      *     null if it could not be submitted.
      */
     this.decode = function(layer, x, y, width, height, nalData, isKeyFrame,
-            rects, onReady, view) {
+            rects, onReady, view, paired) {
 
-        ensureDecoder(width, height);
+        ensureDecoder(width, height, nalData);
 
         /* No decoder at all: the caller's task must still be released, or the
          * display queue stalls behind a frame that will never arrive. */
@@ -886,12 +1540,37 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * recovery would never converge; wait for the next IDR instead. */
         if (needsKeyFrame) {
             if (!isKeyFrame) {
+
+                /* Held, not painted. Nothing on screen changes until the
+                 * server happens to send a keyframe, and an idle desktop
+                 * gives it no reason to. */
+                if (!keyframeWaitSince)
+                    keyframeWaitSince = nowMs();
+                keyframeWaitDropped++;
+
+                if (nowMs() - keyframeWaitSince > 2000)
+                    diagnostic('keyframe_wait', 'holding every frame for want '
+                            + 'of a keyframe: ' + keyframeWaitDropped
+                            + ' dropped over '
+                            + ((nowMs() - keyframeWaitSince) / 1000).toFixed(1)
+                            + 's. The picture is frozen until the server sends '
+                            + 'one, which an idle desktop may not do.');
+
                 if (onReady) onReady();
                 return null;
             }
             needsKeyFrame = false;
             console.warn('[rustguac] H.264: decoder rebuilt, resuming at'
                     + ' keyframe');
+
+            if (keyframeWaitSince) {
+                diagnostic('keyframe_resumed', 'keyframe arrived after '
+                        + ((nowMs() - keyframeWaitSince) / 1000).toFixed(1)
+                        + 's and ' + keyframeWaitDropped + ' dropped frame(s)',
+                        true);
+                keyframeWaitSince = 0;
+                keyframeWaitDropped = 0;
+            }
         }
 
         try {
@@ -911,18 +1590,23 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 y: y,
                 rects: (rects && rects.length) ? rects : null,
                 view: view || 0,
+                paired: !!paired,
                 onReady: onReady,
                 canvas: null,
                 settled: false,
                 watchdog: null
             };
 
+            frameState.submittedAt = nowMs();
             pendingDecodes++;
 
             frameState.watchdog = setTimeout(function() {
                 frameState.watchdog = null;
-                if (!frameState.canvas && frameState.onReady)
-                    frameState.onReady();
+                if (!frameState.canvas) {
+                    watchdogFires++;
+                    reportAbandoned();
+                    if (frameState.onReady) frameState.onReady();
+                }
             }, DECODE_WATCHDOG_MS);
 
             decoder.decode(chunk);
@@ -948,7 +1632,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 /* A snapshot already taken for this frame would otherwise be
                  * stranded outside the pool, since no draw task will run. */
                 if (frameState.canvas) {
-                    releaseCanvas(frameState.canvas);
+                    releaseSnapshot(frameState.canvas);
                     frameState.canvas = null;
                 }
 
@@ -993,6 +1677,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             return;
         }
 
+        /* Ready to painted: time in the display's ordered queue, not work. */
+        if (frameState.decodedAt)
+            recordStat('draw', frameState.view !== 0,
+                    nowMs() - frameState.decodedAt);
+
         try {
 
             if (frameState.layer) {
@@ -1020,7 +1709,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         } finally {
             frameState.canvas = null;
-            releaseCanvas(snapshot);
+            releaseSnapshot(snapshot);
             settle(frameState);
         }
 
@@ -1048,6 +1737,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var timer = setTimeout(function() {
             if (!resolved) {
                 resolved = true;
+                syncTimeouts++;
+                reportAbandoned();
                 var now = performance.now();
                 if (now - lastTimeoutWarn > 1000) {
                     lastTimeoutWarn = now;
@@ -1139,3 +1830,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 Guacamole.H264Decoder.isSupported = function isSupported() {
     return typeof VideoDecoder !== 'undefined';
 };
+
+/**
+ * Sink for decoder diagnostics, or null. Called as onDiagnostic(event, detail)
+ * with a short event name and a description, no more than once per event every
+ * 30 seconds (transitions excepted). The page is expected to forward these to
+ * the server; a fault that appears once in days is not going to be caught in
+ * anyone's console.
+ *
+ * @type {?function(string, string)}
+ */
+Guacamole.H264Decoder.onDiagnostic = null;

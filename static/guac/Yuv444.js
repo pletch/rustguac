@@ -58,10 +58,17 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
     /**
      * The canvas the combined image is rendered into.
      *
+     * Offscreen rather than an element, so that the finished picture can leave
+     * by transferToImageBitmap(). That hands the drawing buffer over whole,
+     * where reading it back out of an element means drawImage() into a second
+     * canvas -- a full-frame RGBA copy per view, 8MB a picture at 1080p and
+     * four times that at 4K, on the main thread.
+     *
      * @private
-     * @type {!HTMLCanvasElement}
+     * @type {!OffscreenCanvas}
      */
-    var canvas = document.createElement('canvas');
+    var canvas = (typeof OffscreenCanvas !== 'undefined')
+        ? new OffscreenCanvas(1, 1) : null;
 
     /**
      * The WebGL2 context, or null if WebGL2 is unavailable.
@@ -72,28 +79,21 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
     var gl = null;
 
     try {
-        /* This canvas is never in the document; it exists to be read back
-         * from with drawImage(). That rules out two attributes that would
-         * otherwise be the obvious choice here:
-         *
-         * desynchronized asks for the low-latency present path, which is for
-         * canvases actually on screen and on some drivers -- mobile ones in
-         * particular -- puts the drawing buffer somewhere that is not a
-         * reliable source for a readback.
-         *
-         * preserveDrawingBuffer: false leaves the buffer's contents undefined
-         * after a compositing boundary. The drawImage() here is synchronous
-         * with the draw, so in principle it never crosses one, but it runs
-         * from a promise callback and that is a thinner guarantee than it
-         * looks. The copy it costs is one the driver is likely making anyway.
-         */
+        if (!canvas)
+            throw new Error('no OffscreenCanvas');
+
+        /* preserveDrawingBuffer is deliberately absent. It exists to keep the
+         * buffer readable after a compositing boundary, which is what a
+         * drawImage() readback needs and what costs the driver a copy of every
+         * frame. transferToImageBitmap() takes the buffer itself, immediately
+         * after the draw and with no compositing in between, so the guarantee
+         * is not needed and the copy is not paid. */
         gl = canvas.getContext('webgl2', {
             alpha: false,
             antialias: false,
             depth: false,
             stencil: false,
-            premultipliedAlpha: false,
-            preserveDrawingBuffer: true
+            premultipliedAlpha: false
         });
     } catch (e) {
         gl = null;
@@ -182,6 +182,9 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         'uniform int uLayout;',    /* 0 = 4:2:0 only, 1 = chroma v1, 2 = chroma v2 */
         'uniform int uInterleaved;',/* bit 0: main view is NV12, bit 1: auxiliary is */
         'uniform float uFilter;',  /* recovery threshold, or 0 to leave the mean alone */
+        'uniform vec2 uRange;',    /* luma offset, luma scale */
+        'uniform float uCScale;',  /* chroma scale */
+        'uniform vec4 uCoef;',     /* R:v, G:u, G:v, B:u */
 
         'out vec4 fragColor;',
 
@@ -331,17 +334,25 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         '        V = unfilter(V, vR + vD + vRD);',
         '    }',
 
-        /* YUV to RGB. BT.709 at full range, matching the coefficients FreeRDP
-         * decodes these streams with (prim_internal.h: 403, 475, 48, 120 over
-         * 256, with no 16 offset on Y). Using limited-range or BT.601 here
-         * would tint the whole session. */
-        '    float u = U - 0.50196078;',  /* 128/255 */
-        '    float v = V - 0.50196078;',
+        /* YUV to RGB, with the matrix and range the decoder reported for
+         * this stream rather than an assumed pair.
+         *
+         * This matters because the 4:2:0 path does not come through here: the
+         * browser draws that VideoFrame itself and applies the frame's own
+         * colour space, including the limited-range expansion of 16-235 to
+         * 0-255. Converting here as though the same samples were full range
+         * leaves blacks at 16 and whites at 235, so the combined 4:4:4 picture
+         * renders visibly flatter than the 4:2:0 one beside it -- the same
+         * session, two different colours, depending only on which codec the
+         * server happened to choose. setColorSpace() supplies these. */
+        '    float luma = (Y - uRange.x) * uRange.y;',
+        '    float u = (U - 0.50196078) * uCScale;',  /* 128/255 */
+        '    float v = (V - 0.50196078) * uCScale;',
 
         '    vec3 rgb = vec3(',
-        '        Y + 1.57421875 * v,',
-        '        Y - 0.18750000 * u - 0.46875000 * v,',
-        '        Y + 1.85546875 * u);',
+        '        luma + uCoef.x * v,',
+        '        luma - uCoef.y * u - uCoef.z * v,',
+        '        luma + uCoef.w * u);',
 
         '    fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);',
         '}'
@@ -384,6 +395,19 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      */
     var PLANES = ['uLumaY', 'uLumaU', 'uLumaV', 'uAuxY', 'uAuxU', 'uAuxV'];
 
+    /**
+     * The most regions worth converting one draw call at a time. Past this,
+     * the scissored draws cost more than they save and the whole picture is
+     * converted in one -- scattered rects cover most of the screen between
+     * them long before the call overhead matters, so the threshold is not a
+     * sensitive one.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var MAX_CLIP_RECTS = 32;
+
     if (gl) {
 
         var vs = compile(gl.VERTEX_SHADER, VERTEX_SHADER);
@@ -413,6 +437,9 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
                 uniforms.auxSize = gl.getUniformLocation(program, 'uAuxSize');
                 uniforms.layout = gl.getUniformLocation(program, 'uLayout');
                 uniforms.filter = gl.getUniformLocation(program, 'uFilter');
+                uniforms.range = gl.getUniformLocation(program, 'uRange');
+                uniforms.cScale = gl.getUniformLocation(program, 'uCScale');
+                uniforms.coef = gl.getUniformLocation(program, 'uCoef');
                 uniforms.interleaved = gl.getUniformLocation(program,
                         'uInterleaved');
 
@@ -452,6 +479,136 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
     /* ==================== Uploading ==================== */
 
     /**
+     * The fraction of a plane's rows past which uploading bands is not worth
+     * it: the rows saved no longer pay for the extra calls and the partial
+     * texture updates they cause.
+     *
+     * @private
+     * @constant
+     */
+    var BAND_LIMIT = 0.75;
+
+    /**
+     * Turns a damage list into the row ranges of a plane it touches, merged
+     * and in order, or null to upload the plane whole.
+     *
+     * Rows, not rectangles: a plane's rows are contiguous in memory, so a row
+     * range is one texSubImage2D against one run of bytes, while a rectangle
+     * would be a call per row. The packed chroma layouts rule out cropping
+     * horizontally in any case -- both halves of an auxiliary row carry
+     * different components of the same output pixels.
+     *
+     * @private
+     *
+     * @param {Array} rects
+     *     The damaged regions, in picture coordinates.
+     *
+     * @param {!number} shift
+     *     How many times to halve a picture row to reach a plane row: 0 for a
+     *     full-resolution plane, 1 for a chroma plane. Ranges are rounded
+     *     outward, so a rect starting on an odd row still brings in the chroma
+     *     row it shares with the row above.
+     *
+     * @param {!number} planeHeight
+     *     The plane's height, in its own rows.
+     *
+     * @returns {Array}
+     *     The row ranges, or null if the whole plane should be uploaded.
+     */
+    function bandsFor(rects, shift, planeHeight) {
+
+        if (!rects || !rects.length || rects.length > MAX_CLIP_RECTS)
+            return null;
+
+        var round = (1 << shift) - 1;
+        var bands = [];
+
+        for (var i = 0; i < rects.length; i++) {
+
+            var y0 = Math.max(0, (rects[i].y | 0)) >> shift;
+            var y1 = Math.min(planeHeight << shift,
+                    (rects[i].y | 0) + (rects[i].height | 0) + round) >> shift;
+
+            if (y1 > y0)
+                bands.push({ y0: y0, y1: Math.min(planeHeight, y1) });
+
+        }
+
+        return merge(bands, planeHeight);
+
+    }
+
+    /**
+     * Sorts row ranges and joins those that touch, so that overlapping rects --
+     * a caret inside the line it sits on, say -- do not upload the same rows
+     * twice. Returns null when the ranges cover so much of the plane that
+     * uploading it whole is the cheaper call.
+     *
+     * @private
+     */
+    function merge(bands, planeHeight) {
+
+        if (!bands.length)
+            return null;
+
+        bands.sort(function(a, b) { return a.y0 - b.y0; });
+
+        var merged = [bands[0]];
+        var rows = 0;
+
+        for (var i = 1; i < bands.length; i++) {
+            var last = merged[merged.length - 1];
+            if (bands[i].y0 <= last.y1)
+                last.y1 = Math.max(last.y1, bands[i].y1);
+            else
+                merged.push(bands[i]);
+        }
+
+        for (var m = 0; m < merged.length; m++)
+            rows += merged[m].y1 - merged[m].y0;
+
+        return (rows >= planeHeight * BAND_LIMIT) ? null : merged;
+
+    }
+
+    /**
+     * The rows of a v1 auxiliary luma plane that a damage list touches.
+     *
+     * The v1 layout does not put output row y at plane row y. Odd output rows
+     * are whole rows of this plane, written in bands of 16 -- the first 8 rows
+     * of each band feeding U and the second 8 feeding V, counted continuously
+     * across the padded plane, which is what main() inverts as
+     * band * 16 + off. Rounding each range out to whole 16-row bands is the
+     * cheap way to be certain every row the shader will read has been
+     * uploaded; the alternative is two ranges per rect for no useful saving.
+     *
+     * @private
+     */
+    function auxV1LumaBands(rects, planeHeight) {
+
+        if (!rects || !rects.length || rects.length > MAX_CLIP_RECTS)
+            return null;
+
+        var bands = [];
+
+        for (var i = 0; i < rects.length; i++) {
+
+            var i0 = Math.max(0, rects[i].y | 0) >> 1;
+            var i1 = ((rects[i].y | 0) + (rects[i].height | 0) + 1) >> 1;
+            if (i1 <= i0) i1 = i0 + 1;
+
+            bands.push({
+                y0: (i0 >> 3) * 16,
+                y1: Math.min(planeHeight, (((i1 - 1) >> 3) + 1) * 16)
+            });
+
+        }
+
+        return merge(bands, planeHeight);
+
+    }
+
+    /**
      * Uploads one plane into its texture, reallocating only when the plane's
      * dimensions change.
      *
@@ -464,8 +621,14 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      * @param {number} [channels=1] - Samples per texel: 1 for an ordinary
      *                                plane, 2 for an interleaved NV12 chroma
      *                                plane, whose pairs become RG texels.
+     * @param {Array} [bands] - The row ranges to upload, or null for all of
+     *                          them. Ignored on the first upload into a
+     *                          texture, and whenever the texture has just been
+     *                          reallocated: the rows outside the bands are
+     *                          meant to still hold the previous picture's, and
+     *                          a fresh texture holds nothing.
      */
-    function uploadPlane(name, data, stride, w, h, channels) {
+    function uploadPlane(name, data, stride, w, h, channels, bands) {
 
         channels = channels || 1;
 
@@ -488,6 +651,22 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
             slot.h = h;
             slot.channels = channels;
         }
+
+        /* Only the damaged rows. The rest of the texture still holds the
+         * previous picture's, which is what the server said is still valid --
+         * the same argument that lets the caller repaint only those regions.
+         * srcOffset is in elements of the view handed in, which starts at the
+         * plane, so a row range is one call against one run of bytes. */
+        else if (bands) {
+            for (var i = 0; i < bands.length; i++) {
+                var rows = bands[i].y1 - bands[i].y0;
+                if (rows > 0)
+                    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, bands[i].y0, w, rows,
+                            format, gl.UNSIGNED_BYTE, data,
+                            bands[i].y0 * stride);
+            }
+        }
+
         else
             gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h,
                     format, gl.UNSIGNED_BYTE, data);
@@ -507,8 +686,12 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      * @param {!number[]} strides - Bytes per row for [y, u, v].
      * @param {!number} w - Picture width.
      * @param {!number} h - Picture height.
+     * @param {Array} [rects] - The regions this view updates, in picture
+     *                          coordinates. Only the rows they touch are
+     *                          uploaded; omit, or pass null, to upload the
+     *                          whole picture.
      */
-    this.uploadLuma = function uploadLuma(y, u, v, strides, w, h) {
+    this.uploadLuma = function uploadLuma(y, u, v, strides, w, h, rects) {
 
         if (!renderer.supported)
             return;
@@ -525,13 +708,16 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
 
         lumaInterleaved = !v;
 
-        uploadPlane('uLumaY', y, strides[0], w, h);
+        var lumaBands = bandsFor(rects, 0, h);
+        var chromaBands = bandsFor(rects, 1, halfH);
+
+        uploadPlane('uLumaY', y, strides[0], w, h, 1, lumaBands);
 
         if (lumaInterleaved)
-            uploadPlane('uLumaU', u, strides[1], halfW, halfH, 2);
+            uploadPlane('uLumaU', u, strides[1], halfW, halfH, 2, chromaBands);
         else {
-            uploadPlane('uLumaU', u, strides[1], halfW, halfH);
-            uploadPlane('uLumaV', v, strides[2], halfW, halfH);
+            uploadPlane('uLumaU', u, strides[1], halfW, halfH, 1, chromaBands);
+            uploadPlane('uLumaV', v, strides[2], halfW, halfH, 1, chromaBands);
         }
 
     };
@@ -548,8 +734,15 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      * @param {!number} w - Auxiliary frame width.
      * @param {!number} h - Auxiliary frame height, which the v1 layout pads to
      *                      a multiple of 16 and so may exceed the picture's.
+     * @param {number} [layout] - Which chroma layout this view is in, 1 or 2.
+     *                            Required to upload less than the whole plane:
+     *                            the two layouts put an output row in
+     *                            different places, so which plane rows a
+     *                            region touches depends on it.
+     * @param {Array} [rects] - The regions this view updates, in picture
+     *                          coordinates, or null for the whole picture.
      */
-    this.uploadAux = function uploadAux(y, u, v, strides, w, h) {
+    this.uploadAux = function uploadAux(y, u, v, strides, w, h, layout, rects) {
 
         if (!renderer.supported)
             return;
@@ -562,13 +755,22 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
 
         auxInterleaved = !v;
 
-        uploadPlane('uAuxY', y, strides[0], w, h);
+        /* The v2 layout puts output row y at plane row y, so its luma bands
+         * are the picture's. The v1 layout scatters them across 16-row bands
+         * and needs its own inverse. Both layouts read the auxiliary chroma
+         * planes at y >> 1, as an ordinary chroma plane. */
+        var lumaBands = (layout === 1)
+            ? auxV1LumaBands(rects, h)
+            : (layout === 2 ? bandsFor(rects, 0, h) : null);
+        var chromaBands = layout ? bandsFor(rects, 1, halfH) : null;
+
+        uploadPlane('uAuxY', y, strides[0], w, h, 1, lumaBands);
 
         if (auxInterleaved)
-            uploadPlane('uAuxU', u, strides[1], halfW, halfH, 2);
+            uploadPlane('uAuxU', u, strides[1], halfW, halfH, 2, chromaBands);
         else {
-            uploadPlane('uAuxU', u, strides[1], halfW, halfH);
-            uploadPlane('uAuxV', v, strides[2], halfW, halfH);
+            uploadPlane('uAuxU', u, strides[1], halfW, halfH, 1, chromaBands);
+            uploadPlane('uAuxV', v, strides[2], halfW, halfH, 1, chromaBands);
         }
 
     };
@@ -576,8 +778,8 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
     /* ==================== Rendering ==================== */
 
     /**
-     * Renders the currently uploaded planes, returning the canvas holding the
-     * result.
+     * Renders the currently uploaded planes, returning the finished picture as
+     * an ImageBitmap.
      *
      * @param {!number} layout
      *     Which auxiliary layout to apply: 0 to use the main view alone
@@ -591,11 +793,113 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      *     sample is discarded as noise, or false not to recover at all. Has no
      *     effect when the layout is 0.
      *
-     * @returns {HTMLCanvasElement}
-     *     The canvas holding the rendered image, or null if this renderer is
-     *     not usable.
+     * @param {Array} [clip]
+     *     The regions of the picture the caller intends to use, each
+     *     {x, y, width, height} in picture coordinates. Only those are
+     *     converted; the rest of the returned image is left blank, so a caller
+     *     passing this MUST draw only these regions. Omit, or pass null, to
+     *     convert the whole picture.
+     *
+     * @returns {ImageBitmap}
+     *     The rendered image, whose ownership passes to the caller and which
+     *     must be close()d once drawn, or null if this renderer is not usable.
      */
-    this.render = function render(layout, filter) {
+    /**
+     * The conversion currently in effect. Defaults to BT.709 at limited range,
+     * which is what an H.264 stream carrying no VUI signalling means, and what
+     * xrdp and Windows both send in practice.
+     *
+     * @private
+     */
+    var colorSpace = conversionFor(true, 'bt709', true);
+
+    /**
+     * Returns the luma offset, scales and matrix coefficients for a decoded
+     * frame's colour space.
+     *
+     * Range is the half of this that shows: limited range carries black at 16
+     * and white at 235, so the two differ by the whole picture's contrast. The
+     * matrix mostly shifts hue in saturated regions, and only the two common
+     * ones are distinguished.
+     *
+     * @private
+     *
+     * @param {!boolean} fullRange
+     *     Whether the samples span 0-255 rather than 16-235.
+     *
+     * @param {String} matrix
+     *     The VideoColorSpace matrix name, if the decoder reported one.
+     *
+     * @param {!boolean} assumed
+     *     Whether the range was defaulted rather than signalled by the stream.
+     *     Carried only into the description, so that a session rendering with
+     *     the wrong contrast can be told from one rendering with the right
+     *     contrast for a different reason.
+     *
+     * @returns {!Object}
+     *     The conversion, as consumed by render().
+     */
+    function conversionFor(fullRange, matrix, assumed) {
+
+        /* BT.601 for the standard-definition matrices, BT.709 otherwise --
+         * including when nothing was reported, since these are desktop
+         * streams. */
+        var sd = (matrix === 'smpte170m' || matrix === 'bt470bg');
+
+        return {
+            yOffset : fullRange ? 0.0 : 16.0 / 255.0,
+            yScale  : fullRange ? 1.0 : 255.0 / 219.0,
+            cScale  : fullRange ? 1.0 : 255.0 / 224.0,
+            coef    : sd
+                ? [1.402, 0.344136, 0.714136, 1.772]
+                : [1.5748, 0.187324, 0.468124, 1.8556],
+            describe: (fullRange ? 'full' : 'limited') + ' range'
+                    + (assumed ? ' (ASSUMED -- stream did not signal it)' : '')
+                    + ', ' + (sd ? 'BT.601' : 'BT.709')
+                    + (matrix ? '' : ' (assumed)')
+        };
+
+    }
+
+    /**
+     * Adopts the colour space of a decoded frame, so the combined picture
+     * matches what the browser draws for the 4:2:0 path.
+     *
+     * A frame whose colour space is absent or only partly populated keeps the
+     * current conversion for the unreported parts: guessing full range on a
+     * stream that never said so is the error this exists to avoid.
+     *
+     * @param {VideoColorSpace} reported
+     *     The colorSpace of a decoded VideoFrame, if any.
+     *
+     * @returns {!String}
+     *     A description of the conversion now in effect.
+     */
+    this.setColorSpace = function setColorSpace(reported) {
+
+        var signalled = !!(reported && reported.fullRange !== null
+                && reported.fullRange !== undefined);
+
+        /* Full range unless the stream says otherwise. MS-RDPEGFX specifies
+         * the ARGB-to-AYUV transform as full-range BT.709 with the components
+         * clamped to 0...255, so an unsignalled RDPEGFX stream is full range
+         * by definition -- and expanding 16-235 to 0-255 on it crushes blacks,
+         * clips whites and over-saturates chroma by 255/224. It looks punchier
+         * and is wrong.
+         *
+         * An explicit flag still wins. A host that signals limited most likely
+         * is limited, whatever the specification says, and following the label
+         * is the defensible reading of a stream that took the trouble to carry
+         * one. */
+        var fullRange = signalled ? !!reported.fullRange : true;
+
+        colorSpace = conversionFor(fullRange, reported && reported.matrix,
+                !signalled);
+        return colorSpace.describe;
+
+    };
+
+    this.render = function render(layout, filter, clip) {
 
         if (!renderer.supported || gl.isContextLost() || !width || !height)
             return null;
@@ -607,10 +911,59 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         gl.uniform2i(uniforms.auxSize, auxWidth, auxHeight);
         gl.uniform1i(uniforms.layout, layout);
         gl.uniform1f(uniforms.filter, filter === false ? -1.0 : filter / 255.0);
+        gl.uniform2f(uniforms.range, colorSpace.yOffset, colorSpace.yScale);
+        gl.uniform1f(uniforms.cScale, colorSpace.cScale);
+        gl.uniform4f(uniforms.coef, colorSpace.coef[0], colorSpace.coef[1],
+                colorSpace.coef[2], colorSpace.coef[3]);
         gl.uniform1i(uniforms.interleaved,
                 (lumaInterleaved ? 1 : 0) | (auxInterleaved ? 2 : 0));
 
-        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        /* Every pixel of the picture costs a chroma unpack and, on three of
+         * every four, three more of them for the reverse filter. Converting a
+         * whole 4K surface to repaint a caret is most of the cost of combining
+         * for none of the benefit, so where the server said which regions it
+         * actually updated, only those are converted -- the caller draws no
+         * more than that either way.
+         *
+         * The scissor rectangle is in GL's bottom-up coordinates, while the
+         * picture and its rects are top-down. */
+        var drawn = 0;
+
+        if (clip && clip.length && clip.length <= MAX_CLIP_RECTS) {
+
+            gl.enable(gl.SCISSOR_TEST);
+
+            for (var i = 0; i < clip.length; i++) {
+
+                var rect = clip[i];
+
+                /* Clamped rather than trusted: a rect reaching outside the
+                 * picture is a server bug, but glScissor with a negative
+                 * width is a GL error that would take the whole frame with
+                 * it. */
+                var x0 = Math.max(0, rect.x | 0);
+                var y0 = Math.max(0, rect.y | 0);
+                var x1 = Math.min(width, (rect.x | 0) + (rect.width | 0));
+                var y1 = Math.min(height, (rect.y | 0) + (rect.height | 0));
+
+                if (x1 <= x0 || y1 <= y0)
+                    continue;
+
+                gl.scissor(x0, height - y1, x1 - x0, y1 - y0);
+                gl.drawArrays(gl.TRIANGLES, 0, 3);
+                drawn++;
+
+            }
+
+            gl.disable(gl.SCISSOR_TEST);
+
+        }
+
+        /* No regions given, too many of them to be worth a draw call each, or
+         * every one of them empty: convert the whole picture. The caller is
+         * still free to draw only part of it. */
+        if (!drawn)
+            gl.drawArrays(gl.TRIANGLES, 0, 3);
 
         /* Checked again on the far side of the draw. The check at the top of
          * this function has already passed by the time the context dies
@@ -631,14 +984,19 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
             return null;
         }
 
-        return canvas;
+        /* Hands over the drawing buffer rather than copying out of it. The
+         * canvas is left with a fresh blank buffer of the same size, which the
+         * next render() overwrites entirely -- every draw covers the whole
+         * viewport with a single triangle -- so nothing is carried between
+         * frames that would need clearing. */
+        return canvas.transferToImageBitmap();
 
     };
 
     /**
      * Returns the canvas this renderer draws into.
      *
-     * @returns {!HTMLCanvasElement}
+     * @returns {!OffscreenCanvas}
      */
     this.getCanvas = function getCanvas() {
         return canvas;
@@ -680,8 +1038,16 @@ Guacamole.Yuv444Renderer.isSupported = function isSupported() {
             || typeof VideoFrame.prototype.copyTo !== 'function')
         return false;
 
+    /* The finished picture leaves as an ImageBitmap; without that the readback
+     * costs a full-frame copy per view, which is most of what combining is
+     * trying to avoid. */
+    if (typeof OffscreenCanvas === 'undefined'
+            || typeof OffscreenCanvas.prototype.transferToImageBitmap
+                !== 'function')
+        return false;
+
     try {
-        var probe = document.createElement('canvas');
+        var probe = new OffscreenCanvas(1, 1);
         return !!probe.getContext('webgl2');
     } catch (e) {
         return false;
