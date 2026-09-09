@@ -173,6 +173,20 @@ Guacamole.Tunnel = function() {
      */
     this.oninstruction = null;
 
+    /**
+     * Fired when a binary blob frame is received, if the tunnel implementation
+     * supports one. Carries the stream index and the raw payload, in place of
+     * the base64 a "blob" instruction would have carried.
+     *
+     * @event
+     * @param {!number} index
+     *     The index of the stream the payload belongs to.
+     *
+     * @param {!ArrayBuffer} payload
+     *     The blob payload, already decoded.
+     */
+    this.onbinary = null;
+
 };
 
 /**
@@ -742,6 +756,32 @@ Guacamole.HTTPTunnel.prototype = new Guacamole.Tunnel();
 Guacamole.WebSocketTunnel = function(tunnelURL) {
 
     /**
+     * Bytes of header preceding the payload of a binary blob frame: a version,
+     * a type, two reserved bytes, then the stream index as a little-endian
+     * uint32. Eight rather than six so the payload starts 8-byte aligned.
+     *
+     * @constant
+     * @type {!number}
+     */
+    var BINARY_HEADER_LENGTH = 8;
+
+    /**
+     * The binary frame format this client understands.
+     *
+     * @constant
+     * @type {!number}
+     */
+    var BINARY_FRAME_VERSION = 1;
+
+    /**
+     * Frame type identifying a blob payload.
+     *
+     * @constant
+     * @type {!number}
+     */
+    var BINARY_FRAME_BLOB = 0;
+
+    /**
      * Reference to this WebSocket tunnel.
      *
      * @private
@@ -987,8 +1027,46 @@ Guacamole.WebSocketTunnel = function(tunnelURL) {
 
         };
 
-        // Connect socket
-        socket = new WebSocket(tunnelURL + "?" + data, "guacamole");
+        /**
+         * Unpacks a binary blob frame and hands its payload to the tunnel's
+         * binary handler. The frame is 8 bytes of header then raw payload:
+         * version, type, two reserved bytes, then the stream index as a
+         * little-endian uint32. The index travels in the frame rather than
+         * being inferred from the preceding text instruction, so this stays
+         * stateless and a frame is interpretable on its own.
+         *
+         * A frame of an unknown version or type is dropped rather than
+         * guessed at, since misreading one would corrupt a stream silently.
+         *
+         * @param {!ArrayBuffer} buffer
+         *     The received binary frame.
+         */
+        function receiveBinary(buffer) {
+
+            if (buffer.byteLength < BINARY_HEADER_LENGTH)
+                return;
+
+            var header = new DataView(buffer, 0, BINARY_HEADER_LENGTH);
+            if (header.getUint8(0) !== BINARY_FRAME_VERSION
+                    || header.getUint8(1) !== BINARY_FRAME_BLOB)
+                return;
+
+            var index = header.getUint32(4, true);
+
+            if (tunnel.onbinary)
+                tunnel.onbinary(index, buffer.slice(BINARY_HEADER_LENGTH));
+
+        }
+
+        // Connect socket. binaryBlobs advertises that this client can decode
+        // binary blob frames; a server that does not know the parameter, or a
+        // client older than it, simply keeps exchanging base64 text.
+        var query = data ? data + "&binaryBlobs=1" : "binaryBlobs=1";
+        socket = new WebSocket(tunnelURL + "?" + query, "guacamole");
+
+        // Binary frames arrive as ArrayBuffers rather than Blobs, so they can
+        // be read synchronously and stay in order with the text around them.
+        socket.binaryType = "arraybuffer";
 
         socket.onopen = function(event) {
             resetTimers();
@@ -1016,6 +1094,17 @@ Guacamole.WebSocketTunnel = function(tunnelURL) {
             resetTimers();
 
             try {
+
+                // A binary frame carries one stream's blob payload as raw
+                // bytes, saving the quarter of the wire that base64 costs.
+                // Text and binary frames are delivered in one order, so a
+                // blob sent this way arrives between exactly the neighbours
+                // it had as text -- nothing here can reorder the stream.
+                if (event.data instanceof ArrayBuffer) {
+                    receiveBinary(event.data);
+                    return;
+                }
+
                 parser.receive(event.data);
             }
             catch (e) {

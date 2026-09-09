@@ -380,6 +380,37 @@ guacd defaults to `-L info` and rustguac to `RUST_LOG=info`, so all of it lands
 in the journal with no configuration — but the journal must be persistent, or
 a fault this rare is gone by the time it is reported.
 
+### Binary blobs
+
+Blob payloads of `h264` and `audio` streams are sent as **binary WebSocket
+frames** rather than base64 inside text instructions, which is a quarter of the
+wire — measured at 24.3% on an idle desktop capture and 24.9% on a video one.
+`img` is deliberately excluded: its blobs feed `DataURIReader`, which wants the
+encoded form.
+
+The conversion is in **rustguac, not a guacd patch** (`src/binary_blob.rs`,
+applied in `guacd_to_ws`). rustguac tees the raw guacd stream to disk as the
+recording, so converting upstream of that tee would turn every recording binary
+and take `SessionRecording.js` with it. Order in `guacd_to_ws` is therefore
+record, then measure, then convert, then send — recording and `FrameStats` both
+still see the text form.
+
+Clients opt in with `binaryBlobs=1` on the WebSocket query, so an older cached
+`client.html` or a third-party integration keeps getting base64. The frame is 8
+bytes of header (version, type, two reserved, then a little-endian u32 stream
+index) followed by the payload; `tests/binary-blob-format.mjs` pins that layout
+across the Rust/JS boundary, because a disagreement there fails silently — the
+client drops frames it cannot parse and video simply stops while both ends look
+healthy. Full rationale in `docs/binary-blobs.md`.
+
+**The UDP transport split was measured and declined** (`tests/spike/`). TCP
+head-of-line blocking costs 5.7% of a video session at 30ms/2% loss and 17.5%
+at 100ms/2%, but reclaiming it needs fragmentation, NACK/ARQ and a
+cross-channel ordering gate, and Caddy cannot proxy WebTransport. The spike
+also established that Windows sends keyframes 20-60s apart during video and
+not at all for 337s on an idle desktop, so any policy that drops a late access
+unit corrupts the screen until the session ends.
+
 ### Native resolution (HiDPI)
 
 Per-connection **Native Resolution** checkbox requests the framebuffer in the

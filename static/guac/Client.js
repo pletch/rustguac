@@ -2010,6 +2010,23 @@ Guacamole.Client = function(tunnel) {
 
     };
 
+    /*
+     * A blob delivered as a binary frame rather than base64 inside a "blob"
+     * instruction. It goes to exactly the same place -- the stream's onblob --
+     * so a reader that accepts an ArrayBuffer (Guacamole.ArrayBufferReader,
+     * which the H.264 and audio paths both use) needs to know nothing about
+     * how its bytes arrived.
+     */
+    tunnel.onbinary = function(index, payload) {
+
+        var stream = streams[index];
+        if (stream && stream.onblob)
+            stream.onblob(payload);
+
+        scheduleKeepAlive();
+
+    };
+
     /**
      * Sends a disconnect instruction to the server and closes the tunnel.
      */
