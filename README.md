@@ -81,6 +81,28 @@ Measured with 1080p video playing, guacd session CPU over 30s:
 | xrdp (AVC420) | ~100% of a core | **2.0%** |
 | Windows 11 (AVC444) | 90.6% of a core | **2.1%** |
 
+### Transport
+
+- **Binary blobs** (`src/binary_blob.rs`, [`docs/binary-blobs.md`](docs/binary-blobs.md))
+  — blob payloads of `h264` and `audio` streams are sent as binary WebSocket
+  frames instead of base64 inside text instructions. Base64 sends four bytes
+  for every three, so this is **roughly a quarter of the wire**: measured at
+  24.3% on an idle desktop capture and 24.9% on a video one, both round-tripped
+  byte for byte. `img` is deliberately excluded, since its blobs feed
+  `DataURIReader`, which wants the encoded form.
+
+  Upstream cannot do this: the Guacamole protocol is defined as text, `.guac`
+  recordings are that same stream on disk, and the HTTP long-polling tunnel
+  cannot carry interleaved binary. It is worth doing here because sustained
+  multi-megabit H.264 is a workload upstream does not have — it exists only
+  because of this fork's passthrough patch.
+
+  The conversion is in rustguac rather than a guacd patch, because rustguac
+  tees the raw guacd stream to disk as the session recording; converting
+  upstream of that tee would turn every recording binary. Clients opt in with
+  `binaryBlobs=1`, so anything older — a cached `client.html`, a third-party
+  integration, the recording player — still receives base64.
+
 ### Display / HiDPI
 
 - **Per-connection Native Resolution** — requests the framebuffer in the
@@ -319,6 +341,7 @@ Add `[vdi]` to your config and create a VDI entry in the connections. See [VDI D
 - [Web Browser Sessions](docs/web-sessions.md): autofill, domain allowlisting, login scripts
 - [VDI Desktop Containers](docs/vdi.md): Docker desktops, image requirements, persistent homes
 - [RDP Video Performance](docs/rdp-video-performance.md): H.264 passthrough, GFX pipeline, xrdp tuning
+- [Binary Blobs](docs/binary-blobs.md): binary WebSocket frames for h264/audio payloads, and why upstream sends base64
 - [Credential Variables](docs/credential-variables.md): shared credentials across entries
 - [Reports](docs/reports.md): session analytics, history, CSV export
 

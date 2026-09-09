@@ -423,6 +423,10 @@
             var client = new Guacamole.Client(tunnel);
             // Expose for console debugging
             window.__guac_client = client;
+            // Exposed alongside the client so a live session can be inspected
+            // from the console -- tunnel.binaryFrames says whether blob
+            // payloads are arriving as binary rather than base64.
+            window.__guac_tunnel = tunnel;
             setupClient(client, tunnel);
         }
 
