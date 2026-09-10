@@ -805,6 +805,26 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
+     * Whether the renderer is to be given full range (true), limited (false),
+     * or left to follow the frame. Set as window.__h264FullRange, as
+     * ?h264FullRange=off on the client's URL, or as the h264FullRange key in
+     * localStorage.
+     *
+     * Exists because a stream's own signalling does not always survive the
+     * browser: Chrome discards video_full_range_flag when the SPS names an
+     * explicitly unspecified colour_primaries or transfer, reporting limited
+     * for a host that said full and painting it with crushed blacks. See
+     * Yuv444Renderer.setColorSpace(), and `H.264 colour:` in rustguac's
+     * journal for which case a given host is in.
+     *
+     * @private
+     * @returns {boolean}
+     */
+    function fullRangeOverride() {
+        return override('h264FullRange');
+    }
+
+    /**
      * Whether the encoder's chroma filter is undone as part of combining, and
      * with what threshold. The auxiliary view carries three of every four
      * chroma samples; the fourth is left as the mean of its 2x2 block by the
@@ -1015,8 +1035,20 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                  * converting here on an assumption is how the two paths come
                  * out different colours on the same session. */
                 if (!colorSpaceApplied && renderer.setColorSpace) {
-                    console.log('[rustguac] H.264: 4:4:4 colour space is '
-                            + renderer.setColorSpace(frame.colorSpace));
+
+                    /* Reported rather than logged to the console, so it lands
+                     * in the journal beside the `H.264 colour:` line rustguac
+                     * reads out of the SPS (src/h264_sps.rs). The two together
+                     * are the whole question: the first says what the host
+                     * declared, this says what the browser made of it, and a
+                     * disagreement between them is invisible in either alone.
+                     * A colour fault reported hours later has both. */
+                    diagnostic('colour_space',
+                            renderer.setColorSpace(frame.colorSpace,
+                                fullRangeOverride())
+                            + '; decoder gave ' + (frame.format || 'unknown')
+                            + ' frames', true);
+
                     colorSpaceApplied = true;
                 }
 

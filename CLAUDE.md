@@ -123,39 +123,50 @@ hardware encoding*, and makes Windows send AVC444 — which is handled: both
 views are forwarded and combined in the browser into full 4:4:4 chroma. Full
 details, including verification commands, in `docs/rdp-h264.md`.
 
-**Colour range differs per host -- honour the signal, never the
-specification.** [MS-RDPEGFX Color
+**Colour range: the samples are full range, and the signalling may not
+survive the browser.** [MS-RDPEGFX Color
 Conversion](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/954d7546-6873-4466-95c8-20a7569c43e5)
-says the ARGB-to-AYUV transform "is based on full-range BT.709" with the
-components clamped to 0...255, and Microsoft's RDP 10 AVC announcement requires
-decoders to support "BT.709 Full Range color conversion". **Windows signals
-limited range anyway** (confirmed 2026-09-08, explicit in the VUI, not
-assumed), so that text is not a guarantee about the bitstream -- most likely it
-describes the conceptual mapping in the AVC444 combination algorithm rather
-than the encode. Do not reason from the spec to what a host sends.
+defines the ARGB-to-AYUV transform as full-range BT.709 clamped to 0...255, and
+RDP hosts encode to it. Converting that as limited expands 16-235 to 0-255:
+blacks crush, whites clip, chroma over-saturates by 255/224 -- the worse of the
+two errors, since clipping destroys information the reverse only compresses.
 
-Getting it wrong either way is visible: expanding 16-235 to 0-255 on full-range
-data crushes blacks, clips whites and over-saturates chroma by 255/224, while
-the reverse washes the picture out. The first is worse, since clipping destroys
-information the second merely compresses.
+The SPS is supposed to settle it with `video_full_range_flag`, and **the
+hardware decode path is stricter than the software one about how that is
+written.** Measured on one browser against two hosts, both NV12: the xrdp fork
+(`full_range=1` with primaries/transfer/matrix all BT.709) is reported full,
+while Windows (`full_range=1`, *no description*) is reported **limited** and
+painted with crushed blacks. Same client, same decoder; the description is the
+only difference. Software decode honours the bare flag, which is what made this
+take three wrong theories -- and Chrome separately discards the range outright
+when a description is *present* and says *unspecified*, so saying less is safer
+than saying "unspecified". `tests/h264-vui-range.mjs` pins all four shapes.
 
-`Yuv444.js` takes the range from `VideoFrame.colorSpace` when the stream
-signals it and **defaults to full when it does not**, per the specification. An
-explicit flag still wins: a host signalling limited most likely is limited,
-whatever the spec says. The log marks an unsignalled range `(ASSUMED -- stream
-did not signal it)`, so a session rendering with the wrong contrast can be told
-from one that is right for a different reason -- the absence of that
-distinction is what hid the bug, since our shader and Chrome's own `drawImage`
-path defaulted to limited from the same absent VUI and agreed with each other
-while both were wrong.
+**`src/h264_rewrite.rs` fixes it on the wire**, completing the SPS's colour
+signalling in either shape seen in the field. Windows declares a range and no
+description: the description is added, the range left alone. Stock xrdp 0.10.6
+declares nothing at all -- it passes x264 no VUI parameters, and with
+`video_format` 5 and no colour description x264 omits the block entirely -- so
+full-range BT.709 is written, which is what the transport defines and what the
+encoder produced (xrdp names its own conversion `XRDP_yuv444_709fr`). Note this
+is the only fix that reaches a stock-xrdp host at all: it sends AVC420, so
+`setColorSpace` is never called and `?h264FullRange` is inert there.
 
-**One gap remains.** Only the combine path is ours. When AVC444 is not being
-combined, `drawImage(frame)` hands conversion to Chrome, which still assumes
-limited for an unsignalled stream, so an AVC420 session against a host that
-does not signal renders over-contrasted and no flag of ours can reach it.
-Closing that means routing 4:2:0 through the shader too, at a measured
-0.7-0.9ms per picture plus a read-back -- not worth it unless a host that
-actually fails to signal turns up. The `(ASSUMED)` marker is how you find out.
+A wire-side fix reaches both render paths (`drawImage()` included, which no
+client flag can) and every client, needs no configuration, and costs one check
+per session: the first SPS decides, and a stream that already carries a
+complete description is never examined again. BT.709 is the value Chrome was already assuming and
+the one MS-RDPEGFX defines. The splice is checked byte-for-byte against
+ffmpeg's `h264_metadata` filter doing the same edit, because a bad bit offset
+stops the picture while both ends look healthy.
+
+`src/h264_sps.rs` logs what the host sent, once per session, and the client
+reports what it made of it (`event=colour_space`, with the decoder's pixel
+format). Read as a pair: the first describes the wire, the second the render,
+and a colour fault is a disagreement between them. Recordings are teed upstream
+of the rewrite and keep the original stream; `?h264FullRange=on` is the lever
+for playback and for any host whose declaration cannot be believed. Full detail
+in `docs/rdp-h264.md`.
 
 **AVC444 is two 4:2:0 streams, not High 4:4:4 Predictive profile.**
 `RFX_AVC444_BITMAP_STREAM` [encapsulates two

@@ -110,6 +110,133 @@ In the browser console, `__h264.stats()` reports decoder health —
 `avgDecodeLatencyMs` in the low single digits, `framesDropped` and `gcLeaks` at
 zero, `auxViewsDecoded` counting AVC444 auxiliary views.
 
+## Colour range
+
+The samples an RDP host sends are **full range**. [MS-RDPEGFX Color
+Conversion](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/954d7546-6873-4466-95c8-20a7569c43e5)
+defines the ARGB-to-AYUV transform as full-range BT.709 with the components
+clamped to 0...255, and Microsoft's RDP 10 AVC announcement requires decoders
+to support "BT.709 Full Range color conversion".
+
+Converting those as limited range expands 16-235 to 0-255: blacks crush to
+zero, whites clip, and chroma over-saturates by 255/224. It looks punchier and
+is wrong — and it is the more damaging of the two mistakes, since clipping
+destroys information that the opposite error merely compresses.
+
+The stream is supposed to prevent that by carrying `video_full_range_flag = 1`
+in the SPS. **Chrome honours that flag in every shape but one.** Measured
+2026-09-09, and pinned by `tests/h264-vui-range.mjs`:
+
+| `video_full_range_flag` | colour description | `colorSpace.fullRange` | 16,16,16 painted as |
+|---|---|---|---|
+| 1 | absent | `true` | 15,17,14 |
+| 1 | present, 2/2 (unspecified) | **`false`** | **0,1,0** |
+| 1 | present, 1/1 (BT.709) | `true` | 14,17,14 |
+| 0 | present, 1/1 (BT.709) | `false` | 13,16,13 |
+
+A colour description that is *present* and says *unspecified* makes Chrome
+discard the whole `video_signal_type` and fall back to limited BT.709. Leaving
+the description out altogether does not.
+
+**That table is software decode, and the hardware path is stricter.** Measured
+on one browser against two hosts, both decoding to NV12:
+
+| host | SPS | Chrome reports |
+|---|---|---|
+| xrdp fork | `full_range=1`, primaries/transfer/matrix all BT.709 | full |
+| Windows | `full_range=1`, **no description** | **limited** |
+
+Same client, same hardware decoder; the description is the only difference. So
+a bare range flag — which the software decoder honours — is ignored once
+D3D11/VAAPI is in the path. That is why Windows renders with crushed blacks
+while xrdp does not, and why signalling the range in the fork
+(`xrdp_accel_assist_vaapi.c`, `video_signal_type_present_flag` through
+`matrix_coefficients`) visibly fixed the colour there.
+
+It is invisible from both ends: the host declared the range, the client reports
+limited, and neither can see the disagreement. It also applies to `drawImage()`
+as much as to the shader, since both read the same reported colour space, so no
+client-side flag can reach the AVC420 path.
+
+### The fix: rustguac completes the SPS
+
+`src/h264_rewrite.rs` completes the SPS's colour signalling, in either of the
+two shapes seen in the field: a declared range with no description (Windows), or
+no `video_signal_type` at all (stock xrdp, whose x264 defaults omit it). The
+first has its description added and its declared range left alone; the second
+gets full-range BT.709 written, because that is what the transport defines and
+what the encoder actually produced. It fixes both render paths and every
+client, including third-party ones, and needs no configuration.
+
+Cheap by construction: the first SPS decides. A stream that already carries a
+description is never examined again, so xrdp and every non-passthrough session
+pay one check per connection and nothing after it.
+
+BT.709 is not a guess — MS-RDPEGFX defines the transform as BT.709, and Chrome
+already reported `bt709` for these streams, so the value is the one the decoder
+was assuming anyway. The splice is verified byte-for-byte against ffmpeg's own
+`h264_metadata` bitstream filter performing the same edit
+(`the_splice_matches_ffmpegs_own_rewrite`), because a bad bit offset or a
+missed emulation-prevention byte does not fail loudly: the picture stops while
+both ends look healthy.
+
+Recordings are teed upstream of the rewrite and keep the host's original
+stream, which is what a recording should be. Playing back a Windows recording
+is subject to the original fault; `?h264FullRange=on` is the lever there.
+
+### Diagnosing it
+
+rustguac reads the first SPS of every passthrough session and logs what it
+found, once per session (`src/h264_sps.rs`):
+
+```bash
+journalctl -u rustguac --since '5 min ago' | grep 'H.264 colour'
+```
+
+```
+H.264 colour: video_full_range_flag=1 colour_primaries=2 (unspecified) \
+  transfer=2 (unspecified) matrix=1 (BT.709) — UNUSABLE: ...
+```
+
+A second line says what the browser made of it, reported by the client:
+
+```
+Client diagnostic: full range, BT.709; decoder gave NV12 frames  event=colour_space
+```
+
+The two together are the whole picture — the first describes the wire, the
+second the render — and a colour fault is a disagreement between them. `NV12`
+means hardware decode and `I420` software, which matters because the two honour
+different things.
+
+Outcomes and fixes:
+
+* **`NO SIGNAL TYPE`** — the SPS says nothing about colour at all. Stock xrdp
+  0.10.6 does this: it passes x264 no VUI parameters, and with `video_format`
+  at 5 and no colour description x264 omits the whole block. Its samples are
+  full-range BT.709 regardless — xrdp names its own conversion
+  `XRDP_yuv444_709fr` — so the browser's fallback to limited crushes the
+  blacks. Full-range BT.709 is spliced in.
+* **`NO DESCRIPTION`** — rustguac splices one in and logs `splicing a BT.709
+  description into the SPS`. The client line should then read `full range`.
+  This is the Windows case, and it is confirmed working end to end:
+
+  ```
+  H.264 colour: video_full_range_flag=1 colour_primaries=absent ... NO DESCRIPTION: ...
+  H.264 colour: splicing a BT.709 description into the SPS ...
+  Client diagnostic: full range, BT.709; decoder gave NV12 frames  event=colour_space
+  ```
+* **`UNUSABLE`** (description present, unspecified) — not rewritten, since
+  replacing 2 with 1 would assert a colourimetry the host declined to claim.
+  Fix it at the encoder.
+* **`full_range=0`, usable** — the host is declaring limited range. If its
+  samples are nevertheless full range, as MS-RDPEGFX requires, nothing on the
+  wire can be believed and the client has to be told: `?h264FullRange=on` on
+  the client URL (also `window.__h264FullRange` or the `h264FullRange` key in
+  localStorage). The console then logs `(FORCED -- frame reported limited)`.
+* **`usable`, and the client reports the matching range** — the colour is
+  right, and a picture that still looks wrong is not a range problem.
+
 ## Recording
 
 Session recordings capture the raw stream, so a recording of an H.264 session
