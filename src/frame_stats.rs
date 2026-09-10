@@ -20,7 +20,8 @@
 //! instruction starts, and only for the two opcodes that matter. Blob payloads
 //! — the bulk of the bytes — are never parsed.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -121,7 +122,17 @@ pub struct FrameStats {
     /// Whether any H.264 access unit has been seen on this session. Read
     /// without the lock on every chunk, so that a session with no passthrough
     /// pays nothing for the overpaint scan.
-    h264_seen: std::sync::atomic::AtomicBool,
+    h264_seen: AtomicBool,
+    /// Whether this session's H.264 colour signalling has been read and
+    /// reported. Read without the lock on every chunk, so the scan for it
+    /// stops costing anything the moment it has succeeded — which is within
+    /// the first keyframe of a passthrough session, and never for a session
+    /// that has none.
+    sps_reported: AtomicBool,
+    /// Stream indices opened by an `h264` instruction, so the SPS scan decodes
+    /// only video blobs. Separate from the `Inner` lock because it is touched
+    /// on the same path as `sps_reported` and only until that is set.
+    h264_streams: Mutex<HashSet<u32>>,
 }
 
 impl Default for FrameStats {
@@ -172,8 +183,77 @@ impl FrameStats {
         Self {
             inner: Mutex::new(Inner::default()),
             started: Instant::now(),
-            h264_seen: std::sync::atomic::AtomicBool::new(false),
+            h264_seen: AtomicBool::new(false),
+            sps_reported: AtomicBool::new(false),
+            h264_streams: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Reads this session's H.264 colour signalling out of the first SPS to
+    /// cross the wire, and returns a line describing it — once per session.
+    ///
+    /// Worth logging because it is the only place the two halves of a colour
+    /// fault can be told apart. A host that encodes full-range BT.709, as
+    /// MS-RDPEGFX requires, renders with crushed blacks and over-saturated
+    /// chroma if the browser converts as limited, and the browser will do
+    /// exactly that both when the stream signals limited and when it signals
+    /// full beside an unspecified `colour_primaries` — Chrome discards the
+    /// whole description in the second case. On screen the two are identical.
+    /// In the journal they are not. See `crate::h264_sps`.
+    ///
+    /// Costs nothing after the first keyframe, and nothing at all on a session
+    /// with no passthrough: the atomic is read before anything is parsed.
+    pub fn observe_h264_colour(&self, text: &str) -> Option<String> {
+        if self.sps_reported.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        for instr in instruction_starts(text) {
+            if let Some(rest) = instr.strip_prefix("4.h264,") {
+                if let Some((index, _)) = next_element(rest) {
+                    if let Ok(index) = index.parse::<u32>() {
+                        self.h264_streams.lock().unwrap().insert(index);
+                    }
+                }
+                continue;
+            }
+
+            let Some(rest) = instr.strip_prefix("4.blob,") else {
+                continue;
+            };
+            let Some((index, after)) = next_element(rest) else {
+                continue;
+            };
+            let Ok(index) = index.parse::<u32>() else {
+                continue;
+            };
+            if !self.h264_streams.lock().unwrap().contains(&index) {
+                continue;
+            }
+            let Some((payload, _)) = next_element(after) else {
+                continue;
+            };
+
+            use base64::Engine as _;
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload) else {
+                continue;
+            };
+
+            let Some(signal) = crate::h264_sps::find_sps(&bytes) else {
+                continue;
+            };
+
+            // Only one report per session, and only from the thread that got
+            // here first: swap rather than store, so a concurrent reader
+            // cannot produce a second line.
+            if self.sps_reported.swap(true, Ordering::Relaxed) {
+                return None;
+            }
+
+            return Some(signal.describe());
+        }
+
+        None
     }
 
     /// Account for a chunk of guacd → browser traffic.
@@ -659,6 +739,51 @@ mod tests {
         assert_eq!(snap.frames_sent, 0);
         assert_eq!(snap.h264_frames, 0);
         assert!(snap.bytes_to_browser > 0);
+    }
+
+    /// An access unit carrying the "full range beside unspecified primaries"
+    /// SPS — the shape that renders crushed while both ends look correct.
+    const AU_WITH_SPS: &str = "AAAAAWdkAAus2UGCabgQEAoAAAMAAgAAAwBkHihTLAAAAAABaOvjyw==";
+
+    #[test]
+    fn reports_h264_colour_from_the_first_sps() {
+        let stats = FrameStats::new();
+
+        // The h264 instruction and its blobs routinely arrive in different
+        // reads, which is why the stream index is remembered.
+        assert_eq!(stats.observe_h264_colour("4.h264,1.7,1.0,1.0;"), None);
+
+        let line = stats
+            .observe_h264_colour(&format!(
+                "4.blob,1.7,{}.{};",
+                AU_WITH_SPS.len(),
+                AU_WITH_SPS
+            ))
+            .expect("the SPS is read");
+        assert!(line.contains("video_full_range_flag=1"), "{line}");
+        assert!(line.contains("UNUSABLE"), "{line}");
+
+        // Once per session, whatever follows.
+        assert_eq!(
+            stats.observe_h264_colour(&format!(
+                "4.blob,1.7,{}.{};",
+                AU_WITH_SPS.len(),
+                AU_WITH_SPS
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_blobs_of_streams_that_are_not_h264() {
+        let stats = FrameStats::new();
+        // An img blob whose payload happens to decode is not video.
+        let out = stats.observe_h264_colour(&format!(
+            "3.img,1.7,1.1,1.0,9.image/png,1.0,1.0;4.blob,1.7,{}.{};",
+            AU_WITH_SPS.len(),
+            AU_WITH_SPS
+        ));
+        assert_eq!(out, None);
     }
 
     #[test]
