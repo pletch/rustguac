@@ -52,7 +52,7 @@ pub enum OutFrame {
 /// The length prefix counts UTF-8 *characters*, per `guac_utf8_strlen` in
 /// libguac, so a clipboard instruction carrying an emoji does not desynchronise
 /// the scan and take every instruction after it along.
-fn element(text: &str, at: usize) -> Option<(&str, usize, u8)> {
+pub(crate) fn element(text: &str, at: usize) -> Option<(&str, usize, u8)> {
     let bytes = text.as_bytes();
     let digits_start = at;
     let mut pos = at;

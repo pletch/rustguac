@@ -432,7 +432,12 @@ function makeRunner(renderer, layerCtx, opts, w, h) {
     return {
         picture: function(main, aux, rects) {
             view(main, false, rects);
-            view(aux, true, rects);
+            /* Item 5: the 4:2:0 picture routed through the shader, so its
+             * colour range is ours rather than Chrome's. One view, one
+             * read-back, three plane uploads -- everything the combine does
+             * except the auxiliary half. */
+            if (!opts.mainOnly)
+                view(aux, true, rects);
         },
         done: function() { return chain; }
     };
@@ -449,7 +454,9 @@ var CONFIGS = [
     { name: '+ scissor to rects',  defer: 1, bitmap: 1, scissor: 1, overlap: 1 },
     { name: '+ banded upload',     defer: 1, bitmap: 1, scissor: 1, overlap: 1,
                                    bands: 1 },
-    { name: 'AVC420 (no combine)', avc420: 1 }
+    { name: 'AVC420 (no combine)', avc420: 1 },
+    { name: 'AVC420 via shader',   defer: 0, bitmap: 1, scissor: 1, overlap: 1,
+                                   bands: 1, mainOnly: 1 }
 ];
 
 /**

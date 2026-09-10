@@ -8,6 +8,8 @@ mod drive;
 mod entry_protocols;
 mod frame_stats;
 mod guacd;
+mod h264_rewrite;
+mod h264_sps;
 mod import;
 mod migrate;
 mod oidc;
