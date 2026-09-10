@@ -805,9 +805,18 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      *     must be close()d once drawn, or null if this renderer is not usable.
      */
     /**
-     * The conversion currently in effect. Defaults to BT.709 at limited range,
-     * which is what an H.264 stream carrying no VUI signalling means, and what
-     * xrdp and Windows both send in practice.
+     * The conversion currently in effect: full-range BT.709.
+     *
+     * Full range because that is what an RDP host sends. MS-RDPEGFX defines
+     * the ARGB-to-AYUV transform as full-range BT.709, and both hosts measured
+     * here encode to it -- read out of their SPS, not inferred: the xrdp fork
+     * writes video_full_range_flag=1 with a complete BT.709 description, and
+     * Windows writes video_full_range_flag=1 with no description at all.
+     * Neither sends limited range.
+     *
+     * Nearly inert in practice, since setColorSpace() runs before the first
+     * render and Chrome always populates VideoFrame.colorSpace. It matters
+     * only for a decoder that reports nothing at all.
      *
      * @private
      */
@@ -865,32 +874,60 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      * Adopts the colour space of a decoded frame, so the combined picture
      * matches what the browser draws for the 4:2:0 path.
      *
-     * A frame whose colour space is absent or only partly populated keeps the
-     * current conversion for the unreported parts: guessing full range on a
-     * stream that never said so is the error this exists to avoid.
+     * Following the frame rather than deciding for ourselves is what keeps the
+     * two paths agreeing: the 4:2:0 picture never reaches this shader, and
+     * whatever the browser makes of it is not ours to override. Where the
+     * frame is wrong, the fix belongs upstream of the browser -- rustguac
+     * completes the host's SPS on the way past (src/h264_rewrite.rs) so that
+     * both paths are told the truth, rather than this one being taught to
+     * disbelieve what it is handed.
      *
      * @param {VideoColorSpace} reported
      *     The colorSpace of a decoded VideoFrame, if any.
      *
+     * @param {boolean} forced
+     *     True to render full range and false to render limited range
+     *     whatever the frame reports, or undefined to follow it.
+     *
+     *     The escape hatch for a host whose signalling the browser will not
+     *     act on. Chrome discards video_full_range_flag when the SPS carries
+     *     an explicitly unspecified colour_primaries or transfer -- it reports
+     *     limited for a stream that says full, and paints it crushed -- so a
+     *     host can be correct on the wire and wrong on the screen with nothing
+     *     to show for it. rustguac logs which case a session is in at connect
+     *     (`H.264 colour:` in the journal, from src/h264_sps.rs).
+     *
      * @returns {!String}
      *     A description of the conversion now in effect.
      */
-    this.setColorSpace = function setColorSpace(reported) {
+    this.setColorSpace = function setColorSpace(reported, forced) {
 
         var signalled = !!(reported && reported.fullRange !== null
                 && reported.fullRange !== undefined);
 
-        /* Full range unless the stream says otherwise. MS-RDPEGFX specifies
+        if (forced !== undefined && forced !== null) {
+            colorSpace = conversionFor(!!forced,
+                    reported && reported.matrix, false);
+            return colorSpace.describe + ' (FORCED -- frame reported '
+                    + (signalled ? (reported.fullRange ? 'full' : 'limited')
+                                 : 'nothing') + ')';
+        }
+
+        /* Full range unless the frame says otherwise. MS-RDPEGFX specifies
          * the ARGB-to-AYUV transform as full-range BT.709 with the components
-         * clamped to 0...255, so an unsignalled RDPEGFX stream is full range
-         * by definition -- and expanding 16-235 to 0-255 on it crushes blacks,
-         * clips whites and over-saturates chroma by 255/224. It looks punchier
-         * and is wrong.
+         * clamped to 0...255, so an RDPEGFX stream the decoder says nothing
+         * about is full range by definition -- and expanding 16-235 to 0-255
+         * on it crushes blacks, clips whites and over-saturates chroma by
+         * 255/224. It looks punchier and is wrong.
          *
-         * An explicit flag still wins. A host that signals limited most likely
-         * is limited, whatever the specification says, and following the label
-         * is the defensible reading of a stream that took the trouble to carry
-         * one. */
+         * A reported flag still wins, because the 4:2:0 path obeys it too and
+         * a session whose two codecs disagree is worse than one that is
+         * uniformly a little off. Note that the flag is the *browser's*
+         * reading, not the host's: Chrome's hardware decoder reports limited
+         * for a Windows host that plainly declared full, having dropped a
+         * range flag that carried no colour description beside it. That is why
+         * the SPS is completed server-side rather than second-guessed here,
+         * and why `forced` exists for anything the splice cannot reach. */
         var fullRange = signalled ? !!reported.fullRange : true;
 
         colorSpace = conversionFor(fullRange, reported && reported.matrix,
