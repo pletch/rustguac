@@ -182,9 +182,6 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         'uniform int uLayout;',    /* 0 = 4:2:0 only, 1 = chroma v1, 2 = chroma v2 */
         'uniform int uInterleaved;',/* bit 0: main view is NV12, bit 1: auxiliary is */
         'uniform float uFilter;',  /* recovery threshold, or 0 to leave the mean alone */
-        'uniform vec2 uRange;',    /* luma offset, luma scale */
-        'uniform float uCScale;',  /* chroma scale */
-        'uniform vec4 uCoef;',     /* R:v, G:u, G:v, B:u */
 
         'out vec4 fragColor;',
 
@@ -334,25 +331,37 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         '        V = unfilter(V, vR + vD + vRD);',
         '    }',
 
-        /* YUV to RGB, with the matrix and range the decoder reported for
-         * this stream rather than an assumed pair.
+        /* YUV to RGB: BT.709 at full range, unconditionally.
          *
-         * This matters because the 4:2:0 path does not come through here: the
-         * browser draws that VideoFrame itself and applies the frame's own
-         * colour space, including the limited-range expansion of 16-235 to
-         * 0-255. Converting here as though the same samples were full range
-         * leaves blacks at 16 and whites at 235, so the combined 4:4:4 picture
-         * renders visibly flatter than the 4:2:0 one beside it -- the same
-         * session, two different colours, depending only on which codec the
-         * server happened to choose. setColorSpace() supplies these. */
-        '    float luma = (Y - uRange.x) * uRange.y;',
-        '    float u = (U - 0.50196078) * uCScale;',  /* 128/255 */
-        '    float v = (V - 0.50196078) * uCScale;',
+         * Not read from the decoded frame, which is the tempting thing to do
+         * and gets it wrong. MS-RDPEGFX defines the ARGB-to-AYUV transform as
+         * full-range BT.709, and every host that feeds this shader encodes to
+         * it -- read out of their SPS rather than assumed: Windows writes
+         * video_full_range_flag=1, the xrdp fork writes it with a complete
+         * BT.709 description, and stock xrdp omits the block entirely while
+         * naming its own conversion XRDP_yuv444_709fr.
+         *
+         * What the *browser* reports for those streams is another matter.
+         * Chrome's hardware decoder ignores a bare range flag with no colour
+         * description beside it, and reports limited for a host that plainly
+         * declared full. Adopting that here would expand 16-235 to 0-255 on
+         * full-range samples: blacks crushed to zero, whites clipped, chroma
+         * over-saturated by 255/224.
+         *
+         * The cost of hardcoding is that the 4:2:0 path disagrees. That
+         * picture never reaches this shader -- the browser draws the
+         * VideoFrame itself and applies whatever colour space it decided on --
+         * so a session can render 4:4:4 correctly and 4:2:0 crushed. That is
+         * the lesser of the two errors: one path right beats both wrong, and
+         * the real repair is upstream of the browser, in completing the host's
+         * SPS so that nothing has to guess. */
+        '    float u = U - 0.50196078;',  /* 128/255 */
+        '    float v = V - 0.50196078;',
 
         '    vec3 rgb = vec3(',
-        '        luma + uCoef.x * v,',
-        '        luma - uCoef.y * u - uCoef.z * v,',
-        '        luma + uCoef.w * u);',
+        '        Y + 1.5748 * v,',
+        '        Y - 0.187324 * u - 0.468124 * v,',
+        '        Y + 1.8556 * u);',
 
         '    fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);',
         '}'
@@ -424,9 +433,6 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
                 uniforms.auxSize = gl.getUniformLocation(program, 'uAuxSize');
                 uniforms.layout = gl.getUniformLocation(program, 'uLayout');
                 uniforms.filter = gl.getUniformLocation(program, 'uFilter');
-                uniforms.range = gl.getUniformLocation(program, 'uRange');
-                uniforms.cScale = gl.getUniformLocation(program, 'uCScale');
-                uniforms.coef = gl.getUniformLocation(program, 'uCoef');
                 uniforms.interleaved = gl.getUniformLocation(program,
                         'uInterleaved');
 
@@ -609,80 +615,6 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      *     The canvas holding the rendered image, or null if this renderer is
      *     not usable.
      */
-    /**
-     * The conversion currently in effect. Defaults to BT.709 at limited range,
-     * which is what an H.264 stream carrying no VUI signalling means, and what
-     * xrdp and Windows both send in practice.
-     *
-     * @private
-     */
-    var colorSpace = conversionFor(false, 'bt709');
-
-    /**
-     * Returns the luma offset, scales and matrix coefficients for a decoded
-     * frame's colour space.
-     *
-     * Range is the half of this that shows: limited range carries black at 16
-     * and white at 235, so treating it as full range renders the whole picture
-     * with lifted blacks and dulled whites. The matrix mostly shifts hue in
-     * saturated regions, and only the two common ones are distinguished.
-     *
-     * @private
-     *
-     * @param {!boolean} fullRange
-     *     Whether the samples span 0-255 rather than 16-235.
-     *
-     * @param {String} matrix
-     *     The VideoColorSpace matrix name, if the decoder reported one.
-     *
-     * @returns {!Object}
-     *     The conversion, as consumed by render().
-     */
-    function conversionFor(fullRange, matrix) {
-
-        /* BT.601 for the standard-definition matrices, BT.709 otherwise --
-         * including when nothing was reported, since these are desktop
-         * streams. */
-        var sd = (matrix === 'smpte170m' || matrix === 'bt470bg');
-
-        return {
-            yOffset : fullRange ? 0.0 : 16.0 / 255.0,
-            yScale  : fullRange ? 1.0 : 255.0 / 219.0,
-            cScale  : fullRange ? 1.0 : 255.0 / 224.0,
-            coef    : sd
-                ? [1.402, 0.344136, 0.714136, 1.772]
-                : [1.5748, 0.187324, 0.468124, 1.8556],
-            describe: (fullRange ? 'full' : 'limited') + ' range, '
-                    + (sd ? 'BT.601' : 'BT.709')
-        };
-
-    }
-
-    /**
-     * Adopts the colour space of a decoded frame, so the combined picture
-     * matches what the browser draws for the 4:2:0 path.
-     *
-     * A frame whose colour space is absent or only partly populated keeps the
-     * current conversion for the unreported parts: guessing full range on a
-     * stream that never said so is the error this exists to avoid.
-     *
-     * @param {VideoColorSpace} reported
-     *     The colorSpace of a decoded VideoFrame, if any.
-     *
-     * @returns {!String}
-     *     A description of the conversion now in effect.
-     */
-    this.setColorSpace = function setColorSpace(reported) {
-
-        var fullRange = (reported && reported.fullRange !== null
-                && reported.fullRange !== undefined)
-            ? !!reported.fullRange : false;
-
-        colorSpace = conversionFor(fullRange, reported && reported.matrix);
-        return colorSpace.describe;
-
-    };
-
     this.render = function render(layout, filter) {
 
         if (!renderer.supported || gl.isContextLost() || !width || !height)
@@ -695,10 +627,6 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         gl.uniform2i(uniforms.auxSize, auxWidth, auxHeight);
         gl.uniform1i(uniforms.layout, layout);
         gl.uniform1f(uniforms.filter, filter === false ? -1.0 : filter / 255.0);
-        gl.uniform2f(uniforms.range, colorSpace.yOffset, colorSpace.yScale);
-        gl.uniform1f(uniforms.cScale, colorSpace.cScale);
-        gl.uniform4f(uniforms.coef, colorSpace.coef[0], colorSpace.coef[1],
-                colorSpace.coef[2], colorSpace.coef[3]);
         gl.uniform1i(uniforms.interleaved,
                 (lumaInterleaved ? 1 : 0) | (auxInterleaved ? 2 : 0));
 

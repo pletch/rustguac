@@ -272,17 +272,6 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var yuv444Unavailable = false;
 
     /**
-     * Whether the renderer has been told this stream's colour space. Applied
-     * from the first main-view frame and not revisited: a decoder replaced
-     * mid-session re-runs this, but the stream's signalling does not change
-     * frame to frame, and reading it per frame would be pure overhead.
-     *
-     * @private
-     * @type {!boolean}
-     */
-    var colorSpaceApplied = false;
-
-    /**
      * Whether the current stream is being combined to 4:4:4. False until an
      * auxiliary view actually arrives: an AVC420 stream has no second view to
      * combine, and reading planes back costs a copy per frame that would buy
@@ -378,7 +367,6 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         }
 
         yuv444 = new Guacamole.Yuv444Renderer();
-        colorSpaceApplied = false;
 
         if (!yuv444.supported) {
             yuv444 = null;
@@ -575,22 +563,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 ? [layout[0].stride, layout[1].stride]
                 : [layout[0].stride, layout[1].stride, layout[2].stride];
 
-            if (view === 0) {
-
-                /* Adopt whatever the decoder says this stream is, once. The
-                 * 4:2:0 path never reaches the shader -- the browser draws
-                 * that VideoFrame and applies its colour space itself -- so
-                 * converting here on an assumption is how the two paths come
-                 * out different colours on the same session. */
-                if (!colorSpaceApplied && renderer.setColorSpace) {
-                    console.log('[rustguac] H.264: 4:4:4 colour space is '
-                            + renderer.setColorSpace(frame.colorSpace));
-                    colorSpaceApplied = true;
-                }
-
+            if (view === 0)
                 renderer.uploadLuma(y, u, v, strides, pictureW, pictureH);
-
-            }
             else
                 renderer.uploadAux(y, u, v, strides, planeW, planeH);
 
