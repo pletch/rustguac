@@ -223,20 +223,63 @@ upload is what pays: 2.0x at 4K and 1.8x at 1080p on a typing-shaped damage
 list, 1.35x on a window, nothing at all full-screen -- correctly, since there
 is nothing to crop. AVC420 is still 1.8-3.6x cheaper than any of it.
 
-**Adaptive suspension was built and removed** (2026-09-08). The client
-measured its own combine cost and painted 4:2:0 when it exceeded a budget. On
-the hardware this actually runs on, a chroma picture costs **1.1-1.4ms at 4MP**
-against a 16.7ms budget, so it never fired in a healthy session; the one time
-it did, a separate bug was inflating every number it consumed. It cost a state
-machine, three tuning constants, two overrides and a documented trap with
-banded upload, and bought nothing measurable. The benchmark that justified it
-ran on a box roughly 3x slower than the real clients, which is why its
-thresholds looked plausible and were not.
+**Adaptive suspension was built, removed, and rebuilt in a different shape.**
+The 2026-09-08 removal rested on the claim that a chroma picture costs
+**1.1-1.4ms at 4MP**, so the gate never fired. That number was wrong: it timed
+GPU *submission*, and `tests/bench`, which forces completion, measures ~1.37ms
+per megapixel -- about 5.5ms at 4MP, four times the figure that justified
+deleting the gate. The design was sound and its instrument lied to it.
 
-What replaced it is better placed: the xrdp fork sends chroma every Nth
-picture (`CHROMA_INTERVAL`), which cuts the second decode and the bandwidth
-too, neither of which a client-side gate can reach. `h264Chroma444=off` remains
-for forcing plain 4:2:0.
+What is there now is a **latch, not a controller**, and it gates on the
+symptom rather than the cost. It watched the decode backlog from 2026-09-09
+and **sync gate timeouts from 2026-09-11**:
+
+* **Symptom, because cost cannot be measured cheaply.** Timing GPU execution
+  needs a `gl.finish()` per picture -- stalling the pipeline the gate exists to
+  protect -- or timer queries that are not reliably available. A held sync ack
+  needs neither and is what the user actually feels.
+* **Sync timeouts, not the backlog, because the backlog never grows.** `012`'s
+  pacing holds each ack until the backlog is within `MAX_PIPELINE_DEPTH`, so
+  guacd slows to the client's pace and the queue stays short: a session
+  combining at 6MP felt much slower while every snapshot read `pending=0`.
+  Measured at 2992x2000 on one client and host (`sync_hold`): 4:2:0 held 0-3%
+  of syncs for a mean of 1.5ms with **no timeouts in thousands**; 4:4:4 held
+  10% for a mean of 271ms, max 338ms, **25 timeouts a minute** -- holds
+  outlasting the 200ms timer showed the combine blocking the main thread, not
+  only the GPU. And a backlog cannot build without timeouts, since every sync
+  waits for the queue to drain and gives up at `SYNC_WAIT_TIMEOUT_MS` -- so the
+  backlog trigger was removed as redundant. Trips on `COMBINE_TIMEOUT_TRIP` (3)
+  timeouts within `COMBINE_TIMEOUT_WINDOW_MS` (10s) while combining.
+* **A latch with hysteresis, not a controller.** The old budget's divisor was
+  the observed interval between pictures, which is what `012`'s frame-ack
+  back-pressure has already throttled the server down to -- and that
+  back-pressure reacts to the lag combining causes. It read its own output as
+  its input and needed a capped ceiling to stop it hunting. This has no loop:
+  it gives up, waits `COMBINE_RECOVER_MS` with no sync timeout at all (in
+  either mode), tries again, and after `COMBINE_MAX_TRIPS` stops trying.
+  Tripping during a video and resuming afterwards is the expected shape.
+* **The trip sets the latch; combining stops at the next main view.** The
+  timeout fires from a timer and can land between a paired main view --
+  uploaded, deliberately unpainted -- and the auxiliary view that paints it.
+  Stopping in between discards that picture, and when it was the connect-time
+  keyframe the session looked hung until a resize (`e846367`).
+* **The recovery window is long because resyncing is expensive, not because
+  flapping is visible.** Only newly painted regions change chroma resolution, so
+  a transition is barely perceptible; but the first combine after a gap uploads
+  whole planes rather than damaged rows -- the most expensive kind there is --
+  and handing that to a client that has just stopped struggling is how a gate
+  makes things worse.
+
+An explicit `h264Chroma444` override disables the latch outright: an override
+is an instruction, and a latch that fought it would make the A/B it exists for
+impossible.
+
+`h264CombineLog` now calls `Yuv444Renderer.finish()` before stamping, so its
+combine figure is execution rather than submission -- at the cost of a stall,
+which is why it happens only when the flag has asked for numbers.
+
+Still true that the xrdp fork's `CHROMA_INTERVAL` is better placed than any
+client-side gate, since it cuts the second decode and the bandwidth too.
 
 `h264CombineLog` reports every 5s, splitting each stage by whether the picture
 carried an auxiliary view: **decode** (`decode()` submitted to the frame
@@ -286,37 +329,32 @@ three sit at levels the others cannot reach:
    from the other direction -- see [[xrdp-avc444-causes-chop]] in project
    memory, where AVC444 itself causes the chop and only clearing `GfxAVC444`
    fixes it.
-3. **Client-side adaptive suspension.** Acts in the decoder's output callback,
+3. **The client-side combine gate.** Acts in the decoder's output callback,
    after both access units have already been decoded, so it removes the combine
-   and nothing else. What it has that the other two lack is that it is a
-   continuous measurement rather than a guess made once at connect time, which
-   makes it the safety net *under* the HiDPI rule: a wrong guess in the
-   expensive direction now recovers on its own instead of chopping for the
-   whole session.
+   and nothing else -- never the decode or the bandwidth, which is why it does
+   not replace lever 1. Two parts: a static threshold on framebuffer area
+   (`COMBINE_MAX_PIXELS`), and a latch that gives up combining when sync
+   acks keep timing out. The threshold is a good prior that avoids a bad
+   few seconds at the start of a 4K session; the latch is the safety net under
+   it, and the only part that adapts to the client's actual GPU rather than to
+   a constant measured on one.
 
-   It is coupled to `012`, and the coupling is not obvious. Its budget divisor
-   is capped at one 60fps frame period (`COMBINE_BUDGET_CEILING_MS`) rather
-   than being the observed interval between pictures, because that interval is
-   what `012`'s frame-ack back-pressure has throttled the server down to -- and
-   that back-pressure reacts to the very lag combining contributes to. Uncapped,
-   the throttle hides the cost that caused it: the client falls behind on 4K
-   video, guacd holds the acks, the server settles at 20fps, and the gate then
-   reads an 18ms combine against a 50ms interval as affordable, leaving the
-   session at 20fps in 4:4:4 where 30fps in 4:2:0 was available. The two loops
-   are chained through the sync round trip (`waitForPending` ->
-   `guac_client_get_processing_lag()`), so a change to either has to be checked
-   against the other.
+   Neither part measures the combine's cost, deliberately -- see the adaptive
+   suspension note above for why that is harder than it looks and what it cost
+   the first time.
 
-   The ceiling is the frame rate the gate aims for, and it is set to
-   prioritise smoothness: at 4K, 30fps of 4:4:4 and 60fps of 4:2:0 cost about
-   the same bandwidth and the same decode, since AVC444 sends two access units
-   per picture -- so the trade is close to free and motion is the half a
-   viewer notices. 4:4:4 survives at 1080p either way, costing 13-23% of a
-   60fps budget. It should match what the host can actually deliver:
-   `min(observed, ceiling)` cannot tell a throttled source from one that
-   simply caps, so on a Windows host left at its default 30fps
-   (`DWMFRAMEINTERVAL`, `docs/rdp-h264.md`) a 60fps ceiling suspends 4:4:4 to
-   chase a rate that is not on offer. Set `h264CombineBudget=33` there.
+   `sync_hold` reports the holds once a minute, split by mode (syncs/s, share
+   held, mean hold across all syncs and across held ones, max, timeouts), with
+   session totals in `describeState()` -- the numbers the timeout trip was set
+   from, and the ones to re-measure against if it misfires.
+
+   **The hold cannot see a slow display queue.** `Client.js` acks a sync only
+   after `display.flush()` completes, and the decoder's gate runs after that,
+   so a stuck queue shows as *fewer syncs with no holds* -- a stalled
+   fullscreen session read 2.2 syncs/s, 0 holds, 0 timeouts. So `sync_hold`
+   also reports the flush (sync arriving to flush complete): `| flush mean ..
+   max .. slow N`, slow being >=100ms. Read a low sync rate next to it: slow
+   flushes are the client's display, fast ones are the host sending little.
 
 The benchmark's `AVC420 (no combine)` row therefore **understates** real
 AVC420, since every row is fed the same pre-decoded frames and none of them
@@ -467,15 +505,41 @@ render's 0.82%. The cost of separating them is a desktop scaled 180% inside a
 200% framebuffer drawing its UI ~10% smaller than nominal, which is legible and
 adjustable on the host where a resample is neither.
 
-**Native resolution also turns 4:4:4 combining off**
-(`Guacamole.H264Decoder.combineChromaByDefault`, cleared in `client.html`). The
-combine is GPU work that contends with the hardware video decoder, so at that
-density it costs frame rate rather than buying chroma -- the same reasoning as
-the entry's Automatic AVC444 setting, which a Windows target cannot use because
-without an AVC444 request it offers no H.264 at all. `?h264Chroma444=on`
-overrides. **`h264CombineLog` cannot see this cost:** it times GPU submission,
-not execution, and reports the same work at under a millisecond; use
-`tests/bench`, which calls `gl.finish()`.
+**4:4:4 combining is declined above 4 megapixels** (`COMBINE_MAX_PIXELS` in
+`H264Decoder.js`, overridable as `h264CombineMaxPixels`). The combine is a
+read-back, six texture uploads and a shader pass per picture, all proportional
+to pixels and all contending with the hardware video decoder on the same GPU:
+`tests/bench` puts it at ~1.37ms per megapixel, so 4MP is about a third of a
+60fps frame. 1080p spends 17% of a frame on it and 1440p 30%; 4K would spend
+68% and a 5.5MP native-resolution session 45%, the latter measured in the field
+as a frame backlog and sync timeouts.
+
+**Keyed on framebuffer area, deliberately.** The desktop scale was tried first
+and is wrong twice over: it only says whether HiDPI scaling was applied, so a
+4K display at `devicePixelRatio` 1 slips past it and combines at 8.3MP; and the
+cost is not a property of the host at all -- the same picture costs the same
+whatever sent it, which is why this was taken for an xrdp problem until a
+Windows session was run at native resolution. `?h264Chroma444=on` overrides,
+and the declined case logs once saying why. **Re-checked at every main view while
+combining** (`chroma_declined`): the framebuffer is resized after connecting, and
+a fit that passed through 2240x1648 (3.7MP) as the first auxiliary view arrived
+once left combining on at 2992x2000 (6MP) for the whole session -- a marked
+slowdown, and the reason a `view=2` keyframe was ever painted at that size.
+Only at a **main** view, never between a paired main view and its auxiliary
+view: the main view is uploaded unpainted for the auxiliary one to paint, so
+stopping in between discards the picture -- and when that is the connect-time
+keyframe the session looks hung until a resize brings another.
+**And never started until the size has settled** (`COMBINE_SETTLE_MS`, 5s). The
+connect-time fit passes through 2240x1648 (3.7MP) for ~4s on the way to
+2992x2000; an auxiliary view landing inside that window switched combining on
+only for fullscreen to switch it off, and the session that went through that
+transition stalled while one that did not, on the same host, did not. Whether
+the view landed inside the window was a race -- a reload could make it vanish.
+The settle wait takes the window out of play rather than chasing the race.
+
+**`h264CombineLog` cannot see this cost:** it times GPU submission, not
+execution, and reports the same work at under a millisecond; use `tests/bench`,
+which calls `gl.finish()`.
 
 RDP is asked to scale via `desktopScaleFactor` (patch `011-rdp-dpi-scaling`),
 and **the two channels that carry it are not equally capable**. At connection

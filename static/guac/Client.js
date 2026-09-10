@@ -1828,8 +1828,15 @@ Guacamole.Client = function(tunnel) {
             var timestamp = parseInt(parameters[0]);
             var frames = parameters[1] ? parseInt(parameters[1]) : 0;
 
+            // When this sync arrived, so that the flush below can be timed.
+            // The ack waits for the flush, so a slow display queue holds acks
+            // back from the server without any H.264 decode being pending.
+            var syncReceivedAt = performance.now();
+
             // Flush display, send sync when done
             display.flush(function displaySyncComplete() {
+
+                var flushMs = performance.now() - syncReceivedAt;
 
                 var sendSync = function() {
 
@@ -1851,7 +1858,7 @@ Guacamole.Client = function(tunnel) {
                 // Gate sync response on H.264 decode completion so that
                 // guacd receives accurate backpressure from decode speed
                 if (guac_client._h264Decoder) {
-                    guac_client._h264Decoder.waitForPending(sendSync);
+                    guac_client._h264Decoder.waitForPending(sendSync, flushMs);
                 } else {
                     sendSync();
                 }

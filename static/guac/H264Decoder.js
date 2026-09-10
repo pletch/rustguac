@@ -91,6 +91,50 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var MAX_PIPELINE_DEPTH = 2;
 
     /**
+     * Default framebuffer area, in pixels, up to which AVC444 views are
+     * combined into 4:4:4. See combineMaxPixels().
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_MAX_PIXELS = 4000000;
+
+    /**
+     * How long a session that gave up combining must go without a sync gate
+     * timeout before it tries combining again, in milliseconds.
+     *
+     * Long, because the point is to distinguish "the video ended" from "the
+     * video paused between scenes". Resuming is not free: the first combine
+     * after a gap uploads whole planes rather than the damaged rows, which is
+     * the most expensive kind of combine there is, and delivering that spike to
+     * a client that has just stopped struggling is how a gate makes things
+     * worse. The flapping itself is nearly invisible -- only newly painted
+     * regions change chroma resolution -- so the cost being avoided here is the
+     * resync, not the appearance.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_RECOVER_MS = 30000;
+
+    /**
+     * How many times a session may give up and resume before giving up for
+     * good.
+     *
+     * A client recovering from a transient load looks the same, sample by
+     * sample, as one that simply cannot sustain the combine. The difference is
+     * only visible over time, and this is what draws the line: three trips is
+     * a client that keeps failing, not a desktop that had a video playing.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_MAX_TRIPS = 3;
+
+    /**
      * Safety timeout (ms) for the sync gate. If pending decodes do not drain
      * within this window the sync is acked anyway, preventing a permanent
      * stall if the decoder wedges.
@@ -598,6 +642,225 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
+     * How long the framebuffer must keep one size before combining may start,
+     * in milliseconds.
+     *
+     * The size changes several times in the first seconds of a session -- the
+     * connect-time fit, then fullscreen -- and one of those steps (2240x1648,
+     * 3.7MP) sits under COMBINE_MAX_PIXELS for about four seconds on the way
+     * to 2992x2000 (6MP). An auxiliary view arriving inside it switched
+     * combining on only for fullscreen to switch it off again, and a session
+     * that went through that transition stalled -- one that did not, on the
+     * same host, did not. Whether the first auxiliary view landed inside the
+     * window was a race, which is why a reload could make it go away. Waiting
+     * for the size to settle takes the window out of play.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_SETTLE_MS = 5000;
+
+    /**
+     * The framebuffer size last seen, as "WxH", and when it last changed.
+     *
+     * @private
+     */
+    var lastFramebufferSize = '';
+    var framebufferChangedAt = 0;
+
+    /**
+     * Notes the framebuffer's current size, restarting the settle clock if it
+     * has changed. Called for every decoded picture: a string compare.
+     *
+     * @private
+     */
+    function noteFramebufferSize() {
+        if (!display)
+            return;
+        var size = display.getWidth() + 'x' + display.getHeight();
+        if (size !== lastFramebufferSize) {
+            lastFramebufferSize = size;
+            framebufferChangedAt = nowMs();
+        }
+    }
+
+    /**
+     * Whether the framebuffer has kept its size for COMBINE_SETTLE_MS. An
+     * explicit h264Chroma444=on skips the wait, as it skips every other gate.
+     *
+     * @private
+     * @returns {!boolean}
+     */
+    function framebufferSettled() {
+        if (override('h264Chroma444') === true)
+            return true;
+        return framebufferChangedAt !== 0
+                && nowMs() - framebufferChangedAt >= COMBINE_SETTLE_MS;
+    }
+
+    /**
+     * Whether combining is currently given up. See noteSyncTimeout().
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var combineLatchedOff = false;
+
+    /**
+     * When the last sync gate timeout happened, in ms, or 0 if none has. A
+     * suspended session resumes only once COMBINE_RECOVER_MS have passed
+     * without one.
+     *
+     * @private
+     * @type {!number}
+     */
+    var lastSyncTimeoutAt = 0;
+
+    /**
+     * How many times combining has been given up this session.
+     *
+     * @private
+     * @type {!number}
+     */
+    var combineTrips = 0;
+
+    /**
+     * Sync timeouts, in ms, charged to combining within the last
+     * COMBINE_TIMEOUT_WINDOW_MS.
+     *
+     * @private
+     * @type {!number[]}
+     */
+    var recentSyncTimeouts = [];
+
+    /**
+     * Sync gate timeouts within COMBINE_TIMEOUT_WINDOW_MS that give up
+     * combining.
+     *
+     * Measured at 2992x2000 on the same client and host: 4:2:0 held 0-3% of
+     * syncs for a mean of 1.5ms, with no timeouts in thousands; 4:4:4 held 10%
+     * for a mean of 271ms, with 25 timeouts a minute -- about four per window.
+     * Held syncs outlasted the 200ms timer by up to 140ms, so the combine was
+     * blocking the main thread, not only the GPU.
+     *
+     * @private
+     * @constant
+     */
+    var COMBINE_TIMEOUT_TRIP = 3;
+    var COMBINE_TIMEOUT_WINDOW_MS = 10000;
+
+    /**
+     * Counts a sync gate timeout, giving up combining when enough land close
+     * together while it is on.
+     *
+     * **Why sync timeouts and not the decode backlog**, which is what this
+     * gate watched first. 012's pacing holds each ack until the backlog is
+     * within MAX_PIPELINE_DEPTH, so guacd slows to the client's pace and the
+     * queue stays short: a client that is merely slow never builds a backlog,
+     * and a session combining at 6MP felt much slower while every snapshot
+     * read pending=0. The cost lands on the sync gate instead. And a backlog
+     * cannot build without timeouts -- every sync waits for the queue to
+     * drain and gives up after SYNC_WAIT_TIMEOUT_MS if it does not -- so this
+     * also trips before a backlog gate would, on a client that is drowning.
+     *
+     * **Deliberately a latch and not a controller.** An earlier version
+     * measured the combine against a frame budget whose divisor was the
+     * interval between pictures, which is what 012's back-pressure has already
+     * throttled the server to -- so it read its own output as its input and
+     * had to be kept from hunting. This gives up once, one way, and resumes
+     * only after COMBINE_RECOVER_MS clear, at most COMBINE_MAX_TRIPS times.
+     *
+     * **And it gates on the symptom, not the cost.** Measuring the combine
+     * means timing GPU execution, which needs a gl.finish() per picture --
+     * stalling the pipeline this protects -- or timer queries that are not
+     * reliably available. A held ack needs neither and is what the user feels.
+     *
+     * The cost of being wrong is bounded: timeouts caused by something else --
+     * a slow link, a struggling decoder -- give up chroma for nothing, which
+     * loses a little colour resolution and no frames.
+     *
+     * @private
+     * @param {!string} mode
+     *     '444' if the ack was held while combining, '420' otherwise.
+     */
+    function noteSyncTimeout(mode) {
+
+        /* The operator is driving this by hand: an override is an
+         * instruction, not a preference, and a gate that fought it would make
+         * the comparison it exists for impossible. */
+        if (override('h264Chroma444') !== undefined)
+            return;
+
+        var now = nowMs();
+
+        /* Any timeout, combining or not, says the client is not clear of load,
+         * and so holds off a resume. */
+        lastSyncTimeoutAt = now;
+
+        if (mode !== '444' || !combining || combineLatchedOff)
+            return;
+
+        recentSyncTimeouts.push(now);
+        while (recentSyncTimeouts.length
+                && now - recentSyncTimeouts[0] > COMBINE_TIMEOUT_WINDOW_MS)
+            recentSyncTimeouts.shift();
+
+        if (recentSyncTimeouts.length < COMBINE_TIMEOUT_TRIP)
+            return;
+
+        var span = now - recentSyncTimeouts[0];
+
+        /* Only the latch is set here. Combining stops at the next main view,
+         * where the output callback re-checks chroma444Enabled(): this runs
+         * from a timer, and may land between a paired main view -- uploaded,
+         * deliberately unpainted -- and the auxiliary view that paints it.
+         * Stopping in between discards that picture, and if it is a keyframe
+         * nothing repaints the screen. */
+        combineLatchedOff = true;
+        combineTrips++;
+        recentSyncTimeouts = [];
+
+        diagnostic('chroma_suspended', 'gave up 4:4:4 combining: '
+                + COMBINE_TIMEOUT_TRIP + ' sync gate timeouts in '
+                + (span / 1000).toFixed(1) + 's -- the client is setting the '
+                + 'frame rate. Painting 4:2:0'
+                + (combineTrips >= COMBINE_MAX_TRIPS
+                    ? ' for the rest of the session, having given up '
+                        + combineTrips + ' times'
+                    : ' until the sync gate has been clear for '
+                        + (COMBINE_RECOVER_MS / 1000) + 's')
+                + '; ?h264Chroma444=on forces it back on', true);
+
+    }
+
+    /**
+     * Lets a suspended session try combining again, once it has gone
+     * COMBINE_RECOVER_MS without a sync gate timeout. Checked on every sync,
+     * which is where a timeout would show. Resuming only clears the latch:
+     * combining itself restarts at the next auxiliary view, through the same
+     * area check as at connect.
+     *
+     * @private
+     */
+    function maybeResumeCombining() {
+
+        if (!combineLatchedOff || combineTrips >= COMBINE_MAX_TRIPS)
+            return;
+
+        if (nowMs() - lastSyncTimeoutAt < COMBINE_RECOVER_MS)
+            return;
+
+        combineLatchedOff = false;
+
+        diagnostic('chroma_resumed', 'resuming 4:4:4 combining: no sync gate '
+                + 'timeout for ' + (COMBINE_RECOVER_MS / 1000) + 's ('
+                + combineTrips + ' of ' + COMBINE_MAX_TRIPS
+                + ' attempts used)', true);
+
+    }
+
+    /**
      * Cancels a frame's decode watchdog, if it is still armed.
      *
      * @private
@@ -895,6 +1158,23 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @private
      * @returns {!number}
      */
+    /**
+     * Forces the renderer's outstanding GPU work to complete, so that the
+     * combine timing that follows measures execution rather than submission.
+     *
+     * Costs a pipeline stall, so it happens only when h264CombineLog has asked
+     * for numbers. Without it the log reports the combine at well under a
+     * millisecond while tests/bench, which does force completion, measures
+     * ~1.37ms per megapixel for the same work -- a discrepancy that has twice
+     * been read as the combine being cheap.
+     *
+     * @private
+     */
+    function finishForTiming() {
+        if (yuv444 && yuv444.finish && override('h264CombineLog'))
+            yuv444.finish();
+    }
+
     function nowMs() {
         return (typeof performance !== 'undefined' && performance.now)
             ? performance.now() : Date.now();
@@ -1107,8 +1387,83 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (value !== undefined)
             return !!value;
 
-        return Guacamole.H264Decoder.combineChromaByDefault !== false;
+        /* Given up for now by noteSyncTimeout(). */
+        if (combineLatchedOff)
+            return false;
 
+        /* Decided from the framebuffer's area, because that is what the cost
+         * is a function of. The combine is a plane read-back, six texture
+         * uploads and a shader pass per picture, all proportional to pixels
+         * and all contending with the hardware video decoder on the same GPU,
+         * so at high resolution it costs frame rate rather than buying
+         * chroma -- and by then a 4:2:0 chroma block already covers close to
+         * one logical pixel, so there is little left to recover.
+         *
+         * Not the desktop scale, which was the first thing tried: that only
+         * says whether HiDPI scaling was applied, so a 4K display at a device
+         * pixel ratio of 1 slips past it and combines at 8.3 megapixels, the
+         * most expensive case there is. It is also not a property of the host
+         * -- the same picture costs the same to combine whatever sent it,
+         * which is why this was mistaken for an xrdp problem before a Windows
+         * session was run at native resolution. */
+        var pixels = display ? display.getWidth() * display.getHeight() : 0;
+
+        /* Nothing sized yet: combine, and let the next picture decide once
+         * the display has been sized. */
+        if (!pixels)
+            return true;
+
+        var limit = combineMaxPixels();
+        var combine = pixels <= limit;
+
+        /* Once, and only where the answer is no -- ensureYuv444() already
+         * announces the yes. A session painting 4:2:0 from an AVC444 stream
+         * looks like a fault otherwise, and this is the line that says it was
+         * a decision. */
+        if (!combine && !chromaDeclineLogged) {
+            chromaDeclineLogged = true;
+            console.log('[rustguac] H.264: not combining AVC444 -- '
+                    + display.getWidth() + 'x' + display.getHeight() + ' is '
+                    + (pixels / 1e6).toFixed(1) + 'MP, over the '
+                    + (limit / 1e6).toFixed(1) + 'MP the combine is worth its '
+                    + 'GPU cost at; ?h264Chroma444=on overrides');
+        }
+
+        return combine;
+
+    }
+
+    /**
+     * Whether the decision not to combine has been reported. The gate is
+     * consulted on every auxiliary view until combining starts, so the line
+     * would otherwise repeat for the life of the session.
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var chromaDeclineLogged = false;
+
+    /**
+     * The framebuffer area, in pixels, up to which AVC444 views are combined.
+     *
+     * From tests/bench on an Intel UHD 770, where the combine costs about
+     * 1.37ms per megapixel (2.46ms at 1080p, 12.93ms at 4K, banded upload,
+     * whole-screen damage). Four megapixels is therefore roughly a third of a
+     * 60fps frame budget: 1080p spends 17% of a frame on it and 1440p 30%,
+     * while 4K would spend 68% and a 5.5MP native-resolution session 45% --
+     * which was measured in the field as a frame backlog and sync timeouts.
+     *
+     * Overridable as window.__h264CombineMaxPixels, ?h264CombineMaxPixels= on
+     * the client's URL, or the h264CombineMaxPixels key in localStorage, since
+     * the figure comes from one GPU and a faster or slower one moves the line.
+     *
+     * @private
+     * @returns {!number}
+     */
+    function combineMaxPixels() {
+        var value = override('h264CombineMaxPixels');
+        return (typeof value === 'number' && value > 0)
+            ? value : COMBINE_MAX_PIXELS;
     }
 
     /**
@@ -1411,6 +1766,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             if (view === 0 && frameState.paired) {
                 deferredMain = true;
                 deferredMainRects = frameState.rects;
+                finishForTiming();
                 combineWorkMs += nowMs() - startedAt;
                 return;
             }
@@ -1462,6 +1818,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * the bottom of the display whenever the server sent no rects. */
             frameState.canvas = rendered;
 
+            finishForTiming();
             combineWorkMs += nowMs() - startedAt;
 
             /* An auxiliary view completes the picture it refines, so the gate
@@ -1667,9 +2024,45 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                      * so no work of ours is counted as the decoder's. */
                     frameState.decodedAt = nowMs();
                     counts.decoded++;
+                    noteFramebufferSize();
                     if (frameState.submittedAt)
                         recordStat('decode', frameState.view !== 0,
                                 frameState.decodedAt - frameState.submittedAt);
+
+                    /* The decision to combine is made from the framebuffer's
+                     * area at the time, and the framebuffer is resized after
+                     * connecting: a fit that passed through 2240x1648 (3.7MP)
+                     * switched combining on, and it stayed on at 2992x2000
+                     * (6MP), where it costs ~8ms of GPU per picture. So
+                     * re-check it while combining -- a multiply and a cached
+                     * lookup -- but only on a main view, where a picture
+                     * begins. A paired main view has already been uploaded
+                     * and deliberately not painted, leaving its auxiliary
+                     * view to paint the picture; stopping between the two
+                     * throws that picture away. When it is the connect-time
+                     * keyframe, nothing else repaints the screen and the
+                     * session looks hung until a resize brings another one.
+                     *
+                     * Stopping here leaves this main view to the 4:2:0 path
+                     * below, which paints it, and its auxiliary view to the
+                     * block after, which declines it. Resuming, should the
+                     * framebuffer shrink again, uploads whole planes, since
+                     * what was uploaded no longer matches the screen. */
+                    if (combining && frameState.view === 0
+                            && !chroma444Enabled()) {
+                        combining = false;
+                        resyncNeeded = true;
+
+                        /* Suspended by the sync gate, which has reported it
+                         * already; this is only where it takes effect. */
+                        if (!combineLatchedOff)
+                            diagnostic('chroma_declined', 'stopped 4:4:4 '
+                                + 'combining: the framebuffer grew to '
+                                + display.getWidth() + 'x' + display.getHeight()
+                                + ', over the ' + (combineMaxPixels() / 1e6)
+                                    .toFixed(1) + 'MP it is worth its cost at',
+                                true);
+                    }
 
                     /* An auxiliary view means this is an AVC444 stream, so
                      * its chroma can be recovered. Switch over for the frames
@@ -1678,7 +2071,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                      * planes were never uploaded. */
                     if (frameState.view !== 0 && !combining) {
 
-                        if (chroma444Enabled() && ensureYuv444())
+                        /* Not before the size has settled; see
+                         * COMBINE_SETTLE_MS. The next auxiliary view after it
+                         * has asks again. */
+                        if (chroma444Enabled() && framebufferSettled()
+                                && ensureYuv444())
                             combining = true;
 
                         /* Not an image on its own: drawing packed chroma would
@@ -2080,27 +2477,171 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     };
 
     /**
+     * How long sync acknowledgements are held waiting for decodes, split by
+     * whether the picture was being combined into 4:4:4 at the time.
+     *
+     * The hold is the throttle itself: guacd paces frames on the ack, so a
+     * client that is slow but not drowning shows up here -- as acks held
+     * longer -- and never as a growing backlog, which is all the combine latch
+     * watches. These are the numbers a gate on sluggishness would need, and
+     * they are collected before anything acts on them because a normal hold on
+     * a large framebuffer is not zero and has not been measured.
+     *
+     * `total` runs for the session and goes into describeState(); `window`
+     * is reported and reset once a minute as `sync_hold`.
+     *
+     * @private
+     */
+    function newHoldStats() {
+        function mode() {
+            return { syncs: 0, held: 0, sumMs: 0, maxMs: 0, timeouts: 0,
+                     flushes: 0, flushSumMs: 0, flushMaxMs: 0, flushSlow: 0 };
+        }
+        return { '420': mode(), '444': mode() };
+    }
+
+    /**
+     * A display flush at least this long, in milliseconds, is counted as slow.
+     * At 60fps a frame is 16.7ms; this is six of them.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var FLUSH_SLOW_MS = 100;
+    var holdTotal = newHoldStats();
+    var holdWindow = newHoldStats();
+    var holdWindowStart = 0;
+
+    /**
+     * How often the window above is reported, in milliseconds.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var HOLD_REPORT_INTERVAL_MS = 60000;
+
+    /**
+     * Records one sync acknowledgement's hold, and reports the window if a
+     * minute has passed. Reporting from here rather than from a timer means a
+     * session sending no frames reports nothing, and nothing outlives the
+     * decoder.
+     *
+     * @private
+     */
+    function recordHold(mode, ms, timedOut, flushMs) {
+
+        [holdTotal[mode], holdWindow[mode]].forEach(function(stats) {
+            if (typeof flushMs === 'number') {
+                stats.flushes++;
+                stats.flushSumMs += flushMs;
+                stats.flushMaxMs = Math.max(stats.flushMaxMs, flushMs);
+                if (flushMs >= FLUSH_SLOW_MS)
+                    stats.flushSlow++;
+            }
+            stats.syncs++;
+            if (ms > 0) {
+                stats.held++;
+                stats.sumMs += ms;
+                stats.maxMs = Math.max(stats.maxMs, ms);
+            }
+            if (timedOut)
+                stats.timeouts++;
+        });
+
+        var now = nowMs();
+        if (!holdWindowStart) {
+            holdWindowStart = now;
+            return;
+        }
+
+        var elapsed = now - holdWindowStart;
+        if (elapsed < HOLD_REPORT_INTERVAL_MS)
+            return;
+
+        diagnostic('sync_hold', 'last ' + (elapsed / 1000).toFixed(0) + 's at '
+                + (display ? display.getWidth() + 'x' + display.getHeight()
+                    : '?') + ': ' + describeHolds(holdWindow, elapsed), true);
+
+        holdWindow = newHoldStats();
+        holdWindowStart = now;
+
+    }
+
+    /**
+     * One mode's holds as text: syncs and their rate, how many were held at
+     * all, the mean hold across every sync (the throttle's average cost per
+     * frame) and across the held ones, the longest, and timeouts.
+     *
+     * @private
+     */
+    function describeHolds(stats, elapsedMs) {
+        var parts = [];
+        ['420', '444'].forEach(function(mode) {
+            var s = stats[mode];
+            if (!s.syncs)
+                return;
+            parts.push((mode === '444' ? '4:4:4' : '4:2:0') + ' ' + s.syncs
+                    + ' syncs'
+                    + (elapsedMs ? ' (' + (s.syncs * 1000 / elapsedMs)
+                        .toFixed(1) + '/s)' : '')
+                    + ' held ' + s.held + ' ('
+                    + (100 * s.held / s.syncs).toFixed(0) + '%)'
+                    + ' mean ' + (s.sumMs / s.syncs).toFixed(1) + 'ms'
+                    + (s.held ? ' mean-held ' + (s.sumMs / s.held).toFixed(1)
+                        + 'ms' : '')
+                    + ' max ' + s.maxMs.toFixed(0) + 'ms'
+                    + ' timeouts ' + s.timeouts
+                    + (s.flushes ? ' | flush mean '
+                        + (s.flushSumMs / s.flushes).toFixed(1) + 'ms max '
+                        + s.flushMaxMs.toFixed(0) + 'ms slow '
+                        + s.flushSlow : ''));
+        });
+        return parts.length ? parts.join('; ') : 'no syncs';
+    }
+
+    /**
      * Waits for pending decodes to drain, then invokes the callback. Used to
      * gate the Guacamole sync response so that guacd receives accurate
      * backpressure from the client's decode speed.
      *
      * @param {function} callback
      *     Called when the backlog is within the allowed pipeline depth.
+     *
+     * @param {number} [flushMs]
+     *     How long the display took to flush this sync's frame, from the sync
+     *     arriving to the flush completing. The ack waits for the flush before
+     *     it ever reaches this gate, so a display queue that is slow holds
+     *     acks where the hold above cannot see it -- measured in the field as
+     *     2.2 syncs/s with no holds while the screen stopped updating. Reported
+     *     beside the hold in `sync_hold`.
      */
-    this.waitForPending = function(callback) {
+    this.waitForPending = function(callback, flushMs) {
+
+        /* Charged to the mode the ack was held under, which is the one whose
+         * cost is being measured -- a combine switched off mid-hold still
+         * caused it. */
+        var mode = combining ? '444' : '420';
+
+        maybeResumeCombining();
 
         if (pendingDecodes <= MAX_PIPELINE_DEPTH || !decoder
                 || decoder.state === 'closed') {
+            recordHold(mode, 0, false, flushMs);
             callback();
             return;
         }
 
         var waitingOn = pendingDecodes;
         var resolved = false;
+        var heldSince = nowMs();
 
         var timer = setTimeout(function() {
             if (!resolved) {
                 resolved = true;
+                recordHold(mode, nowMs() - heldSince, true, flushMs);
+                noteSyncTimeout(mode);
                 syncTimeouts++;
                 reportAbandoned();
                 var now = performance.now();
@@ -2117,6 +2658,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             if (!resolved) {
                 resolved = true;
                 clearTimeout(timer);
+                recordHold(mode, nowMs() - heldSince, false, flushMs);
                 callback();
             }
         });
@@ -2153,7 +2695,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 + ' lastKeyframe=' + ago(counts.lastKeyframeAt)
                 + ' lastKeyframePaint=' + ago(counts.lastKeyframePaintAt)
                 + ' watchdog=' + watchdogFires
-                + ' syncTimeouts=' + syncTimeouts;
+                + ' syncTimeouts=' + syncTimeouts
+                + ' holds[' + describeHolds(holdTotal, 0) + ']';
 
     };
 
@@ -2253,21 +2796,3 @@ Guacamole.H264Decoder.isSupported = function isSupported() {
  */
 Guacamole.H264Decoder.onDiagnostic = null;
 
-/**
- * Whether an AVC444 stream's two views are combined into 4:4:4 chroma unless a
- * runtime override says otherwise.
- *
- * Set false where the combine costs more than the chroma is worth. It is real
- * GPU work -- six plane uploads and a shader pass per picture, 13-19ms at 4K on
- * an Intel UHD 770 -- contending with the hardware video decoder on the same
- * GPU, so at high pixel density it surfaces as decode latency and a frame
- * backlog rather than as an obviously expensive combine.
- *
- * Note that `h264CombineLog` cannot see that cost: it brackets GPU submission,
- * not execution, and reports well under a millisecond for the same work. Use
- * tests/bench, which forces completion with gl.finish(), before concluding the
- * combine is cheap.
- *
- * @type {!boolean}
- */
-Guacamole.H264Decoder.combineChromaByDefault = true;

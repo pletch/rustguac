@@ -1035,6 +1035,24 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      *
      * @returns {!OffscreenCanvas}
      */
+    /**
+     * Blocks until the GPU work issued so far has completed.
+     *
+     * Only for measurement. Uploads, the shader pass and the bitmap transfer
+     * are all asynchronous, so timing them without this measures how fast work
+     * can be *submitted* -- which is roughly a quarter of what the combine
+     * actually costs, and is why it was twice concluded to be nearly free.
+     * tests/bench has always forced completion for exactly this reason.
+     *
+     * Stalls the pipeline, so it belongs behind a diagnostic flag and nowhere
+     * else.
+     */
+    this.finish = function finish() {
+        if (!renderer.supported || gl.isContextLost())
+            return;
+        gl.finish();
+    };
+
     this.getCanvas = function getCanvas() {
         return canvas;
     };
