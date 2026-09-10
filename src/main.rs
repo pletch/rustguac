@@ -6,6 +6,8 @@ mod config;
 mod db;
 mod drive;
 mod guacd;
+mod h264_rewrite;
+mod h264_sps;
 mod import;
 mod migrate;
 mod oidc;

@@ -316,8 +316,15 @@ async fn handle_ws(
 
     // Run the bidirectional proxy
     let start = Instant::now();
-    let proxy_outcome =
-        proxy_ws_guacd(ws, guacd_stream, recording_file, cancel, binary_blobs).await;
+    let proxy_outcome = proxy_ws_guacd(
+        ws,
+        guacd_stream,
+        recording_file,
+        cancel,
+        session_id,
+        binary_blobs,
+    )
+    .await;
     let elapsed = start.elapsed();
     let server_disconnected = proxy_outcome.server_disconnected;
     let proxy_result = proxy_outcome.result;
@@ -435,6 +442,7 @@ async fn proxy_ws_guacd(
     guacd: GuacdStream,
     recording_file: Option<tokio::fs::File>,
     cancel: CancellationToken,
+    session_id: Uuid,
     binary_blobs: bool,
 ) -> ProxyOutcome {
     let (guacd_read, guacd_write) = tokio::io::split(guacd);
@@ -460,6 +468,7 @@ async fn proxy_ws_guacd(
             ws_sink_g,
             recording_clone,
             sd_flag,
+            session_id,
             binary_blobs,
         )
         .await
@@ -522,6 +531,7 @@ async fn guacd_to_ws(
     ws: WsSink,
     recording: Option<Arc<tokio::sync::Mutex<tokio::fs::File>>>,
     server_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    session_id: Uuid,
     binary_blobs: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 65536];
@@ -530,6 +540,14 @@ async fn guacd_to_ws(
     // Only allocated when the client asked for binary blobs; without it the
     // send path below stays the byte-for-byte passthrough it has always been.
     let mut splitter = binary_blobs.then(crate::binary_blob::BlobSplitter::new);
+
+    let mut sps_rewritten = false;
+
+    // Gives a host that declares its colour range without describing its
+    // colourimetry the shape Chrome's hardware decoder will act on. Costs
+    // nothing once the stream's first SPS has been seen and found not to need
+    // it, which is every host but Windows. See crate::h264_rewrite.
+    let mut sps_rewriter = crate::h264_rewrite::SpsRewriter::new();
 
     loop {
         let n = guacd.read(&mut buf).await?;
@@ -578,6 +596,34 @@ async fn guacd_to_ws(
         // at the start or after a previous ";".
         if text.starts_with("10.disconnect;") || text.contains(";10.disconnect;") {
             server_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Splice a colour description into the SPS where the host left one
+        // out.
+        let text = match sps_rewriter.rewrite(&text) {
+            Some(rewritten) => {
+                if !sps_rewritten {
+                    sps_rewritten = true;
+                    tracing::info!(
+                        session_id = %session_id,
+                        "H.264 colour: splicing a BT.709 description into the SPS, \
+                         which Chrome's hardware decoder needs before it will act \
+                         on the range the host declared"
+                    );
+                }
+                rewritten
+            }
+            None => text,
+        };
+
+        // What the stream says about colour, once per session, from the first
+        // SPS as the host sent it -- before the splice above, since the value
+        // of this line is that it describes the wire. The browser's rendering
+        // follows from it and nothing else logs it, and a full-range host with
+        // crushed blacks looks the same on screen whether the stream says
+        // limited or says full beside an unspecified description.
+        if let Some(line) = sps_rewriter.take_wire_colour() {
+            tracing::info!(session_id = %session_id, "H.264 colour: {}", line);
         }
 
         // The recording above saw the text form; only what goes to the
