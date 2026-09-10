@@ -234,6 +234,18 @@ request DPI scaling at all: `channels/disp.c` pins `DesktopScaleFactor` and
 requested width and height, which `settings.c` skips whenever an explicit width
 and height are supplied.
 
+**The two channels differ, and the layout is the capable one.** At connection
+time only 100/140/180 survive, because FreeRDP transposes the pair while
+synthesising its single-monitor definition and an out-of-range
+`deviceScaleFactor` makes the server discard both. The display-control layout
+is built in `disp.c` and handed straight to the channel, so nothing transposes
+it: it carries the **exact** `DesktopScaleFactor` (100–500) beside the nearest
+legal `DeviceScaleFactor`. A client that fits the display shortly after
+connecting is therefore scaled by the exact value, which is what allows 200% on
+a 2.0 display rather than the 180% that leaves its UI 10% small.
+`guac_rdp_clamp_desktop_scale` supplies the first, `guac_rdp_normalize_desktop_scale`
+the second.
+
 **How it works.** `desktop-scale` is parsed as a percentage and validated
 against the 100–500 range of MS-RDPBCGR 2.2.1.3.2. When non-zero,
 `guac_rdp_push_settings()` sets `FreeRDP_DesktopScaleFactor` to it and

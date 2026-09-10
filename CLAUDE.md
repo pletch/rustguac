@@ -433,10 +433,43 @@ server does no such rounding. The connect-time fit is exempt -- its repeats are
 deliberate, covering a window where the server drops the size silently -- but
 it seeds the record so later resizes compare against reality.
 
-RDP is asked to scale via `desktopScaleFactor` (patch `011-rdp-dpi-scaling`).
-**Only 100/140/180 work**, so the factor snaps to 1.4 or 1.8: MS-RDPBCGR
-restricts `deviceScaleFactor` to those three, and FreeRDP transposes the pair
-when synthesising a single-monitor definition, so only equal values survive.
+**The framebuffer factor and the desktop scale are separate numbers, and used
+to be conflated.** The framebuffer takes the browser's true
+`devicePixelRatio` (capped by `MAX_NATIVE_FACTOR`), because the client fits
+whatever framebuffer arrives into the available CSS area -- so one framebuffer
+pixel lands on one physical pixel only when the two agree. Snapping the
+framebuffer to 1.8 on a 2.0 display left the client stretching by 1.111, which
+measured in the field as a uniformly soft picture with almost no single-pixel
+edges: 0.01% of adjacent pixels differing by >100 levels against a native
+render's 0.82%. The cost of separating them is a desktop scaled 180% inside a
+200% framebuffer drawing its UI ~10% smaller than nominal, which is legible and
+adjustable on the host where a resample is neither.
+
+**Native resolution also turns 4:4:4 combining off**
+(`Guacamole.H264Decoder.combineChromaByDefault`, cleared in `client.html`). The
+combine is GPU work that contends with the hardware video decoder, so at that
+density it costs frame rate rather than buying chroma -- the same reasoning as
+the entry's Automatic AVC444 setting, which a Windows target cannot use because
+without an AVC444 request it offers no H.264 at all. `?h264Chroma444=on`
+overrides. **`h264CombineLog` cannot see this cost:** it times GPU submission,
+not execution, and reports the same work at under a millisecond; use
+`tests/bench`, which calls `gl.finish()`.
+
+RDP is asked to scale via `desktopScaleFactor` (patch `011-rdp-dpi-scaling`),
+and **the two channels that carry it are not equally capable**. At connection
+time only 100/140/180 survive: MS-RDPBCGR restricts `deviceScaleFactor` to
+those three, and FreeRDP transposes the pair when synthesising its
+single-monitor definition (`libfreerdp/core/settings.c` — the monitor's
+`desktopScaleFactor` is filled from `FreeRDP_DeviceScaleFactor` and vice
+versa), so only equal values reach the server intact. The display-control
+layout has no such problem: `disp.c` builds it directly, nothing transposes it,
+and MS-RDPEDISP 2.2.2.2.1 allows `desktopScaleFactor` anywhere in 100-500 while
+restricting only `deviceScaleFactor`. So that layout carries the **exact**
+percentage alongside the nearest legal device factor, and since the client fits
+the display shortly after connecting it is what the session ends up scaled by.
+That is what lets a 2.0 display run at 200% rather than the 180% that leaves
+its UI 10% smaller than nominal.
+
 The scale is re-sent on every display update — a `MONITOR_LAYOUT` carrying
 zeroes resets the session to 100%, which used to undo it a second after connect.
 

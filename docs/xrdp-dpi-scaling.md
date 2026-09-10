@@ -9,6 +9,20 @@ workaround" below). The patch buys exactness — correct scaling for any client,
 rather than bucketing by a width threshold — and matters mainly when clients
 with different `devicePixelRatio` values connect to the same host.
 
+**The case is stronger than it was.** rustguac now sends the *exact* scaling
+percentage rather than one of 100/140/180 (see the caveat below), and xrdp
+accepts and stores it. So the number the session wants is already sitting in
+`client_info` and nothing reads it — the patch is plumbing, not negotiation.
+
+Note also what the patch cannot do: there is no X11 equivalent of the Windows
+mechanism it is named after. Windows acts on `desktopScaleFactor` because the
+OS has a system-wide DPI that applications honour; X has no such thing, and
+scaling is a toolkit convention applied inside the session (`Xft/DPI` via
+XSETTINGS for GTK, its own for Qt). So a session-side hook is unavoidable in
+principle. What the patch removes is the *guessing*, not the hook — and if the
+export is paired with a change to xrdp's own shipped `startwm.sh`, the hook
+stops being something a deployment has to write and maintain.
+
 ## What already works
 
 xrdp **parses and validates the scale factors**; it just never uses them.
@@ -126,6 +140,18 @@ Prefer `/Xft/DPI` over `/Gdk/WindowScalingFactor`: the latter takes only
 integers, so it cannot express 140% or 180% at all, and overshoots by ~11% when
 used to approximate 180%.
 
+### 4. Apply it in xrdp's own startwm.sh
+
+Exporting the variable leaves every deployment writing the same three lines.
+Applying it in the `startwm.sh` xrdp ships makes HiDPI work out of the box and
+is what turns this from a hook a site maintains into a feature xrdp has — which
+is also the version worth proposing upstream, since the guessing it replaces is
+guessing every xrdp user is currently doing.
+
+Guard it so it changes nothing for the clients that send no scale: with
+`XRDP_DESKTOP_SCALE_FACTOR` unset or 100 the computed DPI is 96, which is the
+default already.
+
 ## Caveat: FreeRDP transposes the pair
 
 FreeRDP fills the synthesised single-monitor definition with the two factors
@@ -145,10 +171,25 @@ then rejects it — a desktop factor of 200 lands in `device_scale_factor`, fail
 the 100/140/180 check, and both are reset to 100.
 
 Equal values are immune, which is why FreeRDP's own `/scale` accepts only 100,
-140 and 180 and sets both at once. rustguac's guacd patch
-(`patches/011-rdp-dpi-scaling.patch`) does the same, so what arrives is correct
-today — but an xrdp patch should not assume well-formed input from FreeRDP
-clients generally.
+140 and 180 and sets both at once.
+
+**That is only true of the connection-time core data.** The transposition lives
+in FreeRDP's synthesis of a single-monitor definition; the display-control
+layout is built directly by the client and passes through untouched. So
+`patches/011-rdp-dpi-scaling.patch` now snaps only the core-data pair and sends
+the **exact** percentage in the `DISPLAY_CONTROL_MONITOR_LAYOUT` that follows —
+`desktopScaleFactor = 200` beside `deviceScaleFactor = 180` on a 2.0 display.
+
+xrdp accepts that pair. Its validation (`libxrdp/libxrdp.c:1888-1914`) requires
+`desktop_scale_factor` in 100–500 and `device_scale_factor` in {100, 140, 180},
+resetting **both** to 100 if either fails; 200/180 satisfies both. The value is
+therefore already stored per-monitor and is exact — a patch reading it gets the
+client's true ratio, not a bucketed approximation.
+
+An xrdp patch should still not assume well-formed input from FreeRDP clients
+generally: anything arriving over the core-data path from a client that sets the
+two settings independently is transposed, and the 100/100 reset above is what
+that looks like from inside xrdp.
 
 ## Current workaround (no patch)
 

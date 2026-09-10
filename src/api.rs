@@ -353,6 +353,15 @@ static DIAGNOSTIC_BUDGET: std::sync::Mutex<(u64, u32)> = std::sync::Mutex::new((
 /// small next to anything that could fill a disk.
 const DIAGNOSTIC_BUDGET_PER_MINUTE: u32 = 120;
 
+/// Ceiling on the devicePixelRatio a native-resolution entry will size its
+/// framebuffer by.
+///
+/// The factor squares into pixels the host has to encode and the browser has to
+/// decode, so an unbounded value from the page is a way to ask for a
+/// framebuffer neither can sustain. 3.0 covers every display in use; beyond
+/// that the resample is the lesser problem.
+const MAX_NATIVE_FACTOR: f64 = 3.0;
+
 /// POST /api/sessions/{id}/diagnostic — record a browser-side observation.
 ///
 /// Owner or admin only, on the same terms as the thumbnail endpoint: the text
@@ -2958,14 +2967,27 @@ pub async fn ab_connect_entry(
     // reports its devicePixelRatio and sends CSS-pixel dimensions; scaling them
     // here keeps the policy with the entry rather than in the page.
     //
-    // The factor is snapped to 1.4 or 1.8 because those are the only scalings
-    // an RDP session can actually be given -- see guac_rdp_normalize_desktop_scale
-    // in patches/011 -- and a framebuffer scaled by more than the desktop is
-    // scaled leaves everything proportionally too small.
+    // **The framebuffer factor and the desktop scale are separate numbers.**
+    // The framebuffer takes the browser's true devicePixelRatio, because
+    // anything else leaves the client resampling: it fits whatever framebuffer
+    // arrives into the available CSS area, so one framebuffer pixel lands on
+    // one physical pixel only when the two agree. The RDP desktop scale is
+    // snapped to 140 or 180 separately, since MS-RDPBCGR permits only
+    // 100/140/180 -- see guac_rdp_normalize_desktop_scale in patches/011.
+    //
+    // Tying them together, as this used to, meant a 2.0 display was given a
+    // 1.8 framebuffer and the client stretched it by 1.111 -- measured in the
+    // field as a uniformly soft picture with almost no single-pixel edges
+    // anywhere, 0.01% against a native render's 0.82%. The cost of separating
+    // them is that a desktop scaled 180% inside a framebuffer scaled 200% draws
+    // its UI about 10% smaller than nominal. That is the better trade: 10%
+    // smaller is legible and adjustable on the host, while a 1.111 resample is
+    // neither.
     let native_factor = if ab_entry.native_resolution.unwrap_or(false) {
         match req.device_pixel_ratio {
-            Some(dpr) if dpr >= 1.6 => 1.8,
-            Some(dpr) if dpr > 1.0 => 1.4,
+            // Guard against a nonsense or hostile ratio sizing a framebuffer
+            // the server then has to encode.
+            Some(dpr) if dpr.is_finite() && dpr > 1.0 => dpr.min(MAX_NATIVE_FACTOR),
             _ => 1.0,
         }
     } else {
@@ -2978,6 +3000,15 @@ pub async fn ab_connect_entry(
                 .map(|w| ((w as f64 * native_factor).round() as u32) & !0x7),
             req.height
                 .map(|h| (h as f64 * native_factor).round() as u32),
+            // The exact percentage, not the nearest legal one. guacd snaps it
+            // for the connection-time core data, where FreeRDP's monitor
+            // synthesis transposes the pair and only equal values survive, but
+            // sends it verbatim in the display-control layout that follows --
+            // MS-RDPEDISP allows desktopScaleFactor anywhere in 100-500 and
+            // restricts only deviceScaleFactor. Since the client fits the
+            // display shortly after connecting, that layout is what the session
+            // ends up scaled by, so a 2.0 display gets 200% rather than the 180%
+            // that leaves its UI 10% small.
             Some((native_factor * 100.0).round() as u32),
         )
     } else {

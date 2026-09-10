@@ -800,8 +800,16 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @returns {!boolean}
      */
     function chroma444Enabled() {
+
+        /* An explicit override always wins: it is how a session is compared
+         * against the other setting, and a policy that could not be overridden
+         * would make that comparison impossible. */
         var value = override('h264Chroma444');
-        return value === undefined ? true : !!value;
+        if (value !== undefined)
+            return !!value;
+
+        return Guacamole.H264Decoder.combineChromaByDefault !== false;
+
     }
 
     /**
@@ -1873,3 +1881,22 @@ Guacamole.H264Decoder.isSupported = function isSupported() {
  * @type {?function(string, string)}
  */
 Guacamole.H264Decoder.onDiagnostic = null;
+
+/**
+ * Whether an AVC444 stream's two views are combined into 4:4:4 chroma unless a
+ * runtime override says otherwise.
+ *
+ * Set false where the combine costs more than the chroma is worth. It is real
+ * GPU work -- six plane uploads and a shader pass per picture, 13-19ms at 4K on
+ * an Intel UHD 770 -- contending with the hardware video decoder on the same
+ * GPU, so at high pixel density it surfaces as decode latency and a frame
+ * backlog rather than as an obviously expensive combine.
+ *
+ * Note that `h264CombineLog` cannot see that cost: it brackets GPU submission,
+ * not execution, and reports well under a millisecond for the same work. Use
+ * tests/bench, which forces completion with gl.finish(), before concluding the
+ * combine is cheap.
+ *
+ * @type {!boolean}
+ */
+Guacamole.H264Decoder.combineChromaByDefault = true;

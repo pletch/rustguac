@@ -405,7 +405,28 @@
                     };
                 }
                 if (session && session.entry_display_name) entryDisplayName = session.entry_display_name;
-                if (session && session.display_scale > 1) displayScale = session.display_scale;
+                if (session && session.display_scale > 1) {
+                    displayScale = session.display_scale;
+
+                    // A native-resolution session is already carrying several
+                    // times the pixels, and combining AVC444 into 4:4:4 is real
+                    // GPU work per picture that contends with the hardware video
+                    // decoder -- at this density it costs frame rate rather than
+                    // buying visible chroma, since a 4:2:0 chroma block already
+                    // covers about one logical pixel. Same reasoning as the
+                    // entry's Automatic AVC444 setting, which declines to ask
+                    // for AVC444 at all here; a Windows target cannot use that,
+                    // because without an AVC444 request it offers no H.264, so
+                    // the choice has to be made on this side instead.
+                    //
+                    // A default, not a lock: ?h264Chroma444=on still wins.
+                    if (window.Guacamole && Guacamole.H264Decoder) {
+                        Guacamole.H264Decoder.combineChromaByDefault = false;
+                        console.info('[rustguac] H.264: 4:4:4 combining off by '
+                            + 'default at native resolution (framebuffer '
+                            + displayScale + 'x); ?h264Chroma444=on overrides');
+                    }
+                }
                 if (session && session.fullscreen_on_connect) wantFullscreen = true;
                 if (session && session.autohide_side_tabs) wantAutohideTabs = true;
                 return showBanner(session.banner);
