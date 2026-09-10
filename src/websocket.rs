@@ -542,6 +542,14 @@ async fn guacd_to_ws(
     // send path below stays the byte-for-byte passthrough it has always been.
     let mut splitter = binary_blobs.then(crate::binary_blob::BlobSplitter::new);
 
+    let mut sps_rewritten = false;
+
+    // Gives a host that declares its colour range without describing its
+    // colourimetry the shape Chrome's hardware decoder will act on. Costs
+    // nothing once the stream's first SPS has been seen and found not to need
+    // it, which is every host but Windows. See crate::h264_rewrite.
+    let mut sps_rewriter = crate::h264_rewrite::SpsRewriter::new();
+
     loop {
         let n = guacd.read(&mut buf).await?;
         if n == 0 {
@@ -607,6 +615,36 @@ async fn guacd_to_ws(
                 );
             }
         }
+
+        // What the stream says about colour, once per session, read from the
+        // first SPS. The browser's rendering follows from this and nothing
+        // else logs it — and a host whose samples are full range renders with
+        // crushed blacks both when the stream says limited and when it says
+        // full beside an unspecified primaries value, which look identical on
+        // screen. See FrameStats::observe_h264_colour.
+        if let Some(line) = frame_stats.observe_h264_colour(&text) {
+            tracing::info!(session_id = %session_id, "H.264 colour: {}", line);
+        }
+
+        // Splice a colour description into the SPS where the host left one
+        // out. After the telemetry above, so `H.264 colour:` reports what the
+        // host actually sent rather than what we made of it -- the whole value
+        // of that line is that it describes the wire.
+        let text = match sps_rewriter.rewrite(&text) {
+            Some(rewritten) => {
+                if !sps_rewritten {
+                    sps_rewritten = true;
+                    tracing::info!(
+                        session_id = %session_id,
+                        "H.264 colour: splicing a BT.709 description into the SPS, \
+                         which Chrome's hardware decoder needs before it will act \
+                         on the range the host declared"
+                    );
+                }
+                rewritten
+            }
+            None => text,
+        };
 
         // Recording and telemetry above both saw the text form; only what
         // goes to the browser is rewritten. WebSocket delivers text and binary
