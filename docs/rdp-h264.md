@@ -361,9 +361,14 @@ Outcomes and fixes:
   Fix it at the encoder.
 * **`full_range=0`, usable** — the host is declaring limited range. If its
   samples are nevertheless full range, as MS-RDPEGFX requires, nothing on the
-  wire can be believed and the client has to be told: `?h264FullRange=on` on
-  the client URL (also `window.__h264FullRange` or the `h264FullRange` key in
-  localStorage). The console then logs `(FORCED -- frame reported limited)`.
+  wire can be believed and the client has to be told. Set the `h264FullRange`
+  key in localStorage: on a live session that is the only form that survives,
+  since the client builds `/client/{id}?name=...` itself on every launch and
+  relaunch and drops anything added by hand. `?h264FullRange=on` works on the
+  recording player, whose URL nothing rewrites. `window.__h264FullRange` is
+  read once per decoder generation, behind the same latch as the colour-space
+  report, so setting it mid-session does nothing until the decoder is rebuilt.
+  The console then logs `(FORCED -- frame reported limited)`.
 * **`usable`, and the client reports the matching range** — the colour is
   right, and a picture that still looks wrong is not a range problem.
 

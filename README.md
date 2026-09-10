@@ -38,11 +38,12 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   format the decoder produced, as hardware decoders generally give NV12 and
   software ones I420. Falls back to 4:2:0 on its own where WebGL2 is missing,
   the GL context is lost, or the frame carries no readable planes.
-- **Ordered drawing** — the `h264` instruction gains a `<view>` field and
-  trailing region rects, and frames are painted through the display's task
-  queue (`Display.drawH264`) rather than straight from the decoder's output
-  callback. Upstream draws on completion, so on a server mixing H.264 with
-  other codecs a late frame repaints stale video over newer content.
+- **Ordered drawing** — the `h264` instruction gains a `<view>` field,
+  trailing region rects and a trailing `<paired>` flag, and frames are painted
+  through the display's task queue (`Display.drawH264`) rather than straight
+  from the decoder's output callback. Upstream draws on completion, so on a
+  server mixing H.264 with other codecs a late frame repaints stale video over
+  newer content.
 - **Frame lifetime** — ordered drawing defers the paint, so a decoded frame is
   snapshotted to a canvas and closed before its draw task runs. Holding a
   `VideoFrame` across a promise exhausts the hardware decoder's output-surface
@@ -70,9 +71,68 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
 - **Recording playback** — the recordings player loads the H.264 decoder and
   the 4:4:4 shader, so sessions recorded with passthrough replay as video
   instead of a black display.
+- **Colour range** (`src/h264_rewrite.rs`, `src/h264_sps.rs`) — MS-RDPEGFX
+  defines the ARGB-to-AYUV transform as full-range BT.709 and hosts encode to
+  it, but Chrome's *hardware* decoder ignores a `video_full_range_flag` that
+  arrives with no colour description, while its software decoder honours it.
+  Windows sends exactly that shape, so its sessions rendered with blacks
+  crushed and chroma over-saturated by 255/224, while the xrdp fork — which
+  sends the same flag *with* a BT.709 description — rendered correctly. This
+  fork splices a BT.709 description into any SPS that declares a range without
+  one, on the wire, deciding once per session. Doing it there rather than in
+  the client reaches `drawImage()`, which no client-side flag can, and every
+  client including third-party ones. Recordings are teed upstream of the
+  rewrite and keep the host's original stream, so `?h264FullRange=on` on the
+  recording player is the lever for playback. On a live session use the
+  `h264FullRange` key in `localStorage` instead: the client builds its URL on
+  every launch and relaunch, so a hand-added query param does not survive a
+  reconnect, and the window global is read once per decoder generation rather
+  than per frame.
+- **Per-connection AVC444 request** (`patches/013-rdp-avc420-only.patch`) —
+  Automatic, Always or Never, per entry. Automatic clears `GfxAVC444` when
+  Native Resolution is on, since at that pixel density a 4:2:0 chroma block
+  already covers close to one logical pixel. **Always** is the right setting
+  for Windows targets: they offer no H.264 below RDPGFX v10, and FreeRDP emits
+  those capability sets only when AVC444 is requested, so Never loses H.264
+  there altogether rather than downgrading its chroma. This says what the
+  server is asked to send, not what the browser draws.
+- **4:4:4 combining is declined when it would cost frame rate** — the combine
+  is a plane read-back, six texture uploads and a shader pass per picture, all
+  proportional to pixels and all contending with the hardware decoder on the
+  same GPU: `tests/bench` puts it at ~1.37ms per megapixel. So it is skipped
+  above a 4MP framebuffer (`COMBINE_MAX_PIXELS`), and a latch under that gives
+  it up when the decode backlog stays over `MAX_PIPELINE_DEPTH * 3` for two
+  seconds, tries again once the backlog has been clear for 30 seconds, and
+  stops after three trips. It gates on the backlog rather than on the combine's
+  own cost, because timing GPU execution needs a `gl.finish()` per picture,
+  stalling the pipeline the gate exists to protect. Only newly painted regions
+  change chroma resolution, so a transition is gradual rather than a flash. An
+  explicit `h264Chroma444` override disables the latch outright.
+- **What the combine costs, and what trims it** — a main view whose auxiliary
+  view follows is uploaded but never painted (that is what `<paired>` carries,
+  set by guacd from MS-RDPEGFX LC=0, since only the server knows before the
+  second access unit arrives); the renderer draws into an `OffscreenCanvas` and
+  hands over the drawing buffer with `transferToImageBitmap()`; the two views'
+  `copyTo()` calls are in flight at once; and the upload is banded, touching
+  only the rows the damage rects cover. The banding is the one that pays —
+  2.0x at 4K and 1.8x at 1080p on a typing-shaped damage list, nothing at all
+  full-screen, correctly, since there is nothing to crop.
+- **Frame-acknowledgement back-pressure**
+  (`patches/012-rdpgfx-frame-ack-backpressure.patch`) — guacd holds the RDPGFX
+  frame acknowledgement by the amount the client's processing lag exceeds its
+  target, *minus* the spacing the server has already provided since the
+  previous frame. That subtraction makes it a floor rather than a second
+  controller: a server that paces itself from the same round trip would read an
+  additive hold as client latency and hunt against it on a roughly one-second
+  cycle.
 - **Runtime overrides for the chroma path** — `h264Chroma444` (off falls back
-  to 4:2:0) and `h264ChromaFilter` (off, or a 0-255 threshold; default 30),
-  settable as a window global, query param, or `localStorage` key.
+  to 4:2:0), `h264ChromaFilter` (off, or a 0-255 threshold; default 30),
+  `h264CombineMaxPixels` (the 4MP threshold above), `h264FullRange` (force the
+  decoder's range) and `h264CombineLog` (per-stage timings every 5s). Each is
+  read as a window global, a query param, or a `localStorage` key — but only
+  `localStorage` survives a session relaunch, since the client rebuilds its own
+  URL, and only `h264Chroma444` and `h264ChromaFilter` are read per picture, so
+  they are the two a window global can change mid-session.
 
 Measured with 1080p video playing, guacd session CPU over 30s:
 
@@ -91,11 +151,12 @@ Measured with 1080p video playing, guacd session CPU over 30s:
   byte for byte. `img` is deliberately excluded, since its blobs feed
   `DataURIReader`, which wants the encoded form.
 
-  Upstream cannot do this: the Guacamole protocol is defined as text, `.guac`
-  recordings are that same stream on disk, and the HTTP long-polling tunnel
-  cannot carry interleaved binary. It is worth doing here because sustained
-  multi-megabit H.264 is a workload upstream does not have — it exists only
-  because of this fork's passthrough patch.
+  It is a departure from the protocol as specified: the Guacamole protocol is
+  defined as text, `.guac` recordings are that same stream on disk, and
+  Guacamole's other transport — the HTTP long-polling tunnel, which rustguac
+  itself does not serve — could not carry interleaved binary at all. It is
+  worth doing here because sustained multi-megabit H.264 is a workload upstream
+  does not have: it exists only because of this fork's passthrough patch.
 
   The conversion is in rustguac rather than a guacd patch, because rustguac
   tees the raw guacd stream to disk as the session recording; converting
@@ -108,13 +169,23 @@ Measured with 1080p video playing, guacd session CPU over 30s:
 - **Per-connection Native Resolution** — requests the framebuffer in the
   browser's physical pixels rather than its CSS pixels, so text stays sharp on
   a high-DPI display. Off by default and set per entry, because it is only safe
-  where the target also scales its own UI.
+  where the target also scales its own UI. The framebuffer factor and the
+  desktop scale are deliberately separate numbers: the framebuffer takes the
+  browser's true `devicePixelRatio` (capped at 3x), because the client fits
+  whatever framebuffer arrives into the CSS area it has, so snapping it to a
+  legal desktop-scale step leaves the client resampling and the whole picture
+  uniformly soft.
 - **RDP DPI scaling** (`patches/011-rdp-dpi-scaling.patch`) — a `desktop-scale`
   parameter asking the server to render its desktop at a matching DPI, which
   guacd otherwise cannot do at all: it pins `DesktopScaleFactor` to zero, and
-  its `dpi` parameter only rescales the requested dimensions. The scale is
-  re-sent on every display update, since a monitor layout carrying zeroes
-  resets the session to 100%.
+  its `dpi` parameter only rescales the requested dimensions. The two channels
+  that carry it are not equally capable: at connection time only 100/140/180
+  survive, since MS-RDPBCGR restricts `deviceScaleFactor` to those three and
+  FreeRDP transposes the pair when it synthesises a single-monitor definition,
+  but the display-control layout is built directly and MS-RDPEDISP allows
+  anything in 100-500 — so that layout carries the **exact** percentage, which
+  is what the session ends up scaled by. The scale is re-sent on every display
+  update, since a monitor layout carrying zeroes resets the session to 100%.
 - **Configurable SSH terminal font size** with a **HiDPI fix** — SSH text no
   longer renders oversized on high-DPI displays (SSH DPI pinned to a 96
   baseline; the client auto-scales).
@@ -146,6 +217,39 @@ Measured with 1080p video playing, guacd session CPU over 30s:
 
 - **Onboarding modal close button** to skip the welcome tour entirely.
 
+### Diagnostics
+
+Under passthrough, guacd's own framebuffer holds no pixels for any region
+delivered as H.264 — the picture exists only in the browser — so anything that
+repaints a layer from that buffer paints black over a working screen, and
+neither end can see it: guacd believes it sent pixels and the browser believes
+it received them. The fault appears about once in days, so all of this is on by
+default and bounded per minute rather than something to enable afterwards.
+
+- **Wire-level overpaint detection** (`src/frame_stats.rs`) — per-session frame
+  lag and H.264 volume, plus a warning when `img`, `copy`, `rect`, `cfill`,
+  `size` or `dispose` lands on a layer that has carried H.264. The colour of a
+  `cfill` is logged, since a black fill and a region never painted are
+  indistinguishable on screen. Costs nothing until an `h264` instruction is
+  seen.
+- **RDPGFX operation trace** (`patches/014-rdpgfx-op-trace.patch`) — logs the
+  surface operations the passthrough patch cannot see (`CacheToSurface`,
+  `SurfaceToCache`, `SurfaceToSurface`, `SolidFill`, `ResetGraphics`,
+  `CreateSurface`, `DeleteSurface`), and warns when a resize flushes a
+  full-layer repaint while passthrough is live.
+- **Browser-side reporting** — `POST /api/sessions/{id}/diagnostic` records what
+  only the browser knows: decoder rebuilds, keyframe starvation, abandoned
+  frames and chroma fallback, and — riding the existing 10s thumbnail capture —
+  a `display_black` report with an 8x4 grid of which cells have gone black.
+  That transition is the timestamp everything else is read against: full screen
+  points at a resize or a graphics reset, scattered blocks at cache or copy
+  operations.
+- **Console helpers** — `rustguacFindBlack()` locates black regions on the
+  display, `rustguacDumpDraws()` reports what painted a given pixel from a ring
+  of recent draws, and `rustguacDumpBlack()` does both in one call;
+  `?debug=nofit` suppresses resize requests so opening DevTools cannot repaint
+  the region being inspected.
+
 ### Docs and tooling
 
 - [`docs/rdp-h264.md`](docs/rdp-h264.md) — H.264 passthrough setup, including
@@ -166,11 +270,14 @@ Measured with 1080p video playing, guacd session CPU over 30s:
   reinstall — the unit files themselves are rewritten every run. The installer
   also warns about existing systemd drop-ins, which silently override the unit
   it just wrote.
-- **Client-side H.264 diagnostics** — `rustguacFindBlack()` locates black
-  regions on the display, `rustguacDumpDraws()` reports what painted a given
-  pixel from a ring of recent draws, and `rustguacDumpBlack()` does both in one
-  call; `?debug=nofit` suppresses resize requests so opening DevTools cannot
-  repaint the region being inspected.
+- **Benchmark and format tests** — `tests/bench/` measures the AVC444 combine
+  with `gl.finish()`, because the client's own `h264CombineLog` timed GPU
+  submission and read four times low, which is what got an earlier version of
+  the combine gate deleted. `tests/h264-instruction-format.mjs`,
+  `tests/h264-vui-range.mjs` and `tests/binary-blob-format.mjs` pin the wire
+  formats across the Rust/JS boundary, where a disagreement fails silently:
+  the client drops what it cannot parse and video simply stops while both ends
+  look healthy.
 - `contrib/measure-guacd-cpu.sh`, `contrib/setup-rdp-performance.ps1`.
 
 ### Merged upstream
@@ -185,8 +292,11 @@ fork-specific:
   full-window drag (upstream as of v1.8.1).
 - **TCP_NODELAY** — Nagle's algorithm disabled on rustguac's TCP sockets.
 - **Local-time timestamps** on the admin page.
-- **Rendering fixes ported from `fixes-1.6.0`** — terminal OSC-consume and RDP
-  mod-16 dirty-region guacd patches.
+- **Rendering fixes ported from `fixes-1.6.0`** — the terminal OSC-consume and
+  RDP mod-16 guacd patches. The mod-16 one still ships upstream as
+  `patches/007-rdp-disp-mod16.patch`; the OSC one went further and is now in
+  guacamole-server itself as GUACAMOLE-2213, so upstream dropped its patch on
+  the next guacd uplift.
 
 ## Architecture
 
