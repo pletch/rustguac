@@ -385,6 +385,28 @@ bounded, rather than being something to switch on afterwards:
   report `display_black` with an 8x4 grid of which cells are black. That
   transition is the timestamp everything else is read against; full screen
   points at a resize or graphics reset, scattered blocks at cache/copy ops.
+- **Paint probes and page state** — every `display_black` report carries the
+  decoder's `describeState()` (decoded vs painted counts, last keyframe and
+  last paint, pending/queue depth), canvas context-loss state, visibility and
+  fullscreen. While black, the decoder's `setProbing()` compares the next few
+  decoded pictures with what reads back from the layer (`paint_probe`): a dark
+  decode is the decoder, a bright decode that reads back dark is the canvas,
+  and a bright one that lands with the screen still black means the rest of
+  the layer lost its pixels. `display_black_persists` repeats the state each
+  minute, `display_black_cleared` says whether a resize ended it, and
+  `page_hidden` / `page_resumed` / `canvas_context_lost` / `_restored` cover
+  the client idling. Two field episodes on 2026-09-10 showed **no overpaint
+  and no `ResetGraphics`** around the black while H.264 kept arriving, which
+  is why the evidence moved to the browser.
+- **Every painted keyframe is probed** (`keyframe_probe`), always, as two 8x4
+  grids -- the decoder's picture and the layer after -- with `#` black and `G`
+  decoder green (zeroed YUV, ~(0,135,0)). A third episode (2026-09-11) found
+  the canvas intact, the page visible and every delta landing, with a keyframe
+  painted 2.5s before the black and the black cleared by ordinary deltas when
+  the host redrew: the frame to suspect was painted before a black-triggered
+  probe could start. Black or green in the *decoded* grid is the decoder,
+  whatever the host sent; the 10s display check reports `display_green` too,
+  since the same session went green minutes later.
 
 Both budgets are per minute and global, so a looping page cannot fill a disk.
 guacd defaults to `-L info` and rustguac to `RUST_LOG=info`, so all of it lands

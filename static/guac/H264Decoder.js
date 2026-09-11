@@ -208,6 +208,305 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var keyframeWaitDropped = 0;
 
     /**
+     * Running counts of what the decoder has done with the stream, and when it
+     * last did each, for getState().
+     *
+     * A display gone black while frames still arrive has three possible
+     * explanations -- nothing is being decoded, the decoder is producing black,
+     * or its pictures are painted and do not stay -- and the page can only
+     * tell them apart by asking the decoder what it has been doing.
+     *
+     * @private
+     */
+    var counts = {
+        submitted: 0,
+        keyframes: 0,
+        decoded: 0,
+        painted: 0,
+        lastPaintAt: 0,
+        lastKeyframeAt: 0,
+        lastKeyframePaintAt: 0
+    };
+
+    /**
+     * How many paint probes remain for the current black-display episode, or 0
+     * if the page is not asking for them. See setProbing().
+     *
+     * @private
+     * @type {!number}
+     */
+    var probesLeft = 0;
+
+    /**
+     * When the last delta-frame probe ran. Keyframes are not counted here:
+     * probeKeyframe() reports every one of them regardless.
+     *
+     * @private
+     * @type {!number}
+     */
+    var lastProbeAt = 0;
+
+    /**
+     * Probes allowed per black-display episode, and the minimum spacing of
+     * probes on delta frames, in milliseconds. Every probe is a diagnostic,
+     * and the page budgets those at ten a minute across all events.
+     *
+     * @private
+     * @constant
+     */
+    var PROBES_PER_EPISODE = 6;
+    var PROBE_DELTA_INTERVAL_MS = 10000;
+
+    /**
+     * Small canvas that probed regions are downscaled into for reading back.
+     *
+     * @private
+     * @type {?HTMLCanvasElement}
+     */
+    var probeCanvas = null;
+
+    /**
+     * Mean Rec. 709 luma of a region of an image, and the fraction of it that
+     * is black, sampled by downscaling it to 32x32.
+     *
+     * @private
+     * @returns {?{mean: number, dark: number}}
+     *     Null if the region is empty or cannot be read.
+     */
+    function sampleLuma(source, x, y, width, height) {
+
+        if (width <= 0 || height <= 0)
+            return null;
+
+        if (!probeCanvas) {
+            probeCanvas = document.createElement('canvas');
+            probeCanvas.width = 32;
+            probeCanvas.height = 32;
+        }
+
+        var ctx = probeCanvas.getContext('2d', { willReadFrequently: true });
+        ctx.clearRect(0, 0, 32, 32);
+        ctx.drawImage(source, x, y, width, height, 0, 0, 32, 32);
+
+        var data = ctx.getImageData(0, 0, 32, 32).data;
+        var sum = 0, dark = 0, n = data.length / 4;
+        for (var i = 0; i < data.length; i += 4) {
+            var luma = 0.2126 * data[i] + 0.7152 * data[i + 1]
+                    + 0.0722 * data[i + 2];
+            sum += luma;
+            if (luma < 8)
+                dark++;
+        }
+
+        return { mean: sum / n, dark: dark / n };
+
+    }
+
+    /**
+     * Whether an RGB sample is the green a decoder paints from zeroed YUV
+     * planes: Y=U=V=0 converts to roughly (0, 135, 0). A hardware decoder shows
+     * it for macroblocks it concealed or decoded from a missing reference.
+     *
+     * @private
+     */
+    function isDecoderGreen(r, g, b) {
+        return g >= 48 && r * 3 < g && b * 3 < g;
+    }
+
+    /**
+     * Summarises a region of an image as an 8x4 grid: '#' for a cell over 90%
+     * black, 'G' for one over 50% decoder green, '.' otherwise; plus the
+     * region's mean luma and its black and green fractions. Sampled by
+     * downscaling to 64x32, so each cell is 8x8 samples.
+     *
+     * @private
+     * @returns {?{grid: string, mean: number, black: number, green: number}}
+     *     Null if the region is empty.
+     */
+    function sampleGrid(source, x, y, width, height) {
+
+        if (width <= 0 || height <= 0)
+            return null;
+
+        if (!gridCanvas) {
+            gridCanvas = document.createElement('canvas');
+            gridCanvas.width = 64;
+            gridCanvas.height = 32;
+        }
+
+        var ctx = gridCanvas.getContext('2d', { willReadFrequently: true });
+        ctx.clearRect(0, 0, 64, 32);
+        ctx.drawImage(source, x, y, width, height, 0, 0, 64, 32);
+        var data = ctx.getImageData(0, 0, 64, 32).data;
+
+        var rows = [], sum = 0, black = 0, green = 0;
+        for (var cy = 0; cy < 4; cy++) {
+            var row = '';
+            for (var cx = 0; cx < 8; cx++) {
+                var cellBlack = 0, cellGreen = 0;
+                for (var py = cy * 8; py < cy * 8 + 8; py++) {
+                    for (var px = cx * 8; px < cx * 8 + 8; px++) {
+                        var i = (py * 64 + px) * 4;
+                        var r = data[i], g = data[i + 1], b = data[i + 2];
+                        var luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                        sum += luma;
+                        if (luma < 8) cellBlack++;
+                        else if (isDecoderGreen(r, g, b)) cellGreen++;
+                    }
+                }
+                black += cellBlack;
+                green += cellGreen;
+                row += cellBlack > 57 ? '#' : cellGreen > 32 ? 'G' : '.';
+            }
+            rows.push(row);
+        }
+
+        return {
+            grid: rows.join('/'),
+            mean: sum / 2048,
+            black: black / 2048,
+            green: green / 2048
+        };
+
+    }
+
+    /**
+     * Canvas that sampleGrid() downscales into.
+     *
+     * @private
+     * @type {?HTMLCanvasElement}
+     */
+    var gridCanvas = null;
+
+    /**
+     * Reports every painted keyframe as two grids: the picture the decoder
+     * produced, and the layer after it was drawn.
+     *
+     * Always on, unlike the paint probes, because the keyframe is the suspect:
+     * in the field a keyframe was painted 2.5s before the display was found
+     * black, so a probe that starts only once black is seen always misses the
+     * frame that caused it. Keyframes are rare (about a dozen a session), and
+     * each probe is two small read-backs.
+     *
+     * Black or green cells in the decoded grid mean the decoder produced them,
+     * whatever the host sent. A clean decoded grid over a black layer grid
+     * means only the rects were drawn and the rest was already black.
+     *
+     * @private
+     */
+    function probeKeyframe(frameState, snapshot, layerCanvas) {
+
+        var fbWidth = display ? display.getWidth() : layerCanvas.width;
+        var fbHeight = display ? display.getHeight() : layerCanvas.height;
+
+        var w = Math.min(snapshot.width, fbWidth - frameState.x);
+        var h = Math.min(snapshot.height, fbHeight - frameState.y);
+
+        var decoded, landed;
+        try {
+            decoded = sampleGrid(snapshot, 0, 0, w, h);
+            landed = sampleGrid(layerCanvas, 0, 0, fbWidth, fbHeight);
+        }
+        catch (e) {
+            diagnostic('keyframe_probe', 'probe failed: ' + e.message, true);
+            return;
+        }
+
+        if (!decoded || !landed)
+            return;
+
+        var rectArea = 0;
+        if (frameState.rects)
+            for (var r = 0; r < frameState.rects.length; r++)
+                rectArea += frameState.rects[r].width
+                        * frameState.rects[r].height;
+
+        function fmt(sample) {
+            return 'grid ' + sample.grid + ' luma ' + sample.mean.toFixed(0)
+                    + ' black ' + (sample.black * 100).toFixed(0)
+                    + '% green ' + (sample.green * 100).toFixed(0) + '%';
+        }
+
+        diagnostic('keyframe_probe', 'view=' + frameState.view + ' ' + w
+                + 'x' + h + '@' + frameState.x + ',' + frameState.y + ' '
+                + (frameState.rects ? 'rects=' + frameState.rects.length
+                    + ' covering ' + (100 * rectArea / (w * h)).toFixed(0)
+                    + '%' : 'whole')
+                + '; decoded ' + fmt(decoded)
+                + '; layer after ' + fmt(landed), true);
+
+    }
+
+    /**
+     * Compares a decoded picture with what the layer holds after it was drawn
+     * there, over the region painted, and reports both.
+     *
+     * This is what separates the explanations for a black display: a dark
+     * picture means the decoder is producing black; a bright picture that
+     * reads back dark from the layer means drawing onto the layer is not
+     * taking; a bright picture that lands and a display that stays black means
+     * the rest of the layer lost its pixels and only damage is being repaired.
+     *
+     * @private
+     */
+    function probePaint(frameState, snapshot, layerCanvas) {
+
+        var sw = snapshot.width, sh = snapshot.height;
+        var sx, sy, lx, ly, w, h;
+
+        // With rects, snapshot and layer share coordinates; without, the whole
+        // snapshot lands at the frame's offset.
+        if (frameState.rects) {
+            var x0 = Infinity, y0 = Infinity, x1 = 0, y1 = 0;
+            for (var r = 0; r < frameState.rects.length; r++) {
+                var rect = frameState.rects[r];
+                x0 = Math.min(x0, rect.x);
+                y0 = Math.min(y0, rect.y);
+                x1 = Math.max(x1, rect.x + rect.width);
+                y1 = Math.max(y1, rect.y + rect.height);
+            }
+            sx = lx = Math.max(0, x0);
+            sy = ly = Math.max(0, y0);
+            w = Math.min(x1, sw) - sx;
+            h = Math.min(y1, sh) - sy;
+        }
+        else {
+            sx = sy = 0;
+            lx = frameState.x;
+            ly = frameState.y;
+            w = sw;
+            h = sh;
+        }
+
+        var decoded, landed;
+        try {
+            decoded = sampleLuma(snapshot, sx, sy, w, h);
+            landed = sampleLuma(layerCanvas, lx, ly, w, h);
+        }
+        catch (e) {
+            diagnostic('paint_probe', 'probe failed: ' + e.message, true);
+            return;
+        }
+
+        if (!decoded || !landed)
+            return;
+
+        function fmt(sample) {
+            return 'luma ' + sample.mean.toFixed(0) + ' ('
+                    + (sample.dark * 100).toFixed(0) + '% black)';
+        }
+
+        diagnostic('paint_probe', (frameState.keyFrame ? 'keyframe' : 'delta')
+                + ' view=' + frameState.view + ' ' + w + 'x' + h + '@' + lx
+                + ',' + ly + (frameState.rects
+                    ? ' rects=' + frameState.rects.length : ' whole')
+                + ': decoded ' + fmt(decoded) + ', layer after paint '
+                + fmt(landed) + '; layer ' + layerCanvas.width + 'x'
+                + layerCanvas.height, true);
+
+    }
+
+    /**
      * Reports frames given up on, if any have been since the last report. Both
      * counters are also consumed by the console stats block, which may be off,
      * so this tracks what it has reported rather than resetting them.
@@ -1367,6 +1666,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     /* Submitted to arrived. Stamped before anything else here
                      * so no work of ours is counted as the decoder's. */
                     frameState.decodedAt = nowMs();
+                    counts.decoded++;
                     if (frameState.submittedAt)
                         recordStat('decode', frameState.view !== 0,
                                 frameState.decodedAt - frameState.submittedAt);
@@ -1638,7 +1938,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             };
 
             frameState.submittedAt = nowMs();
+            frameState.keyFrame = !!isKeyFrame;
             pendingDecodes++;
+
+            counts.submitted++;
+            if (isKeyFrame) {
+                counts.keyframes++;
+                counts.lastKeyframeAt = frameState.submittedAt;
+            }
 
             frameState.watchdog = setTimeout(function() {
                 frameState.watchdog = null;
@@ -1745,6 +2052,23 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 else
                     ctx.drawImage(snapshot, frameState.x, frameState.y);
 
+                counts.painted++;
+                counts.lastPaintAt = nowMs();
+                if (frameState.keyFrame)
+                    counts.lastKeyframePaintAt = counts.lastPaintAt;
+
+                if (frameState.keyFrame)
+                    probeKeyframe(frameState, snapshot,
+                            frameState.layer.getCanvas());
+
+                else if (probesLeft > 0 && counts.lastPaintAt - lastProbeAt
+                        >= PROBE_DELTA_INTERVAL_MS) {
+                    probesLeft--;
+                    lastProbeAt = counts.lastPaintAt;
+                    probePaint(frameState, snapshot,
+                            frameState.layer.getCanvas());
+                }
+
             }
 
         } finally {
@@ -1797,6 +2121,53 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             }
         });
 
+    };
+
+    /**
+     * Describes the decoder's state in one line of key=value pairs, for the
+     * page to attach to a report of the display going black.
+     *
+     * @returns {!string}
+     */
+    this.describeState = function() {
+
+        var now = nowMs();
+        function ago(at) {
+            return at ? Math.round(now - at) + 'ms' : 'never';
+        }
+
+        return 'decoder=' + (decoder ? decoder.state : 'none')
+                + ' configured=' + configured
+                + ' needsKeyFrame=' + needsKeyFrame
+                + (keyframeWaitSince
+                    ? ' keyframeWait=' + ago(keyframeWaitSince) : '')
+                + ' pending=' + pendingDecodes
+                + ' queue=' + (decoder && decoder.decodeQueueSize !== undefined
+                    ? decoder.decodeQueueSize : '?')
+                + ' combining=' + combining
+                + ' submitted=' + counts.submitted
+                + ' decoded=' + counts.decoded
+                + ' painted=' + counts.painted
+                + ' keyframes=' + counts.keyframes
+                + ' lastPaint=' + ago(counts.lastPaintAt)
+                + ' lastKeyframe=' + ago(counts.lastKeyframeAt)
+                + ' lastKeyframePaint=' + ago(counts.lastKeyframePaintAt)
+                + ' watchdog=' + watchdogFires
+                + ' syncTimeouts=' + syncTimeouts;
+
+    };
+
+    /**
+     * Starts or stops probing painted delta frames. While on, a delta at most
+     * every PROBE_DELTA_INTERVAL_MS is compared with what reached the layer and
+     * reported as `paint_probe` diagnostics, up to PROBES_PER_EPISODE. The page
+     * turns it on when it sees the display go black, and off when it recovers.
+     *
+     * @param {!boolean} on
+     */
+    this.setProbing = function(on) {
+        probesLeft = on ? PROBES_PER_EPISODE : 0;
+        lastProbeAt = 0;
     };
 
     /**

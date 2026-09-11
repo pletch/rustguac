@@ -1667,6 +1667,157 @@
             // own.
             var _blackReported = false;
 
+            // The black episode in progress: when it was first seen, the
+            // framebuffer size at the time (so recovery can say whether a
+            // resize is what ended it), and how many checks it has lasted.
+            var _blackSince = 0;
+            var _blackSize = '';
+            var _blackChecks = 0;
+
+            // Page visibility history. A display that goes black after
+            // "minutes idle" may be the client idling rather than the remote:
+            // Chrome marks a page hidden when its window is occluded or the
+            // screen locks, and may evict GPU resources while it is.
+            var _hiddenSince = 0;
+            var _lastVisibilityChange = 0;
+            var _frozenSince = 0;
+
+            function msAgo(at) {
+                return at ? Math.round((Date.now() - at) / 1000) + 's ago' : 'never';
+            }
+
+            function framebufferSize() {
+                var display = client.getDisplay();
+                return display.getWidth() + 'x' + display.getHeight();
+            }
+
+            /**
+             * Reports a display canvas losing its 2D context, and getting it
+             * back. A restored context is blank, and under H.264 passthrough
+             * nothing repaints it: the server sends damage only, and keyframes
+             * are rare. Nothing else reports this.
+             */
+            function watchDisplayCanvases() {
+                var canvases = client.getDisplay().getElement()
+                        .querySelectorAll('canvas');
+                for (var i = 0; i < canvases.length; i++) {
+                    var canvas = canvases[i];
+                    if (canvas._rgWatched) continue;
+                    canvas._rgWatched = true;
+                    canvas.addEventListener('contextlost', function(e) {
+                        var c = e.target;
+                        reportDiagnostic('canvas_context_lost', c.width + 'x'
+                                + c.height + ' display canvas lost its 2D '
+                                + 'context; ' + describeDisplayState());
+                    });
+                    canvas.addEventListener('contextrestored', function(e) {
+                        var c = e.target;
+                        reportDiagnostic('canvas_context_restored', c.width
+                                + 'x' + c.height + ' display canvas restored '
+                                + 'blank; ' + describeDisplayState());
+                    });
+                }
+                return canvases;
+            }
+
+            /**
+             * One line of key=value pairs describing the page, its canvases
+             * and the H.264 decoder, attached to black-display reports. Enough
+             * to say which of three things happened: nothing decoded, black
+             * decoded, or decoded pictures that did not stay on the canvas.
+             */
+            function describeDisplayState() {
+                var parts = [];
+                try {
+                    var canvases = watchDisplayCanvases();
+                    var lost = 0;
+                    for (var i = 0; i < canvases.length; i++) {
+                        var ctx = canvases[i].getContext('2d');
+                        if (ctx && ctx.isContextLost && ctx.isContextLost())
+                            lost++;
+                    }
+                    parts.push('fb=' + framebufferSize()
+                            + ' canvases=' + canvases.length + ' lost=' + lost);
+                } catch (e) { parts.push('canvases=?'); }
+
+                parts.push('visibility=' + document.visibilityState
+                        + ' visibilityChanged=' + msAgo(_lastVisibilityChange)
+                        + ' fullscreen=' + !!rgFullscreenEl());
+
+                var decoder = client._h264Decoder;
+                parts.push(decoder && decoder.describeState
+                        ? decoder.describeState() : 'h264=none');
+
+                return parts.join(' ');
+            }
+
+            /**
+             * Makes Chrome present the whole display again after the window
+             * has been covered. Chrome only presents a new frame when page
+             * content changes, and an idle remote desktop changes nothing: on
+             * returning to a fullscreen session with Alt-Tab, the area the
+             * other window had covered kept its pixels until a click, though
+             * every frame had been decoded and painted to the canvas
+             * (watchdog=0, pending=0). A fully transparent fill over each
+             * display canvas changes no pixel but damages the whole of it, so
+             * the next frame presents everything -- the whole canvas, because
+             * Chrome presents only damaged regions. Repeated a little later
+             * in case the first lands before the window is restored.
+             */
+            function repaintDisplay() {
+                var paint = function() {
+                    try {
+                        var canvases = client.getDisplay().getElement()
+                                .querySelectorAll('canvas');
+                        for (var i = 0; i < canvases.length; i++) {
+                            var ctx = canvases[i].getContext('2d');
+                            if (!ctx) continue;
+                            ctx.save();
+                            ctx.globalCompositeOperation = 'source-over';
+                            ctx.fillStyle = 'rgba(0,0,0,0)';
+                            ctx.fillRect(0, 0, canvases[i].width,
+                                    canvases[i].height);
+                            ctx.restore();
+                        }
+                    } catch (e) { /* nothing to repaint yet */ }
+                };
+                requestAnimationFrame(paint);
+                setTimeout(function() { requestAnimationFrame(paint); }, 250);
+            }
+
+            // Alt-Tab back to a window that was never hidden, only covered,
+            // may not change visibility at all; focus covers that case.
+            window.addEventListener('focus', repaintDisplay);
+
+            document.addEventListener('visibilitychange', function() {
+                _lastVisibilityChange = Date.now();
+                if (document.visibilityState === 'hidden') {
+                    _hiddenSince = Date.now();
+                    return;
+                }
+                repaintDisplay();
+                // Reported on the way back, since a hidden page may not get
+                // its request out. Short absences are tab switches, not idle.
+                if (_hiddenSince && Date.now() - _hiddenSince >= 30000)
+                    reportDiagnostic('page_hidden', 'page was hidden for '
+                            + Math.round((Date.now() - _hiddenSince) / 1000)
+                            + 's; ' + describeDisplayState());
+                _hiddenSince = 0;
+            });
+
+            // Page lifecycle: Chrome may freeze a page it considers idle, and
+            // a frozen page runs no timers and paints nothing.
+            document.addEventListener('freeze', function() {
+                _frozenSince = Date.now();
+            });
+            document.addEventListener('resume', function() {
+                reportDiagnostic('page_resumed', 'page was frozen for '
+                        + (_frozenSince ? Math.round((Date.now() - _frozenSince)
+                            / 1000) + 's' : 'an unknown time')
+                        + '; ' + describeDisplayState());
+                _frozenSince = 0;
+            });
+
             /**
              * Reports the display going substantially black, and its
              * recovering afterwards.
@@ -1682,6 +1833,43 @@
              * question: a full screen points at a resize or a graphics reset,
              * scattered blocks at cached or copied regions.
              */
+            var _greenReported = false;
+            var _greenSince = 0;
+
+            /**
+             * Reports the display going substantially green, and recovering.
+             * Green is the other face of the black-display fault: a hardware
+             * decoder fills macroblocks it concealed, or decoded against a
+             * reference it never had, with black or green depending on how its
+             * surfaces were initialised. Both were seen in one session.
+             *
+             * The threshold is lower than for black because green of this
+             * shade is not something a desktop shows in bulk.
+             */
+            function checkForGreenDisplay(fraction, cells) {
+                var decoder = client._h264Decoder;
+                if (!_greenReported && fraction > 0.25) {
+                    _greenReported = true;
+                    _greenSince = Date.now();
+                    if (decoder && decoder.setProbing)
+                        decoder.setProbing(true);
+                    reportDiagnostic('display_green',
+                            (fraction * 100).toFixed(0) + '% of the display is '
+                            + 'decoder green; grid ' + cells.join('/') + '; '
+                            + describeDisplayState());
+                }
+                else if (_greenReported && fraction < 0.05) {
+                    _greenReported = false;
+                    if (decoder && decoder.setProbing && !_blackReported)
+                        decoder.setProbing(false);
+                    reportDiagnostic('display_green_cleared',
+                            'green cleared after '
+                            + Math.round((Date.now() - _greenSince) / 1000)
+                            + 's, now ' + (fraction * 100).toFixed(0)
+                            + '% green; ' + describeDisplayState());
+                }
+            }
+
             function checkForBlackDisplay(thumb) {
 
                 var data;
@@ -1693,7 +1881,7 @@
 
                 var cols = 8, rows = 4;
                 var cells = [];
-                var black = 0, total = 0;
+                var black = 0, green = 0, total = 0;
 
                 for (var ry = 0; ry < rows; ry++) {
                     var row = '';
@@ -1704,19 +1892,28 @@
                         var y0 = Math.floor(ry * thumb.height / rows);
                         var y1 = Math.floor((ry + 1) * thumb.height / rows);
 
-                        var cellBlack = 0, cellTotal = 0;
+                        var cellBlack = 0, cellGreen = 0, cellTotal = 0;
                         for (var y = y0; y < y1; y += 2) {
                             for (var x = x0; x < x1; x += 2) {
                                 var i = (y * thumb.width + x) * 4;
+                                var r = data[i], g = data[i+1], b = data[i+2];
                                 cellTotal++;
-                                if (data[i] < 8 && data[i+1] < 8 && data[i+2] < 8)
+                                if (r < 8 && g < 8 && b < 8)
                                     cellBlack++;
+                                // The green a decoder paints from zeroed YUV
+                                // planes, roughly (0, 135, 0): concealed
+                                // macroblocks or a missing reference.
+                                else if (g >= 48 && r * 3 < g && b * 3 < g)
+                                    cellGreen++;
                             }
                         }
 
                         black += cellBlack;
+                        green += cellGreen;
                         total += cellTotal;
-                        row += (cellTotal && cellBlack / cellTotal > 0.9) ? '#' : '.';
+                        row += (cellTotal && cellBlack / cellTotal > 0.9) ? '#'
+                                : (cellTotal && cellGreen / cellTotal > 0.5) ? 'G'
+                                : '.';
 
                     }
                     cells.push(row);
@@ -1724,21 +1921,56 @@
 
                 if (!total) return;
                 var fraction = black / total;
+                checkForGreenDisplay(green / total, cells);
 
                 // Hysteresis, and a deliberately high bar: a dark wallpaper or
                 // a lock screen is legitimately black, so only a large area
                 // reports, and only on the way in and the way out.
+                var decoder = client._h264Decoder;
+
                 if (!_blackReported && fraction > 0.4) {
                     _blackReported = true;
+                    _blackSince = Date.now();
+                    _blackSize = framebufferSize();
+                    _blackChecks = 0;
+
+                    // Compare what the decoder produces with what lands on
+                    // the canvas, for the next few frames painted.
+                    if (decoder && decoder.setProbing)
+                        decoder.setProbing(true);
+
                     reportDiagnostic('display_black',
                             (fraction * 100).toFixed(0) + '% of the display is '
-                            + 'black; grid ' + cells.join('/'));
+                            + 'black; grid ' + cells.join('/') + '; '
+                            + describeDisplayState());
                 }
                 else if (_blackReported && fraction < 0.15) {
                     _blackReported = false;
+                    if (decoder && decoder.setProbing && !_greenReported)
+                        decoder.setProbing(false);
+
+                    var size = framebufferSize();
                     reportDiagnostic('display_black_cleared',
-                            'display recovered, now '
-                            + (fraction * 100).toFixed(0) + '% black');
+                            'display recovered after '
+                            + Math.round((Date.now() - _blackSince) / 1000)
+                            + 's, now ' + (fraction * 100).toFixed(0)
+                            + '% black, ' + (size !== _blackSize
+                                ? 'after a resize ' + _blackSize + '->' + size
+                                : 'with no resize') + '; '
+                            + describeDisplayState());
+                }
+
+                // Still black: whether frames were decoded and painted in the
+                // meantime is the question, so report again every minute for
+                // the first three.
+                else if (_blackReported) {
+                    _blackChecks++;
+                    if (_blackChecks % 6 === 0 && _blackChecks <= 18)
+                        reportDiagnostic('display_black_persists',
+                                (fraction * 100).toFixed(0) + '% black for '
+                                + Math.round((Date.now() - _blackSince) / 1000)
+                                + 's; grid ' + cells.join('/') + '; '
+                                + describeDisplayState());
                 }
 
             }

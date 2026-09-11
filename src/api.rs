@@ -400,7 +400,7 @@ pub async fn post_session_diagnostic(
         .detail
         .chars()
         .filter(|c| !c.is_control())
-        .take(512)
+        .take(1024)
         .collect();
 
     let now_min = std::time::SystemTime::now()
