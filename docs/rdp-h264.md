@@ -240,6 +240,73 @@ execution — there is no `gl.finish()` in the render path — and reports the s
 work at under a millisecond. Use `tests/bench`, which forces completion, before
 concluding the combine is cheap.
 
+### Is it the combine, or the handoff? (investigation)
+
+The field numbers do not add up to what `tests/bench` measures. At 1920x1072
+against the xrdp fork, 4:2:0 ran at 54.7 syncs/s with a 0.6ms mean flush and
+4:4:4 at 33-41/s with 16-22ms. Part of that ratio is an accounting artifact --
+the 4:2:0 path snapshots the `VideoFrame` into a 2D canvas inside the decoder's
+output callback, so its pixel copy is already paid before flush begins, while
+the combine path only *submits* GPU work there and the result is first needed
+inside flush. But the sync rate cannot be an artifact: 54.7/s to 33-41/s is
+6-12ms per frame, against a benched combine of ~2.8ms at 2.06MP.
+
+The same slowdown appears on an RTX 3070 and an Intel 770. Those differ by
+roughly 8x in memory bandwidth and the NVIDIA part decodes on a separate
+engine, so agreement between them rules out shader cost, GPU bandwidth, and
+contention between the two hardware decodes and the combine. What survives is
+what is *not* GPU throughput: CPU-side driver staging (which is what
+`texSubImage2D` already is), and synchronous GPU-to-CPU transfers.
+
+That points at a boundary the 4:2:0 path never crosses. The combine's output is
+a GPU-resident `ImageBitmap` produced by the renderer's own WebGL2 context, and
+it is consumed by `drawImage()` into the display layer's 2D context. If the
+driver cannot share that surface, the blit is a readback -- area-proportional,
+vendor-independent, and invisible to every existing instrument. And it would
+not shrink with damage: `render()` scissors the conversion to the damage rects,
+but `transferToImageBitmap()` hands over the **whole drawing buffer** every
+frame. At 1920x1072 that is 8.2MB crossing the boundary to repaint a caret,
+which is also why banding the plane uploads measured 2.0x in the bench and much
+less in the field.
+
+**What is instrumented.** Under `h264CombineLog`, a fourth stage `paint` times
+the `drawImage()` calls in `drawDecoded()` -- the boundary crossing itself --
+split by which kind of surface crossed it (`bitmap` from the renderer, `canvas`
+from the 4:2:0 snapshot) rather than by chroma. It is reported against two
+denominators, because which one the cost tracks says what it is: steady per
+damaged megapixel means the blit, steady per buffer megapixel means the
+handoff. `sync_hold` additionally splits its flush figure by what actually
+painted during each sync (`| by paint: bitmap ..., canvas ..., idle ...`),
+since the mode a sync is charged to says only whether combining was on. `idle`
+is the floor -- a sync that painted nothing -- and whatever it costs is the
+display's own work.
+
+**The control is `h264PaintViaSnapshot`.** An unpaired main view is an ordinary
+4:2:0 picture that happens to be travelling the combine path, so with this set
+it is snapshotted exactly as the 4:2:0 path snapshots it, skipping
+`render()` for that picture only. Its planes are already uploaded, so an
+auxiliary view behind it still combines correctly. That gives both handoffs on
+one stream, one host, one session, differing in nothing else. Against the xrdp
+fork's `CHROMA_INTERVAL=N`, N-1 pictures in N are unpaired, so the sample is
+large.
+
+Read it as:
+
+* `paint` slow for `bitmap`, fast for `canvas`, on the same stream -- the cost
+  is the context boundary, and no amount of shader or upload work will touch
+  it. The fix is to size the drawing buffer to the union of the damage rects
+  and blit at that offset, so the handoff scales with damage like everything
+  else already does.
+* `paint` similar for both, with flush still slow -- the cost is downstream of
+  the blit, in the display's own queue.
+* `paint` fast for both -- the cost is upstream, in `copyTo()` and the plane
+  uploads, and the bench is simply understating them on this hardware.
+
+Set the overrides as a window global (`window.__h264PaintViaSnapshot = true`)
+to flip them mid-session without a reload, or in `localStorage` to have them
+survive one. Not as a query parameter: the client relaunches its own URL, so a
+hand-added parameter is gone at the next reconnect.
+
 ## Colour range
 
 The samples an RDP host sends are **full range**. [MS-RDPEGFX Color

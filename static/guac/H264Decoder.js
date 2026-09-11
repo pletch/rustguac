@@ -1287,12 +1287,28 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *            time spent in the display's ordered task queue rather than
      *            doing work.
      *
+     *   paint    the blit from the snapshot into the display's layer. Split
+     *            by which kind of surface crossed that boundary rather than
+     *            by chroma: the 4:2:0 path hands over a 2D canvas, the
+     *            combine path a GPU-resident ImageBitmap produced by a
+     *            different (WebGL2) context. If that second handoff is a
+     *            readback rather than a texture share it is area-proportional
+     *            and vendor-independent, which is the shape the field numbers
+     *            have -- so this is reported per megapixel as well as per
+     *            picture, since a readback's cost tracks pixels and a texture
+     *            share's does not.
+     *
      * @private
-     * @param {!string} stage - 'decode', 'combine' or 'draw'.
-     * @param {!boolean} hadAux - Whether the picture carried an auxiliary view.
+     * @param {!string} stage - 'decode', 'combine', 'draw' or 'paint'.
+     * @param {!(boolean|string)} variant - Whether the picture carried an
+     *                                      auxiliary view, or an explicit
+     *                                      bucket name for stages not split
+     *                                      that way.
      * @param {!number} ms - The sample.
+     * @param {number} [pixels] - Pixels this sample covered, where the stage
+     *                            has a meaningful area. Reported as ms/MP.
      */
-    function recordStat(stage, hadAux, ms) {
+    function recordStat(stage, variant, ms, pixels) {
 
         if (!override('h264CombineLog'))
             return;
@@ -1302,11 +1318,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (!stats)
             stats = { since: now };
 
-        var key = stage + (hadAux ? ':chroma' : ':luma');
-        var bucket = stats[key] || (stats[key] = { n: 0, sum: 0, max: 0 });
+        var key = stage + ':' + (typeof variant === 'string' ? variant
+                : (variant ? 'chroma' : 'luma'));
+        var bucket = stats[key]
+                || (stats[key] = { n: 0, sum: 0, max: 0, px: 0 });
 
         bucket.n++;
         bucket.sum += ms;
+        bucket.px += pixels || 0;
         if (ms > bucket.max)
             bucket.max = ms;
 
@@ -1317,7 +1336,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             if (!b || !b.n)
                 return 'none';
             return b.n + ' mean ' + (b.sum / b.n).toFixed(1)
-                    + ' max ' + b.max.toFixed(1);
+                    + ' max ' + b.max.toFixed(1)
+                    + (b.px ? ' ' + (b.sum / (b.px / 1e6)).toFixed(2)
+                        + 'ms/MP' : '');
         }
 
         var lines = ['[rustguac] H.264 over '
@@ -1328,6 +1349,18 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     + 'chroma ' + one(stats[name + ':chroma'])
                     + '  |  luma ' + one(stats[name + ':luma']));
         });
+
+        /* Split by handoff rather than by chroma -- see recordStat(). */
+        function perMP(b) {
+            return (b && b.px)
+                ? (b.sum / (b.px / 1e6)).toFixed(2) + 'ms/MP' : 'none';
+        }
+
+        lines.push('  paint   bitmap ' + one(stats['paint:bitmap'])
+                + '  |  canvas ' + one(stats['paint:canvas']));
+        lines.push('          per buffer MP: bitmap '
+                + perMP(stats['paintbuf:bitmap'])
+                + '  |  canvas ' + perMP(stats['paintbuf:canvas']));
 
         var tail = [];
         if (copyWait && copyWait.n)
@@ -1983,6 +2016,38 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 deferredMainRects = null;
             }
 
+            /* The control for the handoff measurement. An unpaired main view
+             * is an ordinary 4:2:0 picture that happens to be travelling the
+             * combine path, so it can be snapshotted exactly as the 4:2:0
+             * path snapshots it -- same decode, same content, same session,
+             * same host, differing only in which kind of surface reaches the
+             * display. If `paint` is slow for a bitmap and fast for a canvas
+             * on the very same stream, the cost is the context boundary and
+             * not the combine.
+             *
+             * The planes have already been uploaded, so an auxiliary view
+             * behind this one still combines against them correctly; only
+             * this picture's own paint changes. Main views only: an auxiliary
+             * view carries packed chroma, which is not a picture and cannot
+             * be blitted.
+             *
+             * Off by default. Settable as ?h264PaintViaSnapshot= on the URL
+             * or from localStorage -- see override(). */
+            if (view === 0 && override('h264PaintViaSnapshot')) {
+
+                if (frameState.paint && !frameState.settled) {
+                    var plain = acquireCanvas(pictureW, pictureH);
+                    plain.getContext('2d').drawImage(frame, 0, 0);
+                    frameState.canvas = plain;
+                    frameState.viaRenderer = false;
+                }
+
+                finishForTiming();
+                combineWorkMs += nowMs() - startedAt;
+                return;
+
+            }
+
             /* A main view with no auxiliary view behind it renders on its own
              * as an ordinary 4:2:0 picture, exactly as a luma-only (LC=1)
              * update does for FreeRDP. */
@@ -2015,6 +2080,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * size instead left a blank strip below the picture, blitted over
              * the bottom of the display whenever the server sent no rects. */
             frameState.canvas = rendered;
+            frameState.viaRenderer = true;
 
             finishForTiming();
             combineWorkMs += nowMs() - startedAt;
@@ -2338,6 +2404,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
                     canvas.getContext('2d').drawImage(frame, 0, 0);
                     frameState.canvas = canvas;
+                    frameState.viaRenderer = false;
 
                 } catch (e) {
 
@@ -2681,6 +2748,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
                 var ctx = frameState.layer.getCanvas().getContext('2d');
 
+                /* Timed, because this is where a GPU-resident ImageBitmap
+                 * from the renderer's own WebGL2 context crosses into the
+                 * display's 2D one. The combine's own work is submitted, not
+                 * executed, by the time it gets here, so a driver that cannot
+                 * share the surface pays for both the execution and a
+                 * readback right on this line -- inside the display's flush,
+                 * where `sync_hold` sees it as a slow flush and
+                 * `h264CombineLog` sees it not at all. */
+                var paintedAt = nowMs();
+                var paintedPx = 0;
+
                 /* Draw only the regions the server marked valid. The decoded
                  * picture spans the whole surface, so blitting all of it would
                  * overwrite areas delivered via other codecs on a server that
@@ -2691,12 +2769,32 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                         ctx.drawImage(snapshot,
                                 rect.x, rect.y, rect.width, rect.height,
                                 rect.x, rect.y, rect.width, rect.height);
+                        paintedPx += rect.width * rect.height;
                     }
                 }
 
                 /* No regions given: the entire picture is valid */
-                else
+                else {
                     ctx.drawImage(snapshot, frameState.x, frameState.y);
+                    paintedPx += (snapshot.width || 0)
+                            * (snapshot.height || 0);
+                }
+
+                /* The same time against two denominators, because which one
+                 * it is proportional to says what it is. render() scissors
+                 * the conversion to the damage, but transferToImageBitmap()
+                 * hands over the entire drawing buffer whatever the damage
+                 * was -- so a cost that holds steady per damaged megapixel is
+                 * the blit, and one that holds steady per buffer megapixel is
+                 * the handoff, and only the second would explain a session
+                 * that stays slow while typing. */
+                var bufferPx = (snapshot.width || 0) * (snapshot.height || 0);
+                var paintMs = nowMs() - paintedAt;
+
+                var source = frameState.viaRenderer ? 'bitmap' : 'canvas';
+                paintedSinceSync[source]++;
+                recordStat('paint', source, paintMs, paintedPx);
+                recordStat('paintbuf', source, paintMs, bufferPx);
 
                 counts.painted++;
                 counts.lastPaintAt = nowMs();
@@ -2742,12 +2840,58 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @private
      */
     function newHoldStats() {
+        function flushBucket() {
+            return { flushes: 0, flushSumMs: 0, flushMaxMs: 0, flushSlow: 0 };
+        }
         function mode() {
-            return { syncs: 0, held: 0, sumMs: 0, maxMs: 0, timeouts: 0,
-                     flushes: 0, flushSumMs: 0, flushMaxMs: 0, flushSlow: 0 };
+            var m = flushBucket();
+            m.syncs = 0;
+            m.held = 0;
+            m.sumMs = 0;
+            m.maxMs = 0;
+            m.timeouts = 0;
+            /* The same flush, also charged to whichever kind of surface was
+             * blitted into the display during it -- see paintedSinceSync. */
+            m.flushBy = { bitmap: flushBucket(), canvas: flushBucket(),
+                          idle: flushBucket() };
+            return m;
         }
         return { '420': mode(), '444': mode() };
     }
+
+    /**
+     * Adds one flush sample to a bucket.
+     *
+     * @private
+     */
+    function addFlush(bucket, flushMs) {
+        bucket.flushes++;
+        bucket.flushSumMs += flushMs;
+        bucket.flushMaxMs = Math.max(bucket.flushMaxMs, flushMs);
+        if (flushMs >= FLUSH_SLOW_MS)
+            bucket.flushSlow++;
+    }
+
+    /**
+     * How many pictures of each handoff kind were blitted into the display
+     * since the last sync was accounted for.
+     *
+     * The mode a sync is charged to says only whether combining was on, which
+     * conflates two things the field numbers cannot separate: the combine's
+     * cost, and the cost of handing a GPU-resident ImageBitmap to a 2D canvas.
+     * A session can be combining and still paint through the 4:2:0 snapshot
+     * path -- every unpaired main view does so under h264PaintViaSnapshot --
+     * so what actually crossed into the display is recorded here and the
+     * flush charged to it.
+     *
+     * A sync during which both kinds painted is charged to `bitmap`: it is
+     * the suspect, and attributing a mixed flush to the cheap path would hide
+     * exactly the case being looked for.
+     *
+     * @private
+     * @type {!Object.<string, number>}
+     */
+    var paintedSinceSync = { bitmap: 0, canvas: 0 };
 
     /**
      * A display flush at least this long, in milliseconds, is counted as slow.
@@ -2785,13 +2929,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (mode === '444')
             noteCombineFlush(flushMs);
 
+        var src = paintedSinceSync.bitmap ? 'bitmap'
+                : (paintedSinceSync.canvas ? 'canvas' : 'idle');
+        paintedSinceSync.bitmap = 0;
+        paintedSinceSync.canvas = 0;
+
         [holdTotal[mode], holdWindow[mode]].forEach(function(stats) {
             if (typeof flushMs === 'number') {
-                stats.flushes++;
-                stats.flushSumMs += flushMs;
-                stats.flushMaxMs = Math.max(stats.flushMaxMs, flushMs);
-                if (flushMs >= FLUSH_SLOW_MS)
-                    stats.flushSlow++;
+                addFlush(stats, flushMs);
+                addFlush(stats.flushBy[src], flushMs);
             }
             stats.syncs++;
             if (ms > 0) {
@@ -2849,9 +2995,35 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     + (s.flushes ? ' | flush mean '
                         + (s.flushSumMs / s.flushes).toFixed(1) + 'ms max '
                         + s.flushMaxMs.toFixed(0) + 'ms slow '
-                        + s.flushSlow : ''));
+                        + s.flushSlow : '')
+                    + describeFlushSplit(s));
         });
         return parts.length ? parts.join('; ') : 'no syncs';
+    }
+
+    /**
+     * The same flushes again, split by what was blitted into the display
+     * during them. `idle` is a sync that painted nothing, and is the floor
+     * the other two are read against: whatever it costs is the display's own
+     * work rather than the handoff's.
+     *
+     * @private
+     */
+    function describeFlushSplit(s) {
+
+        var parts = [];
+
+        ['bitmap', 'canvas', 'idle'].forEach(function(src) {
+            var b = s.flushBy[src];
+            if (!b.flushes)
+                return;
+            parts.push(src + ' ' + b.flushes + ' mean '
+                    + (b.flushSumMs / b.flushes).toFixed(1) + 'ms max '
+                    + b.flushMaxMs.toFixed(0) + 'ms slow ' + b.flushSlow);
+        });
+
+        return parts.length ? ' | by paint: ' + parts.join(', ') : '';
+
     }
 
     /**
