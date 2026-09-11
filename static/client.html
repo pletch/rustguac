@@ -407,6 +407,11 @@
                 if (session && session.entry_display_name) entryDisplayName = session.entry_display_name;
                 if (session && session.display_scale > 1) displayScale = session.display_scale;
                 if (session && session.fullscreen_on_connect) wantFullscreen = true;
+                // Set before startGuacamole(), so the decoder sees it as the
+                // window override on its first auxiliary view. The entry asked
+                // for the server's full-colour stream without the browser's
+                // combine, which costs latency on every update.
+                if (session && session.h264_no_combine) window.__h264Chroma444 = false;
                 if (session && session.autohide_side_tabs) wantAutohideTabs = true;
                 return showBanner(session.banner);
             })

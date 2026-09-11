@@ -816,13 +816,13 @@
                         <div style="color:#888;font-size:0.75em;margin-top:0.2em;">Sends the display at the screen's physical pixels instead of its logical ones, so text stays sharp on a HiDPI display. Windows is asked to scale its desktop to match. Nothing does that automatically on Linux/xrdp targets, so enable it there only if the session sets its own DPI &mdash; otherwise icons and text simply come out smaller. Roughly 3&times; the pixels to encode.</div>
                     </label>
                     <label style="margin-top:0.3em">
-                        Request AVC444 chroma
+                        H.264 codecs offered
                         <select id="em-avc444" style="margin-top:0.2em">
-                            <option value="">Automatic</option>
-                            <option value="1">Always</option>
-                            <option value="0">Never</option>
+                            <option value="1">AVC444 + AVC420 (server chooses)</option>
+                            <option value="nc">AVC444 + AVC420, never combined</option>
+                            <option value="0">AVC420 only</option>
                         </select>
-                        <div style="color:#888;font-size:0.75em;margin-top:0.2em;">Only applies with H.264 Passthrough. AVC444 sends full-colour chroma as a second picture per frame, which the browser decodes and combines &mdash; roughly twice the decode work. <b>Automatic</b> skips it when Native Resolution is on, since at that pixel density the extra chroma buys little. Set <b>Always</b> for Windows targets: they offer no H.264 at all unless AVC444 is requested, so Automatic can drop them to the slower tile path.<br><br>This is what the server is <i>asked to send</i>, not what the browser draws. The browser combines the two views only while that costs no frame rate, and paints plain 4:2:0 when it would &mdash; commonly at 4K, where 60fps of 4:2:0 and 30fps of 4:4:4 cost about the same bandwidth. So <b>Always</b> on a 4K Windows target is still the right setting: it is what keeps H.264 working at all, even though the picture may be drawn at 4:2:0.</div>
+                        <div style="color:#888;font-size:0.75em;margin-top:0.2em;">Only applies with H.264 Passthrough. AVC444 sends full-colour chroma as a second picture per frame, which the browser decodes and combines. <b>AVC444 + AVC420</b> is required for Windows targets: they offer no H.264 at all unless AVC444 is on offer, so <b>AVC420 only</b> drops them to the slower tile path. <b>AVC420 only</b> is for xrdp targets where bandwidth or decode work matters more than chroma: one picture per frame instead of two. <b>Never combined</b> keeps H.264 working everywhere but always paints 4:2:0: the second picture is still sent and decoded, and each update reaches the screen roughly 12-17ms sooner, which suits a target used mainly for typing.<br><br>This is what the server is <i>asked to send</i>, not what the browser draws. The browser combines the two views only while that costs no frame rate, and paints plain 4:2:0 when it would &mdash; commonly at 4K, where 60fps of 4:2:0 and 30fps of 4:4:4 cost about the same bandwidth. So <b>AVC444 + AVC420</b> on a 4K Windows target is still the right setting: it is what keeps H.264 working at all, even though the picture may be drawn at 4:2:0.</div>
                     </label>
                     <div class="field-hint" style="margin-top:0.8em;margin-bottom:0.5em">Desktop appearance. Off by default to save bandwidth; enable for a normal-looking Windows desktop.</div>
                     <label style="margin-top:0.3em">
@@ -3358,7 +3358,7 @@
             document.getElementById('em-force-lossless').checked = false;
             document.getElementById('em-enable-h264').checked = false;
             document.getElementById('em-native-resolution').checked = false;
-            document.getElementById('em-avc444').value = '';
+            document.getElementById('em-avc444').value = '1';
             document.getElementById('em-enable-wallpaper').checked = false;
             document.getElementById('em-enable-theming').checked = false;
             document.getElementById('em-enable-full-window-drag').checked = false;
@@ -3587,13 +3587,14 @@
                     document.getElementById('em-force-lossless').checked = !!entryData.force_lossless;
                     document.getElementById('em-enable-h264').checked = !!entryData.enable_h264;
                     document.getElementById('em-native-resolution').checked = !!entryData.native_resolution;
+                    // Unset (saved when Automatic existed) offers both views.
                     document.getElementById('em-avc444').value =
-                        entryData.avc444 === undefined || entryData.avc444 === null
-                            ? '' : (entryData.avc444 ? '1' : '0');
+                        entryData.avc444 === false ? '0'
+                            : entryData.h264_combine === false ? 'nc' : '1';
                     document.getElementById('em-enable-wallpaper').checked = !!entryData.enable_wallpaper;
                     document.getElementById('em-enable-theming').checked = !!entryData.enable_theming;
                     document.getElementById('em-enable-full-window-drag').checked = !!entryData.enable_full_window_drag;
-                    if (entryData.enable_gfx || entryData.enable_desktop_composition || entryData.force_lossless || entryData.enable_h264 || entryData.native_resolution || entryData.avc444 !== undefined && entryData.avc444 !== null || entryData.enable_wallpaper || entryData.enable_theming || entryData.enable_full_window_drag) {
+                    if (entryData.enable_gfx || entryData.enable_desktop_composition || entryData.force_lossless || entryData.enable_h264 || entryData.native_resolution || entryData.avc444 === false || entryData.h264_combine === false || entryData.enable_wallpaper || entryData.enable_theming || entryData.enable_full_window_drag) {
                         document.getElementById('em-video-perf-fields').style.display = '';
                         document.getElementById('em-video-perf-arrow').innerHTML = '&#9660;';
                     }
@@ -3822,7 +3823,8 @@
                 if (document.getElementById('em-enable-h264').checked) entry.enable_h264 = true;
                 if (document.getElementById('em-native-resolution').checked) entry.native_resolution = true;
                 var avc444Value = document.getElementById('em-avc444').value;
-                if (avc444Value !== '') entry.avc444 = (avc444Value === '1');
+                entry.avc444 = (avc444Value !== '0');
+                if (avc444Value === 'nc') entry.h264_combine = false;
                 if (document.getElementById('em-enable-wallpaper').checked) entry.enable_wallpaper = true;
                 if (document.getElementById('em-enable-theming').checked) entry.enable_theming = true;
                 if (document.getElementById('em-enable-full-window-drag').checked) entry.enable_full_window_drag = true;

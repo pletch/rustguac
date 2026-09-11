@@ -320,23 +320,32 @@ only. It covers the older instruction shapes too.
 Adaptive suspension does **not** make the AVC420 levers redundant, and the
 three sit at levels the others cannot reach:
 
-1. **Whether AVC444 is advertised at all** (`013-rdp-avc420-only`, and the
-   HiDPI default from the desktop scale). Clearing `GfxAVC444` is the only one
+1. **Whether AVC444 is advertised at all** (`013-rdp-avc420-only`, set per
+   connection -- lever 2 below). Clearing `GfxAVC444` is the only one
    of the three that reduces what is *sent and decoded*: one bitstream instead
    of two, so half the bandwidth, half of guacd's copy and queue work, and one
    decode per picture instead of two. It is also the only lever with a quality
    argument behind it rather than a cost one -- at 1.4x or 1.8x a 4:2:0 chroma
    block covers close to one logical pixel, so the density has already bought
    most of what combining recovers.
-2. **The per-connection Automatic / Always / Never setting.** Not really a
+2. **The per-connection codec offer: AVC444 + AVC420, that pair never
+   combined, or AVC420 only** (stored as `avc444` true/false plus
+   `h264_combine`, which reaches client.html through `SessionInfo` as
+   `h264_no_combine` and sets the `h264Chroma444` window override before the
+   decoder exists -- combining is the only one of the three levers the server
+   never sees; the first is the default; an
+   Automatic option that dropped AVC444 under HiDPI was removed 2026-09-11 --
+   on Windows it lost H.264 outright, and the combine cost it guarded against
+   is now judged in the browser by area and measured flush; unset entries are
+   sent as AVC444 + AVC420, never as guacd's empty/auto value). Not really a
    chroma switch: Windows offers no H.264 below RDPGFX v10 and FreeRDP emits
-   those capability sets only when AVC444 is requested, so Never on a Windows
+   those capability sets only when AVC444 is requested, so AVC420 only on a Windows
    host loses H.264 altogether rather than downgrading its chroma. A per-target
    compatibility decision, invisible to the client. It says what the server is
-   asked to send, **not** what gets drawn -- Always on a 4K host still paints
+   asked to send, **not** what gets drawn -- AVC444 + AVC420 on a 4K host still paints
    4:2:0 once lever 3 suspends, and is still the correct setting there, because
-   it is what keeps H.264 working at all. Do not be tempted to make Always
-   disable lever 3: Always is the recommended setting for every Windows target,
+   it is what keeps H.264 working at all. Do not be tempted to make AVC444 + AVC420
+   disable lever 3: it is the recommended setting for every Windows target,
    so that would switch the gate off exactly where it earns most. xrdp needs the same lever
    from the other direction -- see [[xrdp-avc444-causes-chop]] in project
    memory, where AVC444 itself causes the chop and only clearing `GfxAVC444`

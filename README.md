@@ -89,13 +89,19 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   reconnect, and the window global is read once per decoder generation rather
   than per frame.
 - **Per-connection AVC444 request** (`patches/013-rdp-avc420-only.patch`) —
-  Automatic, Always or Never, per entry. Automatic clears `GfxAVC444` when
-  Native Resolution is on, since at that pixel density a 4:2:0 chroma block
-  already covers close to one logical pixel. **Always** is the right setting
-  for Windows targets: they offer no H.264 below RDPGFX v10, and FreeRDP emits
-  those capability sets only when AVC444 is requested, so Never loses H.264
-  there altogether rather than downgrading its chroma. This says what the
-  server is asked to send, not what the browser draws.
+  which H.264 codecs are offered, per entry: **AVC444 + AVC420** (the default;
+  the server chooses), **AVC444 + AVC420, never combined**, or **AVC420
+  only**. Never combined leaves the offer alone and tells the browser to paint
+  4:2:0: the second view is still sent and decoded, but each update reaches
+  the screen 12-17ms sooner, which suits a target used mainly for typing. AVC444 + AVC420 is required for
+  Windows targets: they offer no H.264 below RDPGFX v10, and FreeRDP emits
+  those capability sets only when AVC444 is requested, so AVC420 only loses
+  H.264 there altogether rather than downgrading its chroma. AVC420 only is
+  for xrdp targets where bandwidth or decode work matters more than chroma. This says what the
+  server is asked to send, not what the browser draws -- whether the two views
+  are combined is decided per picture in the browser. (An Automatic option
+  that dropped AVC444 under Native Resolution was removed: on Windows it lost
+  H.264 outright. Entries saved with it are treated as AVC444 + AVC420.)
 - **4:4:4 combining is declined when it would cost frame rate** — the combine
   is a plane read-back, six texture uploads and a shader pass per picture, all
   proportional to pixels and all contending with the hardware decoder on the

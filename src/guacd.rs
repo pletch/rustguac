@@ -192,17 +192,19 @@ pub struct RdpParams {
     pub force_lossless: bool,
     /// Enable H.264 passthrough. Raw H.264 NAL units sent to browser WebCodecs decoder.
     pub enable_h264: bool,
-    /// Whether AVC444 is advertised alongside AVC420. `None` leaves the
-    /// decision to guacd, which advertises it unless the session is HiDPI --
-    /// at 1.4x or 1.8x a 4:2:0 chroma block covers close to one logical pixel,
-    /// so the density has already bought most of what 4:4:4 offers, on the
-    /// same decoder now being asked for a second view per frame.
+    /// Whether AVC444 is advertised alongside AVC420. `None` and `Some(true)`
+    /// both advertise it; only `Some(false)` does not.
     ///
-    /// Which way that falls depends on the server, hence per connection: xrdp
-    /// sends AVC420 when AVC444 is not advertised, while Windows sends no
-    /// H.264 at all, offering it only from RDPGFX version 10 -- capability
-    /// sets FreeRDP emits only when AVC444 is requested. A Windows entry
-    /// therefore wants `Some(true)` whatever its scale.
+    /// There used to be a third, automatic state, left to guacd, which dropped
+    /// AVC444 once the session was HiDPI. On Windows that lost H.264 outright:
+    /// Windows offers it only from RDPGFX version 10, capability sets FreeRDP
+    /// emits only when AVC444 is requested, so a Native Resolution session to
+    /// a Windows host silently fell back to the tile path. Its reason -- the
+    /// combine's cost at high pixel density -- is now the browser's to judge,
+    /// per picture, by framebuffer area and by the flush it actually measures.
+    /// What remains of the choice is bandwidth and decode work, which is what
+    /// `Some(false)` is for: xrdp then sends AVC420, one bitstream instead of
+    /// two.
     pub avc444: Option<bool>,
     /// DPI scaling percentage the remote session should render its UI at, sent
     /// to the server as desktopScaleFactor. `None` leaves the server at its
@@ -417,14 +419,10 @@ pub async fn connect_and_handshake(
                 "disable-gfx" => if p.enable_gfx { "false" } else { "true" }.into(),
                 "force-lossless" => if p.force_lossless { "true" } else { "false" }.into(),
                 "enable-h264" => if p.enable_h264 { "true" } else { "false" }.into(),
-                // Tri-state: empty leaves guacd to decide from the desktop
-                // scale, matching GUAC_RDP_AVC444_AUTO.
-                "avc444" => {
-                    p.avc444.map_or(
-                        String::new(),
-                        |v| if v { "1".into() } else { "0".to_string() },
-                    )
-                }
+                // Always unless explicitly off. Never empty: guacd reads that
+                // as GUAC_RDP_AVC444_AUTO, which drops AVC444 on HiDPI
+                // sessions and with it all H.264 from a Windows host.
+                "avc444" => if p.avc444.unwrap_or(true) { "1" } else { "0" }.into(),
                 "desktop-scale" => p.desktop_scale.map_or(String::new(), |s| s.to_string()),
                 "remote-app" => p.remote_app.clone().unwrap_or_default(),
                 "remote-app-dir" => p.remote_app_dir.clone().unwrap_or_default(),

@@ -126,10 +126,14 @@ pub struct CreateSessionRequest {
     pub force_lossless: Option<bool>,
     /// Enable H.264 passthrough for RDP.
     pub enable_h264: Option<bool>,
-    /// Advertise AVC444 alongside AVC420 (RDP). `None` lets guacd decide from
-    /// the session's desktop scale; `Some(true)` is needed for Windows hosts,
-    /// which offer no H.264 below RDPGFX version 10.
+    /// Advertise AVC444 alongside AVC420 (RDP). `Some(false)` offers AVC420
+    /// only; anything else advertises AVC444, which Windows hosts require to
+    /// offer H.264 at all.
     pub avc444: Option<bool>,
+    /// Whether the browser combines AVC444's two views into 4:4:4 chroma.
+    /// `None` means yes. Never reaches guacd: it is passed to client.html
+    /// through `SessionInfo`, since only the browser combines.
+    pub h264_combine: Option<bool>,
     // VDI fields
     /// Docker image for VDI sessions (e.g. "myregistry/desktop:latest").
     pub container_image: Option<String>,
@@ -261,6 +265,12 @@ pub struct SessionInfo {
     /// from the /api/sessions/:id fetch; omitted when false/unset.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub fullscreen_on_connect: bool,
+    /// Never combine AVC444's two views into 4:4:4 chroma, whatever the
+    /// client's own gates decide. Read by client.html from the
+    /// /api/sessions/:id fetch; stated the negative way round so that the
+    /// default -- combine -- is the omitted one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub h264_no_combine: bool,
     /// Auto-hide the clipboard/files side tabs when idle. Read by
     /// client.html from the /api/sessions/:id fetch; omitted when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -329,6 +339,9 @@ pub struct Session {
     /// (#154). Surfaced verbatim in `SessionInfo` so client.html can
     /// trigger fullscreen on first user gesture after CONNECTED.
     pub fullscreen_on_connect: bool,
+    /// Whether the browser may combine AVC444's two views into 4:4:4.
+    /// Copied from the source entry; surfaced inverted in `SessionInfo`.
+    pub h264_combine: bool,
     /// Copied from the source entry's `autohide_side_tabs` flag.
     /// Surfaced in `SessionInfo` so client.html can auto-hide the
     /// clipboard/files side tabs.
@@ -573,6 +586,7 @@ impl Session {
             thumbnail_url: Some(format!("/api/sessions/{}/thumbnail", self.id)),
             display_scale: self.display_scale,
             fullscreen_on_connect: self.fullscreen_on_connect,
+            h264_no_combine: !self.h264_combine,
             autohide_side_tabs: self.autohide_side_tabs,
         }
     }
@@ -1813,6 +1827,7 @@ impl SessionManager {
             share_allowed,
             display_scale: req.display_scale,
             fullscreen_on_connect: req.fullscreen_on_connect.unwrap_or(false),
+            h264_combine: req.h264_combine.unwrap_or(true),
             autohide_side_tabs: req.autohide_side_tabs.unwrap_or(false),
             frame_stats: Arc::new(crate::frame_stats::FrameStats::new()),
         };
@@ -2729,6 +2744,7 @@ mod tests {
             share_allowed: true,
             display_scale: None,
             fullscreen_on_connect: false,
+            h264_combine: true,
             autohide_side_tabs: false,
             frame_stats: Arc::new(crate::frame_stats::FrameStats::new()),
         }
