@@ -101,8 +101,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var COMBINE_MAX_PIXELS = 4000000;
 
     /**
-     * How long a session that gave up combining must go without a sync gate
-     * timeout before it tries combining again, in milliseconds.
+     * How long a session that gave up combining must stay quiet -- under
+     * QUIET_SYNCS_PER_SECOND, with no sync gate timeout -- before it tries
+     * combining again, in milliseconds.
      *
      * Long, because the point is to distinguish "the video ended" from "the
      * video paused between scenes". Resuming is not free: the first combine
@@ -775,7 +776,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
-     * Whether combining is currently given up. See noteSyncTimeout().
+     * Whether combining is currently given up. See suspendCombining().
      *
      * @private
      * @type {!boolean}
@@ -884,29 +885,144 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (recentSyncTimeouts.length < COMBINE_TIMEOUT_TRIP)
             return;
 
-        var span = now - recentSyncTimeouts[0];
+        suspendCombining(COMBINE_TIMEOUT_TRIP + ' sync gate timeouts in '
+                + ((now - recentSyncTimeouts[0]) / 1000).toFixed(1) + 's');
 
-        /* Only the latch is set here. Combining stops at the next main view,
-         * where the output callback re-checks chroma444Enabled(): this runs
-         * from a timer, and may land between a paired main view -- uploaded,
-         * deliberately unpainted -- and the auxiliary view that paints it.
-         * Stopping in between discards that picture, and if it is a keyframe
-         * nothing repaints the screen. */
+    }
+
+    /**
+     * Gives up combining until the load that caused it has passed, counting
+     * the trip. Shared by the two trips: sync gate timeouts (the client cannot
+     * keep up at all) and slow flushes (it keeps up, but sets the frame rate).
+     *
+     * Only the latch is set here. Combining stops at the next main view, where
+     * the output callback re-checks chroma444Enabled(): a trip can land between
+     * a paired main view -- uploaded, deliberately unpainted -- and the
+     * auxiliary view that paints it. Stopping in between discards that
+     * picture, and if it is a keyframe nothing repaints the screen.
+     *
+     * @private
+     * @param {!string} reason
+     *     What tripped it, for the diagnostic.
+     */
+    function suspendCombining(reason) {
+
         combineLatchedOff = true;
         combineTrips++;
         recentSyncTimeouts = [];
+        flushWindow = null;
 
-        diagnostic('chroma_suspended', 'gave up 4:4:4 combining: '
-                + COMBINE_TIMEOUT_TRIP + ' sync gate timeouts in '
-                + (span / 1000).toFixed(1) + 's -- the client is setting the '
-                + 'frame rate. Painting 4:2:0'
+        diagnostic('chroma_suspended', 'gave up 4:4:4 combining: ' + reason
+                + ' -- the client is setting the frame rate. Painting 4:2:0'
                 + (combineTrips >= COMBINE_MAX_TRIPS
                     ? ' for the rest of the session, having given up '
                         + combineTrips + ' times'
-                    : ' until the sync gate has been clear for '
+                    : ' until the session has been quiet (under '
+                        + QUIET_SYNCS_PER_SECOND + ' syncs/s, no timeouts) for '
                         + (COMBINE_RECOVER_MS / 1000) + 's')
                 + '; ?h264Chroma444=on forces it back on', true);
 
+    }
+
+    /**
+     * Mean flush time, in ms, above which a busy window while combining gives
+     * combining up; the window's length; and the syncs it must hold to count.
+     *
+     * Measured at 1920x1072 on one client, playing the same video against the
+     * xrdp fork: 4:2:0 ran at 54.7 syncs/s with a mean flush of 0.6ms; 4:4:4
+     * at 33-41/s with 16-22ms, and 14ms even at 1920x896. No sync was held and
+     * none timed out in either mode, so the timeout trip could never see it:
+     * the client kept up, it just set a frame rate 40% lower. 8ms sits more
+     * than ten times above the one and well under the other.
+     *
+     * The minimum count keeps a static desktop combining. It sends a few
+     * syncs a second, well under 100 in a window, and its full chroma is what
+     * combining is for; only motion is worth giving it up for.
+     *
+     * @private
+     * @constant
+     */
+    var COMBINE_FLUSH_TRIP_MS = 8;
+    var COMBINE_FLUSH_WINDOW_MS = 10000;
+    var COMBINE_FLUSH_MIN_SYNCS = 100;
+
+    /**
+     * The flush window in progress while combining, or null.
+     *
+     * @private
+     * @type {?{start: number, syncs: number, sumMs: number}}
+     */
+    var flushWindow = null;
+
+    /**
+     * Counts one sync's flush while combining, and gives combining up at the
+     * end of a busy window whose mean flush is over COMBINE_FLUSH_TRIP_MS.
+     *
+     * @private
+     */
+    function noteCombineFlush(flushMs) {
+
+        if (override('h264Chroma444') !== undefined || !combining
+                || combineLatchedOff || typeof flushMs !== 'number') {
+            flushWindow = null;
+            return;
+        }
+
+        var now = nowMs();
+        if (!flushWindow)
+            flushWindow = { start: now, syncs: 0, sumMs: 0 };
+
+        flushWindow.syncs++;
+        flushWindow.sumMs += flushMs;
+
+        if (now - flushWindow.start < COMBINE_FLUSH_WINDOW_MS)
+            return;
+
+        var mean = flushWindow.sumMs / flushWindow.syncs;
+        var syncs = flushWindow.syncs;
+        var span = now - flushWindow.start;
+        flushWindow = null;
+
+        if (syncs >= COMBINE_FLUSH_MIN_SYNCS && mean > COMBINE_FLUSH_TRIP_MS)
+            suspendCombining('mean flush ' + mean.toFixed(1) + 'ms over '
+                    + syncs + ' syncs in ' + (span / 1000).toFixed(0)
+                    + 's, over the ' + COMBINE_FLUSH_TRIP_MS + 'ms a '
+                    + 'combining client is expected to stay within');
+
+    }
+
+    /**
+     * Syncs per second at or under which the session counts as quiet, for
+     * resuming. See maybeResumeCombining().
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var QUIET_SYNCS_PER_SECOND = 10;
+
+    /**
+     * When the session was last busier than QUIET_SYNCS_PER_SECOND, measured
+     * over one-second buckets; and the bucket in progress.
+     *
+     * @private
+     */
+    var lastBusyAt = 0;
+    var busyBucket = null;
+
+    /**
+     * Counts a sync towards the busy/quiet measure.
+     *
+     * @private
+     */
+    function noteActivity() {
+        var now = nowMs();
+        if (!busyBucket || now - busyBucket.start >= 1000) {
+            if (busyBucket && busyBucket.syncs > QUIET_SYNCS_PER_SECOND)
+                lastBusyAt = now;
+            busyBucket = { start: now, syncs: 0 };
+        }
+        busyBucket.syncs++;
     }
 
     /**
@@ -923,13 +1039,20 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (!combineLatchedOff || combineTrips >= COMBINE_MAX_TRIPS)
             return;
 
-        if (nowMs() - lastSyncTimeoutAt < COMBINE_RECOVER_MS)
+        var now = nowMs();
+
+        /* Not merely timeout-free: 4:2:0 never times out and never flushes
+         * slowly, so that alone would resume in the middle of the video that
+         * tripped it, trip again a window later, and spend every trip on one
+         * video. Quiet is what says the motion has passed. */
+        if (now - lastSyncTimeoutAt < COMBINE_RECOVER_MS
+                || now - lastBusyAt < COMBINE_RECOVER_MS)
             return;
 
         combineLatchedOff = false;
 
-        diagnostic('chroma_resumed', 'resuming 4:4:4 combining: no sync gate '
-                + 'timeout for ' + (COMBINE_RECOVER_MS / 1000) + 's ('
+        diagnostic('chroma_resumed', 'resuming 4:4:4 combining: quiet, with no '
+                + 'sync gate timeout, for ' + (COMBINE_RECOVER_MS / 1000) + 's ('
                 + combineTrips + ' of ' + COMBINE_MAX_TRIPS
                 + ' attempts used)', true);
 
@@ -1462,7 +1585,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (value !== undefined)
             return !!value;
 
-        /* Given up for now by noteSyncTimeout(). */
+        /* Given up for now by suspendCombining(). */
         if (combineLatchedOff)
             return false;
 
@@ -2642,6 +2765,10 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @private
      */
     function recordHold(mode, ms, timedOut, flushMs) {
+
+        noteActivity();
+        if (mode === '444')
+            noteCombineFlush(flushMs);
 
         [holdTotal[mode], holdWindow[mode]].forEach(function(stats) {
             if (typeof flushMs === 'number') {

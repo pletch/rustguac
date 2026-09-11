@@ -250,14 +250,26 @@ and **sync gate timeouts from 2026-09-11**:
   waits for the queue to drain and gives up at `SYNC_WAIT_TIMEOUT_MS` -- so the
   backlog trigger was removed as redundant. Trips on `COMBINE_TIMEOUT_TRIP` (3)
   timeouts within `COMBINE_TIMEOUT_WINDOW_MS` (10s) while combining.
+* **And slow flushes, because at 2MP the client keeps up but sets the pace.**
+  Same video, 1920x1072, xrdp fork host: 4:2:0 ran at **54.7 syncs/s with a
+  0.6ms mean flush**; 4:4:4 at **33-41/s with 16-22ms** (14ms even at
+  1920x896) -- and **no hold and no timeout in either mode**, so the timeout
+  trip could never see a 40% frame-rate cost. A 10s window while combining
+  with at least `COMBINE_FLUSH_MIN_SYNCS` (100) syncs and a mean flush over
+  `COMBINE_FLUSH_TRIP_MS` (8ms) also trips the latch. The minimum count keeps a
+  static desktop (a few syncs/s) combining, which is where full chroma is worth
+  having.
 * **A latch with hysteresis, not a controller.** The old budget's divisor was
   the observed interval between pictures, which is what `012`'s frame-ack
   back-pressure has already throttled the server down to -- and that
   back-pressure reacts to the lag combining causes. It read its own output as
   its input and needed a capped ceiling to stop it hunting. This has no loop:
-  it gives up, waits `COMBINE_RECOVER_MS` with no sync timeout at all (in
-  either mode), tries again, and after `COMBINE_MAX_TRIPS` stops trying.
-  Tripping during a video and resuming afterwards is the expected shape.
+  it gives up, waits `COMBINE_RECOVER_MS` of **quiet** -- under
+  `QUIET_SYNCS_PER_SECOND` (10) and no sync timeout -- tries again, and after
+  `COMBINE_MAX_TRIPS` stops trying. Quiet, not merely clean: 4:2:0 never
+  flushes slowly, so "30s clean" resumed mid-video, tripped a window later and
+  spent every trip on one video. Tripping during a video and resuming once it
+  has stopped is the expected shape.
 * **The trip sets the latch; combining stops at the next main view.** The
   timeout fires from a timer and can land between a paired main view --
   uploaded, deliberately unpainted -- and the auxiliary view that paints it.
