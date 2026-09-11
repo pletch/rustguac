@@ -700,6 +700,81 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
+     * Fraction of a keyframe's decoded picture that must be black for it to be
+     * withheld, and how long the framebuffer must have kept its size first.
+     * See keepPictureOverBlackKeyframe().
+     *
+     * @private
+     * @constant
+     */
+    var BLACK_KEYFRAME_FRACTION = 0.98;
+    var BLACK_KEYFRAME_STABLE_MS = 5000;
+
+    /**
+     * Whether a keyframe about to be painted should be withheld instead,
+     * leaving the picture already on screen in place.
+     *
+     * Windows sometimes deletes and recreates its RDPGFX surface at the same
+     * size, mid-session, with no resize. The new surface is empty, so its
+     * first keyframe decodes black and covers the whole screen -- and Windows
+     * then repaints only what it thinks changed, trusting the client still to
+     * hold the rest. Both black-display episodes of 2026-09-11 were exactly
+     * that (guacd logged Delete+CreateSurface 2992x2000 over 2992x2000 2-4s
+     * before each), and they were the only same-size recreations that day.
+     *
+     * It is the same Windows behaviour as sol1/rustguac#118, where a resize
+     * reallocated the surface and left regions unpainted. The evidence there
+     * rules out asking Windows to repaint: a guacd patch sending
+     * SuppressOutput off/on and RefreshRect after each resize fired and the
+     * black stayed, since Windows does not re-stream its surface cache for
+     * either. What fixed it was re-sending pixels the client side already had
+     * (patch 005). Under passthrough guacd has none, but the browser does: it
+     * is still showing the right picture when the black keyframe arrives. So
+     * the keyframe is decoded -- later pictures reference it -- and not
+     * painted, and the regions Windows does repaint land on the old picture,
+     * which is what Windows assumes the client is showing.
+     *
+     * Not while the size is changing: after a resize or at connect, Windows
+     * repaints everything, and what is on screen is the wrong size anyway.
+     * The cost of being wrong is a genuinely black screen shown late, until
+     * the next update arrives. h264KeepBlackKeyframes=off disables this.
+     *
+     * @private
+     * @returns {!boolean}
+     */
+    function keepPictureOverBlackKeyframe(frameState, snapshot) {
+
+        if (!frameState.keyFrame || override('h264KeepBlackKeyframes') === false)
+            return false;
+
+        if (!framebufferChangedAt
+                || nowMs() - framebufferChangedAt < BLACK_KEYFRAME_STABLE_MS)
+            return false;
+
+        var sample;
+        try {
+            sample = sampleGrid(snapshot, 0, 0, snapshot.width, snapshot.height);
+        }
+        catch (e) {
+            return false;
+        }
+
+        if (!sample || sample.black < BLACK_KEYFRAME_FRACTION)
+            return false;
+
+        diagnostic('h264_black_keyframe_kept', 'withheld a keyframe decoded '
+                + (sample.black * 100).toFixed(0) + '% black with the '
+                + 'framebuffer unchanged for '
+                + ((nowMs() - framebufferChangedAt) / 1000).toFixed(0)
+                + 's: most likely Windows recreating its surface. Keeping the '
+                + 'picture on screen; h264KeepBlackKeyframes=off paints it',
+                true);
+
+        return true;
+
+    }
+
+    /**
      * Whether combining is currently given up. See noteSyncTimeout().
      *
      * @private
@@ -1765,7 +1840,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * already queued both views. */
             if (view === 0 && frameState.paired) {
                 deferredMain = true;
-                deferredMainRects = frameState.rects;
+                deferredMainRects = frameState.paint ? frameState.rects : [];
                 finishForTiming();
                 combineWorkMs += nowMs() - startedAt;
                 return;
@@ -2114,6 +2189,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                      * surface still held. Closing in a finally, with no await
                      * in between, removes the window rather than narrowing
                      * it. */
+                    /* Nothing will be painted, so there is nothing to copy.
+                     * The finally below closes the frame and releases the
+                     * task, which drawDecoded() then settles. */
+                    if (!frameState.paint)
+                        return;
+
                     canvas = acquireCanvas(frame.displayWidth,
                             frame.displayHeight);
 
@@ -2326,6 +2407,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 x: x,
                 y: y,
                 rects: (rects && rects.length) ? rects : null,
+
+                /* An empty list, unlike an absent one, says no region of the
+                 * picture changed: decode it for its references, paint none
+                 * of it. See drawDecoded(). */
+                paint: !(rects && rects.length === 0),
                 view: view || 0,
                 paired: !!paired,
                 onReady: onReady,
@@ -2415,8 +2501,33 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         clearWatchdog(frameState);
 
+        /* A picture whose region list was sent empty changed nothing on
+         * screen. Reported because it is rare and was, painted whole, the
+         * cause of the black-display episodes: a keyframe of uninitialised
+         * content that the server never meant to show. */
+        if (!frameState.paint) {
+            diagnostic('h264_undisplayed', (frameState.keyFrame ? 'keyframe'
+                    : 'delta') + ' view=' + frameState.view + ' with no '
+                    + 'region rects: decoded for its references, not painted');
+            if (frameState.canvas) {
+                releaseSnapshot(frameState.canvas);
+                frameState.canvas = null;
+            }
+            settle(frameState);
+            return;
+        }
+
         var snapshot = frameState.canvas;
         if (!snapshot) {
+            settle(frameState);
+            return;
+        }
+
+        /* A black keyframe over a stable framebuffer: keep what is on screen.
+         * See keepPictureOverBlackKeyframe(). */
+        if (keepPictureOverBlackKeyframe(frameState, snapshot)) {
+            frameState.canvas = null;
+            releaseSnapshot(snapshot);
             settle(frameState);
             return;
         }

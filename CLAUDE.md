@@ -446,6 +446,30 @@ bounded, rather than being something to switch on afterwards:
   whatever the host sent; the 10s display check reports `display_green` too,
   since the same session went green minutes later.
 
+**First cause found (2026-09-11): a keyframe with zero region rects, painted
+whole.** Mid-session, with no resize, Windows sent an IDR whose
+`numRegionRects` was 0; `keyframe_probe` read its decoded picture as 100%
+decoder green (zeroed YUV -- uninitialised content), and the client painted it
+over the whole screen, because it read "no rects" as "whole picture valid". In
+MS-RDPEGFX the region rects are the areas that *changed*, and FreeRDP's
+`avc420_decompress` copies and invalidates only those -- zero rects changes
+nothing. The client now tells an absent list (older guacd: whole picture) from
+an empty one (decode for references, paint nothing, report `h264_undisplayed`).
+**Second cause, the main one: Windows recreating its surface at the same size.**
+guacd's patch-014 trace put `DeleteSurface`+`CreateSurface 2992x2000` over a
+2992x2000 surface 2-4s before *both* black episodes that day (12:35:40,
+15:03:45), and those were the only same-size recreations -- every other one was
+a resize, after which Windows repaints everything. The new surface is empty, its
+first keyframe (full-screen rect) decodes black, and Windows then repaints only
+what it thinks changed. It is the same Windows behaviour as sol1/rustguac#118,
+whose reporter proved that `SuppressOutput` off/on and `RefreshRect` do **not**
+make Windows re-stream the surface -- so do not try that again. #118 was fixed by
+re-sending pixels the client side already had; under passthrough those are in
+the browser, so `keepPictureOverBlackKeyframe()` withholds a keyframe decoded
+>=98% black when the framebuffer has kept its size for 5s (decoded for its
+references, not painted; `h264_black_keyframe_kept`), and Windows' partial
+repaint lands on the old picture. `h264KeepBlackKeyframes=off` disables it.
+
 Both budgets are per minute and global, so a looping page cannot fill a disk.
 guacd defaults to `-L info` and rustguac to `RUST_LOG=info`, so all of it lands
 in the journal with no configuration — but the journal must be persistent, or
