@@ -2252,14 +2252,29 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                         resyncNeeded = true;
 
                         /* Suspended by the sync gate, which has reported it
-                         * already; this is only where it takes effect. */
-                        if (!combineLatchedOff)
-                            diagnostic('chroma_declined', 'stopped 4:4:4 '
-                                + 'combining: the framebuffer grew to '
-                                + display.getWidth() + 'x' + display.getHeight()
-                                + ', over the ' + (combineMaxPixels() / 1e6)
-                                    .toFixed(1) + 'MP it is worth its cost at',
+                         * already; this is only where it takes effect.
+                         *
+                         * Otherwise say which of the other two reasons it
+                         * was. The override is read per picture, so it can
+                         * stop combining at any point in a session, and
+                         * blaming the framebuffer for it sends whoever reads
+                         * the line looking at the wrong thing. */
+                        if (!combineLatchedOff) {
+
+                            var declineOverride = override('h264Chroma444');
+
+                            diagnostic('chroma_declined', declineOverride
+                                    !== undefined
+                                ? 'stopped 4:4:4 combining: the h264Chroma444 '
+                                    + 'override is off'
+                                : 'stopped 4:4:4 combining: the framebuffer '
+                                    + 'grew to ' + display.getWidth() + 'x'
+                                    + display.getHeight() + ', over the '
+                                    + (combineMaxPixels() / 1e6).toFixed(1)
+                                    + 'MP it is worth its cost at',
                                 true);
+
+                        }
                     }
 
                     /* An auxiliary view means this is an AVC444 stream, so
