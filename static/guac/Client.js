@@ -1476,8 +1476,14 @@ Guacamole.Client = function(tunnel) {
             // Region rects, if sent. These identify which parts of the decoded
             // picture are actually valid; the picture is always full-surface
             // sized, so a server mixing codecs leaves the remainder holding no
-            // meaningful content. A count of zero (or an older guacd that
-            // sends no count at all) means the whole picture is valid.
+            // meaningful content. An older guacd that sends no count at all
+            // means the whole picture is valid. A count of zero means NONE of
+            // it is: MS-RDPEGFX's region rects are the areas that changed, and
+            // FreeRDP's own decoder updates only those, so a zero-rect picture
+            // is decoded for its references and never shown. Windows sends
+            // keyframes like that mid-session, with uninitialised content --
+            // painting one filled the screen with decoder green, and the
+            // black keyframe after it left 77% of the display black.
             // Which view this access unit carries. 0 is a displayable picture
             // (AVC420, or the main view of AVC444); 1 and 2 are the auxiliary
             // chroma views of AVC444 in its v1 and v2 layouts. An auxiliary
@@ -1575,7 +1581,8 @@ Guacamole.Client = function(tunnel) {
                     display.drawH264(
                         layer, guac_client._h264Decoder,
                         x, y, width, height,
-                        bytes.buffer, isKeyFrame, rects, view, paired
+                        bytes.buffer, isKeyFrame,
+                        parameters.length > 8 ? rects : null, view, paired
                     );
                 } catch (e) {
                     if (typeof console !== 'undefined')
