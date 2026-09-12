@@ -53,6 +53,35 @@
 //! Plus `gaps_in_frame_num_value_allowed_flag`, which says whether a decoder is
 //! even required to tolerate the holes dropping would leave.
 //!
+//! # It has been done before, and what went wrong was not this
+//!
+//! Upstream sol1 **v1.8.0 shipped exactly this configuration**: it negotiated
+//! `GfxAVC444 = TRUE` and its AVC444 branch copied `bitstream[0]` alone,
+//! dropping the auxiliary view before the browser ever saw it. v1.8.1
+//! (`4bcac32`) changed it to `GfxAVC444 = FALSE`, which is where the present
+//! AVC420 lever comes from — and, unknown at the time, is what stops a Windows
+//! host engaging hardware H.264 encoding at all.
+//!
+//! The symptom that drove that change was *not* a broken reference chain. It
+//! was recorded as "two blocks with green and magenta casts": v1.8.0 read no
+//! `LC` at all, so an MS-RDPEGFX LC=2 command — chroma in `bitstream[0]`, no
+//! luma anywhere — was forwarded and painted as an image. Packed chroma drawn
+//! as YUV is green and magenta. A shattered reference chain looks like
+//! smearing or nothing, not like a recognisable chroma plane, so the pictures
+//! were decoding.
+//!
+//! That is real evidence the drop is viable, and it is weaker than it looks on
+//! three counts, all of which this probe can speak to: v1.8.0 still ran the
+//! GDI decode (`orig(context, cmd)`), so guacd held real pixels and the layer
+//! had another source of paint; the fault was diagnosed as a colour bug and
+//! fixed quickly, so nobody watched a long session for slow reference drift;
+//! and it says nothing about xrdp, whose fork interleaves chroma on a
+//! `CHROMA_INTERVAL` and need not structure its references the same way.
+//!
+//! It also settles one thing outright: **LC=2 commands are real on Windows**.
+//! A downstream drop has to lose the whole command for those, not merely its
+//! auxiliary half, which is why the unpaired auxiliary view is counted here.
+//!
 //! # What this is
 //!
 //! A probe, not a feature. It is off unless `RUSTGUAC_H264_NAL_PROBE` is set,
@@ -89,6 +118,10 @@ const AU_ENOUGH_BYTES: usize = 768;
 /// Cap on part-assembled access units held at once, so a stream that never
 /// ends cannot grow the map without limit.
 const MAX_PENDING_STREAMS: usize = 256;
+
+/// Region rects to count past when reaching the trailing `<paired>` flag,
+/// beyond which the instruction is taken as malformed rather than walked.
+const MAX_RECTS: usize = 4096;
 
 /// The fields of a sequence parameter set a slice header cannot be read
 /// without.
@@ -154,6 +187,9 @@ impl Slice {
 struct Pending {
     view: u8,
     keyframe: bool,
+    /// The trailing `<paired>` flag: an auxiliary view for this same picture
+    /// follows immediately (MS-RDPEGFX LC=0).
+    paired: bool,
     buf: Vec<u8>,
     /// Set once the slice header has been read, so the remaining blobs of a
     /// large picture are ignored rather than buffered.
@@ -183,6 +219,15 @@ struct Stats {
     aux_offsets: BTreeMap<u32, u64>,
     main_with_list_mod: u64,
     aux_with_list_mod: u64,
+    /// Auxiliary views arriving with no paired main view ahead of them — an
+    /// MS-RDPEGFX LC=2 command, whose only bitstream is chroma.
+    ///
+    /// Worth counting because it is the case that broke this in v1.8.0, which
+    /// requested AVC444 and forwarded bitstream[0] without reading LC: against
+    /// a Windows host that put the chroma picture on the wire as an image, and
+    /// the browser painted it. A downstream drop has to lose the whole command
+    /// for these, not merely its auxiliary half.
+    aux_unpaired: u64,
     list_mods: BTreeMap<(u32, u32), u64>,
     mmco: BTreeMap<u32, u64>,
     parse_failures: u64,
@@ -198,6 +243,9 @@ pub struct NalProbe {
     pps: HashMap<u32, Pps>,
     stats: Stats,
     last_main_frame_num: Option<u32>,
+    /// Whether the most recent main view declared an auxiliary view to follow,
+    /// so one arriving without it can be recognised as a chroma-only command.
+    last_main_paired: bool,
     next_summary: u64,
 }
 
@@ -227,6 +275,7 @@ impl NalProbe {
             pps: HashMap::new(),
             stats: Stats::default(),
             last_main_frame_num: None,
+            last_main_paired: false,
             next_summary: FIRST_SUMMARY_AUS,
         }
     }
@@ -255,7 +304,8 @@ impl NalProbe {
         lines
     }
 
-    /// `h264,<stream>,<layer>,<keyframe>,<x>,<y>,<w>,<h>,<view>,...`
+    /// `h264,<stream>,<layer>,<keyframe>,<x>,<y>,<w>,<h>,<view>,<numrects>,
+    /// [<x> <y> <w> <h>]...,<paired>`
     fn open(&mut self, rest: &str) {
         let mut args = crate::frame_stats::elements(rest);
         let Some(index) = args.next().and_then(|v| v.parse::<u32>().ok()) else {
@@ -269,6 +319,19 @@ impl NalProbe {
             .unwrap_or(0)
             .min(2);
 
+        // <paired> trails the rects because they vary in number, so reaching it
+        // means counting past them. Guarded against an absurd count, which
+        // would otherwise be a long walk over a truncated instruction.
+        let num_rects = args
+            .next()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n <= MAX_RECTS)
+            .unwrap_or(0);
+        let paired = args
+            .nth(num_rects * 4)
+            .and_then(|v| v.parse::<u32>().ok())
+            .is_some_and(|v| v != 0);
+
         if self.pending.len() >= MAX_PENDING_STREAMS {
             // Streams that never ended. Nothing here is worth recovering, and
             // the alternative is unbounded growth on a long session.
@@ -280,6 +343,7 @@ impl NalProbe {
             Pending {
                 view,
                 keyframe,
+                paired,
                 buf: Vec::new(),
                 done: false,
             },
@@ -346,6 +410,7 @@ impl NalProbe {
         pending.done = true;
         let view = pending.view;
         let keyframe = pending.keyframe;
+        let paired = pending.paired;
         let buf = std::mem::take(&mut pending.buf);
 
         let mut slice = None;
@@ -380,6 +445,11 @@ impl NalProbe {
         self.stats.aus += 1;
         let n = self.stats.aus;
 
+        // Read before the update below: an auxiliary view never declares a
+        // pair of its own, so what makes it chroma-only is the absence of a
+        // paired main view *ahead* of it.
+        let chroma_only = view != 0 && !self.last_main_paired;
+
         let stats = &mut self.stats.views[view as usize];
         stats.total += 1;
         if slice.nal_ref_idc != 0 {
@@ -410,7 +480,12 @@ impl NalProbe {
             if !slice.list_mods.is_empty() {
                 self.stats.main_with_list_mod += 1;
             }
+            self.last_main_paired = paired;
         } else {
+            if chroma_only {
+                self.stats.aux_unpaired += 1;
+            }
+            self.last_main_paired = false;
             if let Some(main) = self.last_main_frame_num {
                 let offset = (slice.frame_num + wrap - main) % wrap;
                 *self.stats.aux_offsets.entry(offset).or_default() += 1;
@@ -461,6 +536,10 @@ impl NalProbe {
                 mmco,
                 if slice.long_term_reference {
                     " long_term_reference"
+                } else if view == 0 && paired {
+                    " paired"
+                } else if chroma_only {
+                    " chroma-only"
                 } else {
                     ""
                 },
@@ -530,6 +609,10 @@ impl Stats {
                     .collect::<Vec<_>>()
                     .join(", ")
             }
+        ));
+        lines.push(format!(
+            "  aux views with no paired main view (LC=2, chroma only): {}",
+            self.aux_unpaired
         ));
         lines.push(format!(
             "  memory_management_control_operation: {}",
@@ -1094,6 +1177,18 @@ mod tests {
     /// blob reassembly, and the access unit that is only read at `end`
     /// because it never reached the buffering threshold.
     fn instruction_stream(views: &[u8]) -> String {
+        instruction_stream_with(views, 0)
+    }
+
+    /// As above, with `num_rects` region rects between `<view>` and the
+    /// trailing `<paired>` flag, and every main view declaring a pair.
+    ///
+    /// The rects are what make `<paired>` hard to find: it trails a
+    /// variable-length list, so an off-by-one reads a rect coordinate as a
+    /// boolean — true for nearly every rect — and the probe would then call
+    /// every chroma-only command paired. `tests/h264-instruction-format.mjs`
+    /// guards the same arithmetic on the client side.
+    fn instruction_stream_with(views: &[u8], num_rects: usize) -> String {
         use base64::Engine as _;
 
         let mut params = Vec::new();
@@ -1127,10 +1222,11 @@ mod tests {
                 "128".into(),                 // width
                 "96".into(),                  // height
                 view.to_string(),
-                "0".into(), // numrects
-                "0".into(), // paired
+                num_rects.to_string(),
             ]
             .into_iter()
+            .chain((0..num_rects).flat_map(|r| [r + 1, r + 2, 16, 16].map(|v| v.to_string())))
+            .chain(std::iter::once(u8::from(*view == 0).to_string()))
             .collect();
             for arg in args {
                 out.push_str(&format!("{}.{},", arg.len(), arg));
@@ -1182,6 +1278,45 @@ mod tests {
 
         let summary = probe.stats.summary().join("\n");
         assert!(summary.contains("no auxiliary views seen"), "{}", summary);
+    }
+
+    /// `<paired>` is found past the rects, not among them.
+    #[test]
+    fn the_paired_flag_is_read_past_the_rects() {
+        for rects in [0, 1, 7] {
+            let mut probe = NalProbe::with_detail(4);
+            let lines = probe.observe(&instruction_stream_with(&[0, 2, 0, 2], rects));
+
+            assert!(
+                lines[0].contains(" paired"),
+                "{} rects: {}",
+                rects,
+                lines[0]
+            );
+            assert!(
+                !lines[1].contains("chroma-only"),
+                "{} rects: {}",
+                rects,
+                lines[1]
+            );
+            assert_eq!(
+                probe.stats.aux_unpaired, 0,
+                "{} rects: auxiliary views followed a paired main view",
+                rects
+            );
+        }
+    }
+
+    /// An auxiliary view with no paired main view ahead of it is the LC=2
+    /// command that v1.8.0 forwarded and the browser painted. A run of them
+    /// with no main view at all is the shape a chroma-only refresh takes.
+    #[test]
+    fn a_chroma_only_command_is_counted_as_unpaired() {
+        let mut probe = NalProbe::with_detail(4);
+        let lines = probe.observe(&instruction_stream_with(&[2, 2], 3));
+
+        assert!(lines[0].contains("chroma-only"), "{}", lines[0]);
+        assert_eq!(probe.stats.aux_unpaired, 2);
     }
 
     /// The probe is off unless asked for, and that is what keeps it free.
