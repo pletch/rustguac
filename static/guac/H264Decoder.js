@@ -1355,8 +1355,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 + (lastFrameFormat ? ' (decoder gives ' + lastFrameFormat
                     + ')' : '') + ':'];
 
-        ['decode', 'issue', 'combine', 'draw', 'queue'].forEach(
-                function(name) {
+        ['decode', 'issue', 'alloc', 'buf', 'copy', 'combine', 'draw',
+                'queue'].forEach(function(name) {
             lines.push('  ' + (name + '     ').slice(0, 8)
                     + 'chroma ' + one(stats[name + ':chroma'])
                     + '  |  luma ' + one(stats[name + ':luma']));
@@ -1872,8 +1872,19 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 throw new Error('decoded frame is ' + (format || 'an unknown'
                         + ' format') + ', which carries no YUV planes');
 
+            /* Timed apart, because `issue` measures all three and only one
+             * of them can be fixed. allocationSize() may force a GPU-backed
+             * frame to be mapped; acquireBuffer() zero-fills several
+             * megabytes on a pool miss; copyTo()'s synchronous prologue does
+             * the D3D11 array-texture copy and staging map. */
+            var allocAt = nowMs();
             size = frame.allocationSize(options);
+
+            var bufAt = nowMs();
+            recordStat('alloc', view !== 0, bufAt - allocAt);
+
             buffer = acquireBuffer(size);
+            recordStat('buf', view !== 0, nowMs() - bufAt);
 
         } catch (e) {
 
@@ -1897,11 +1908,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         /* Issued here rather than inside the chain, so that the two views of
          * a picture are in flight at once; only what follows is ordered. */
         var copy;
+        var copyAt = nowMs();
         try {
             copy = frame.copyTo(buffer, options);
         } catch (e) {
             copy = Promise.reject(e);
         }
+
+        /* The synchronous half of copyTo(). `read-back wait` times the
+         * promise, which is why the transfer looked free: by the time the
+         * promise is awaited the blocking work is already done. */
+        recordStat('copy', view !== 0, nowMs() - copyAt);
 
         /* The chain below is this copy's real error handler, but it may not
          * attach for some time, and a rejection with nothing attached yet is
