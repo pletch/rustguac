@@ -136,6 +136,31 @@
 //! is not a coincidence: both encoders have to keep two views from predicting
 //! through each other, and the H.264 tools for doing so are few.
 //!
+//! # What it costs, and the IDR that is still open
+//!
+//! Re-measured on Windows with the byte counters, 201 access units: the
+//! auxiliary view is **13% of the H.264 payload** (559 KiB against main's
+//! 3443 KiB, 27 pictures against 174). Not half, which is what this module
+//! and `CLAUDE.md` both assumed before anyone counted. Windows sends chroma
+//! sparsely, so dropping it is a real saving and a modest one, and the
+//! proportion moves with the workload — an earlier capture ran 61 auxiliary
+//! pictures in 200.
+//!
+//! One thing is unresolved, and it came out of an odd `frame_num` delta.
+//! **Auxiliary views send IDRs too.** An IDR with `long_term_reference_flag`
+//! set marks every other reference unused and claims `LongTermFrameIdx` 0
+//! (8.2.5.1), so immediately after an auxiliary IDR the picture at long-term 0
+//! is chroma — and the capture shows a main slice naming long-term 0 right
+//! there. Either that is main predicting from chroma across a keyframe
+//! boundary, or the view attribution at those points is wrong; the counter
+//! above is what tells them apart. Dropping an auxiliary IDR would also remove
+//! a decoded picture buffer reset the surviving stream is written against,
+//! which is a separate problem from the reference itself.
+//!
+//! Two supporting oddities: Windows' auxiliary slices claim index 1 with
+//! `mmco` 6 but never send the `mmco` 4 that raises `MaxLongTermFrameIdx`
+//! above the 0 an IDR leaves behind, while xrdp sends both, in that order.
+//!
 //! # What this is
 //!
 //! A probe, not a feature. It is off unless `RUSTGUAC_H264_NAL_PROBE` is set,
@@ -298,6 +323,16 @@ struct Stats {
     num_ref_idx_by_view: [BTreeMap<u32, u64>; 3],
     /// Inter slices per view that marked themselves a long-term reference.
     long_term_marked: [u64; 3],
+    /// Main slices naming a long-term picture while the most recent IDR was an
+    /// auxiliary view.
+    ///
+    /// An IDR with `long_term_reference_flag` set marks every other reference
+    /// unused and claims `LongTermFrameIdx` 0 (8.2.5.1), so after an auxiliary
+    /// IDR the picture at long-term 0 is chroma. A main slice naming it there
+    /// is either predicting from chroma or evidence that this reading is
+    /// wrong — and either way, dropping that IDR removes a decoded picture
+    /// buffer reset the surviving stream is written against.
+    main_refs_across_aux_idr: u64,
     /// Auxiliary views arriving with no paired main view ahead of them — an
     /// MS-RDPEGFX LC=2 command, whose only bitstream is chroma.
     ///
@@ -326,6 +361,9 @@ pub struct NalProbe {
     /// Whether the most recent main view declared an auxiliary view to follow,
     /// so one arriving without it can be recognised as a chroma-only command.
     last_main_paired: bool,
+    /// The view of the most recent IDR, which owns long-term index 0 until the
+    /// next one.
+    last_idr_view: Option<u8>,
     next_summary: u64,
 }
 
@@ -356,6 +394,7 @@ impl NalProbe {
             stats: Stats::default(),
             last_main_frame_num: None,
             last_main_paired: false,
+            last_idr_view: None,
             next_summary: FIRST_SUMMARY_AUS,
         }
     }
@@ -601,6 +640,14 @@ impl NalProbe {
                 .entry(slice.num_ref_idx_l0_active)
                 .or_default() += 1;
         }
+        if slice.idr {
+            self.last_idr_view = Some(view);
+        } else if view == 0
+            && self.last_idr_view.is_some_and(|v| v != 0)
+            && slice.list_mods.iter().any(|(idc, _)| *idc == 2)
+        {
+            self.stats.main_refs_across_aux_idr += 1;
+        }
         if slice.mmco.iter().any(|(op, _)| *op == 6) {
             self.stats.long_term_marked[view as usize] += 1;
         }
@@ -643,14 +690,26 @@ impl NalProbe {
                 slice.frame_num,
                 mods,
                 mmco,
-                if slice.long_term_reference {
-                    " long_term_reference"
-                } else if view == 0 && paired {
-                    " paired"
-                } else if chroma_only {
-                    " chroma-only"
-                } else {
-                    ""
+                {
+                    // Joined rather than chosen between: an auxiliary IDR is
+                    // both long-term and chroma-only, and an else-if chain hid
+                    // the second behind the first for exactly the pictures
+                    // that turned out to matter.
+                    let mut flags = Vec::new();
+                    if slice.long_term_reference {
+                        flags.push("long_term_reference");
+                    }
+                    if view == 0 && paired {
+                        flags.push("paired");
+                    }
+                    if chroma_only {
+                        flags.push("chroma-only");
+                    }
+                    if flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", flags.join(" "))
+                    }
                 },
             ));
         }
@@ -783,6 +842,14 @@ impl Stats {
                 .unwrap_or_else(|| "?".into()),
         ));
 
+        if self.main_refs_across_aux_idr > 0 {
+            lines.push(format!(
+                "  main slices naming a long-term picture after an auxiliary \
+                 IDR: {} — an IDR claims long-term 0 and empties the buffer, so \
+                 that names chroma",
+                self.main_refs_across_aux_idr
+            ));
+        }
         lines.push(format!("  VERDICT: {}", self.verdict()));
         lines
     }
@@ -940,6 +1007,23 @@ impl Stats {
 
         // Separate chains. The only thing left is frame_num continuity, since
         // dropping a reference picture leaves a hole where one was expected.
+        if self.main_refs_across_aux_idr > 0 {
+            return format!(
+                "DROPPABLE IN STEADY STATE, NOT ACROSS AN AUXILIARY IDR — the \
+                 two views run on separate long-term reference chains (main \
+                 names {:?}, auxiliary {:?}), but {} main slices name a \
+                 long-term picture while the most recent IDR was an auxiliary \
+                 view. An IDR marks every other reference unused and claims \
+                 long-term index 0, so at those points long-term 0 is the \
+                 auxiliary picture. Dropping it removes a buffer reset the \
+                 surviving stream is written against. {}",
+                main_long_term,
+                aux_long_term,
+                self.main_refs_across_aux_idr,
+                self.frame_num_caveat(main_advances_by_one)
+            );
+        }
+
         format!(
             "DROPPABLE, with one caveat — the two views run on separate \
              long-term reference chains: main names long-term {:?} and the \
@@ -1730,6 +1814,23 @@ mod tests {
         let verdict = stats.verdict();
         assert!(verdict.starts_with("NOT DROPPABLE"), "{}", verdict);
         assert!(verdict.contains("index 0"), "{}", verdict);
+    }
+
+    /// Separate chains are not enough on their own: an auxiliary IDR takes
+    /// long-term 0 with it, and a main slice naming long-term 0 after one is
+    /// naming chroma.
+    #[test]
+    fn a_main_reference_across_an_auxiliary_idr_is_not_steady_state() {
+        let mut stats = windows_shaped_stats();
+        stats.main_refs_across_aux_idr = 2;
+
+        let verdict = stats.verdict();
+        assert!(
+            verdict.starts_with("DROPPABLE IN STEADY STATE, NOT ACROSS"),
+            "{}",
+            verdict
+        );
+        assert!(verdict.contains("claims long-term index 0"), "{}", verdict);
     }
 
     /// The probe is off unless asked for, and that is what keeps it free.
