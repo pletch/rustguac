@@ -308,14 +308,24 @@ Measured on xrdp with glxgears at 2992x1648 once both were fixed: the auxiliary
 copy fell from 29.3ms to 12.6ms, per-picture copy from 22.4ms to 17.0ms, and
 throughput rose from ~30 to ~41 pictures a second.
 
-**Every post-fix xrdp number here was taken with glxgears running**, including
-the 34-93% damage that made the copies expensive -- an animating window a third
-of the screen wide legitimately damages a third of the screen, contiguously.
-There is no post-fix measurement of light typing on xrdp, so nothing here says
-whether ordinary desktop work trips the gate there or bands as cheaply as it
-does on Windows. That is the measurement to take before tuning anything for
-xrdp, and before touching `MAX_CAPTURE_RECTS` in xorgxrdp -- see
-`docs/rdp-h264.md`.
+**Banding is inert on xrdp**, where it took Windows from 77% of the main thread
+to 12-17%. Measured 2026-09-12 at 1920x1080 with light scrolling and reading:
+`banded 0 (0%)`, `damage 98-99%`, on both views, in every window -- so every
+copy reads a whole plane. What protects an xrdp desktop is the picture rate,
+not the banding: 12.2 pictures a second at 15.4ms is an 18.9% share and 3.1 a
+second is 4.2%, both well under the gate, against 39-47 a second while
+scrolling hard.
+
+**The unexplained part is 99% damage at 3.1 pictures a second.** A session that
+quiet damages a cursor blink and a clock. It is not the `MAX_CAPTURE_RECTS`
+extents collapse either, which needs sixteen rects and a near-idle desktop has
+no such thing -- something upstream declares nearly the whole screen for very
+small changes. Not yet conclusive, because the capture included scrolling and
+scrolling legitimately repaints the viewport. **A reading-only capture would
+settle it**, and if damage is still ~98% at 2-3 pictures a second then xrdp's
+damage reporting is where the remaining win is -- see `docs/rdp-h264.md`.
+Earlier xrdp numbers here were all taken with glxgears running, which
+legitimately damages the window it animates.
 
 **`tests/bench` cannot see the dominant cost, by construction.** Its
 `copyTo()` row reads 0.29ms at 1080p against ~14ms in the field, because it
