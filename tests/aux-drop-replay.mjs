@@ -392,6 +392,37 @@ for (const au of accessUnits) {
     k++;
 }
 
+/*
+ * Every access unit carries exactly one picture, so a decoder that emits fewer
+ * pictures than it was fed could not reconstruct some of them. That is a
+ * cleaner answer than any comparison -- and it has to be checked first,
+ * because missing pictures also break the positional alignment below and would
+ * otherwise surface as a difference at an arbitrary index.
+ */
+const fullExpected = accessUnits.length;
+const strippedExpected = accessUnits.filter(
+    (au) => au.view === 0 || au.keyframe).length;
+
+if (fullPics.length !== fullExpected) {
+    console.error(`\nthe UNMODIFIED stream decoded ${fullPics.length} pictures `
+        + `from ${fullExpected} access units. Something is wrong with this `
+        + 'capture or with ffmpeg, not with the drop — no conclusion.');
+    if (!keep) rmSync(dir, { recursive: true, force: true });
+    process.exit(2);
+}
+
+if (strippedPics.length !== strippedExpected) {
+    console.error(`\nNOT SAFE: the stripped stream decoded `
+        + `${strippedPics.length} pictures from ${strippedExpected} access `
+        + `units — ${strippedExpected - strippedPics.length} could not be `
+        + 'reconstructed at all, while the unmodified stream decoded every '
+        + `one of its ${fullExpected}. Main pictures on this host predict from `
+        + 'the auxiliary view.');
+    console.error(keep ? `  intermediates in ${dir}` : '  rerun with --keep to inspect');
+    if (!keep) rmSync(dir, { recursive: true, force: true });
+    process.exit(1);
+}
+
 let compared = 0;
 let firstDifference = null;
 
