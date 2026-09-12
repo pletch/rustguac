@@ -161,6 +161,33 @@
 //! `mmco` 6 but never send the `mmco` 4 that raises `MaxLongTermFrameIdx`
 //! above the 0 an IDR leaves behind, while xrdp sends both, in that order.
 //!
+//! # The answer, and why it argues against building this
+//!
+//! xrdp measured, 2202 access units: main slices activate **two** list-0
+//! entries. With `max_num_ref_frames` 2 the buffer holds one short-term
+//! picture (the previous main view) and one long-term (the previous auxiliary
+//! view), so the default list is exactly `[previous main, auxiliary]` and
+//! index 1 reaches the chroma. Whether a macroblock picks it is below the
+//! slice header. **Unproven, and not decidable from here.**
+//!
+//! The auxiliary view is **41% of the payload** there (12150 KiB against
+//! main's 16966) — 448 pictures against 1754, so each is ~27 KiB against
+//! ~10 KiB, the `CHROMA_INTERVAL` accumulation this repo already documents.
+//! Against Windows' 13%.
+//!
+//! So the drop is provably safe exactly where it is worth least, and worth
+//! most exactly where it is unproven. And on xrdp the question is moot:
+//! `GfxAVC444` can simply be cleared, which is strictly better than dropping
+//! downstream — it removes the same bytes *and* the second decode *and*
+//! guacd's copy and queue work, with no bitstream reasoning at all. The
+//! downstream drop is only needed where that lever fails, which is Windows,
+//! and on Windows it buys 13% in exchange for an SPS rewrite to legalise the
+//! `frame_num` gaps, LC=2 handling, and the auxiliary-IDR question above.
+//!
+//! That is the finding. The probe stays because the reasoning is worth
+//! keeping and re-running costs nothing; the feature it was investigating is
+//! not worth building on this evidence.
+//!
 //! # What this is
 //!
 //! A probe, not a feature. It is off unless `RUSTGUAC_H264_NAL_PROBE` is set,
