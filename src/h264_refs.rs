@@ -109,6 +109,33 @@
 //! flag is one bit in the SPS, and `crate::h264_rewrite` already edits that
 //! structure.
 //!
+//! # xrdp separates the views differently, and the difference matters
+//!
+//! The same day, the xrdp fork: 152 main and 48 auxiliary views, all
+//! reference pictures, and **no reference list modification anywhere**. Main
+//! slices carry no marking either — ordinary short-term references on the
+//! default list — while every auxiliary slice carries `mmco` 4 and 6, setting
+//! the maximum long-term index and marking itself long-term.
+//!
+//! That reaches the same place by the opposite route. A P slice's default
+//! list-0 ordering is the short-term pictures by descending `PicNum` followed
+//! by the long-term ones ascending, so marking each auxiliary picture
+//! long-term lifts it out of the short-term set and puts the previous *main*
+//! view at index 0. Left short-term it would have been the most recent
+//! short-term picture and landed at index 0 itself, which is the fatal case.
+//!
+//! So the deciding number is `num_ref_idx_l0_active_minus1`: with one entry
+//! active, main can only ever reference index 0 and the auxiliary pictures are
+//! unreachable; with more, the list reaches them from index 1 and whether any
+//! macroblock picks one is below the slice header, where this cannot see.
+//! **That field was not recorded in the first captures**, which is why it is
+//! read now — the xrdp verdict is not settled until a capture reports it.
+//!
+//! Two hosts, two schemes, and the one thing they share is that neither leaves
+//! an auxiliary picture where a main slice's first reference would land. That
+//! is not a coincidence: both encoders have to keep two views from predicting
+//! through each other, and the H.264 tools for doing so are few.
+//!
 //! # What this is
 //!
 //! A probe, not a feature. It is off unless `RUSTGUAC_H264_NAL_PROBE` is set,
@@ -192,6 +219,16 @@ struct Slice {
     /// with a `modification_of_pic_nums_idc` of 2.
     mmco: Vec<(u32, u32)>,
     long_term_reference: bool,
+    /// `num_ref_idx_l0_active_minus1 + 1`, the number of list-0 entries a
+    /// macroblock in this slice may index.
+    ///
+    /// It decides whether the default reference list ordering is safe. A P
+    /// slice's default list is the short-term pictures by descending PicNum
+    /// followed by the long-term ones ascending, so an auxiliary picture that
+    /// marked itself long-term sits *after* every short-term picture — out of
+    /// reach entirely when only one entry is active, and addressable from
+    /// index 1 upwards when more are.
+    num_ref_idx_l0_active: u32,
 }
 
 impl Slice {
@@ -257,6 +294,10 @@ struct Stats {
     /// long-term picture and never the other's.
     list_mods_by_view: [BTreeMap<(u32, u32), u64>; 3],
     mmco_by_view: [BTreeMap<(u32, u32), u64>; 3],
+    /// Active list-0 entries per view, over the inter slices that have one.
+    num_ref_idx_by_view: [BTreeMap<u32, u64>; 3],
+    /// Inter slices per view that marked themselves a long-term reference.
+    long_term_marked: [u64; 3],
     /// Auxiliary views arriving with no paired main view ahead of them — an
     /// MS-RDPEGFX LC=2 command, whose only bitstream is chroma.
     ///
@@ -555,6 +596,14 @@ impl NalProbe {
                 .entry(op)
                 .or_default() += 1;
         }
+        if slice.base_type() != 2 && slice.base_type() != 4 {
+            *self.stats.num_ref_idx_by_view[view as usize]
+                .entry(slice.num_ref_idx_l0_active)
+                .or_default() += 1;
+        }
+        if slice.mmco.iter().any(|(op, _)| *op == 6) {
+            self.stats.long_term_marked[view as usize] += 1;
+        }
         for &op in &slice.mmco {
             *self.stats.mmco.entry(op.0).or_default() += 1;
             *self.stats.mmco_by_view[view as usize]
@@ -691,6 +740,18 @@ impl Stats {
                     .join(", ")
             ));
         }
+        for (view, counts) in self.num_ref_idx_by_view.iter().enumerate() {
+            if counts.is_empty() {
+                continue;
+            }
+            lines.push(format!(
+                "    {:<6} active list-0 entries: {}  ({} slices marked \
+                 themselves long-term)",
+                view_name(view as u8),
+                histogram(counts),
+                self.long_term_marked[view]
+            ));
+        }
         lines.push(format!(
             "  aux views with no paired main view (LC=2, chroma only): {}",
             self.aux_unpaired
@@ -816,12 +877,58 @@ impl Stats {
                 ));
             }
             if main_long_term.is_empty() && short_term == 0 {
-                reasons.push(
-                    "main slices take the default reference list, whose \
-                     ordering puts the most recently decoded picture — the \
-                     auxiliary view — first"
-                        .into(),
-                );
+                // No reordering anywhere: main takes the default list. Whether
+                // that is safe depends on where the auxiliary pictures sit in
+                // it, and marking them long-term is what moves them out of the
+                // way -- a P slice's default list is the short-term pictures by
+                // descending PicNum first, so an auxiliary picture left
+                // short-term would be the most recent of them and land at
+                // index 0, while one marked long-term sits after every
+                // short-term picture.
+                let aux_inter: u64 = (1..3)
+                    .map(|v| self.views[v].total - self.views[v].idr)
+                    .sum();
+                let aux_long_term_marked: u64 = self.long_term_marked[1] + self.long_term_marked[2];
+                let main_active_entries: u64 = self.num_ref_idx_by_view[0]
+                    .keys()
+                    .copied()
+                    .max()
+                    .unwrap_or(1) as u64;
+
+                if aux_long_term_marked < aux_inter {
+                    reasons.push(format!(
+                        "main slices take the default reference list and only \
+                         {} of {} auxiliary pictures mark themselves long-term, \
+                         so an auxiliary picture is the most recent short-term \
+                         reference and lands at index 0 of it",
+                        aux_long_term_marked, aux_inter
+                    ));
+                } else if main_active_entries > 1 {
+                    return format!(
+                        "UNPROVEN — every auxiliary picture marks itself \
+                         long-term (mmco 6), which moves it behind every \
+                         short-term picture in the default reference list main \
+                         slices use, so index 0 is the previous main view. But \
+                         main slices activate up to {} list-0 entries, and from \
+                         index 1 that list reaches the auxiliary pictures. \
+                         Whether any macroblock actually picks one is below the \
+                         slice header and cannot be read here: decide it by \
+                         lowering the encoder's reference count, or by \
+                         dropping and watching for drift",
+                        main_active_entries
+                    );
+                } else {
+                    return format!(
+                        "DROPPABLE, with one caveat — no slice reorders its \
+                         reference list, but every auxiliary picture marks \
+                         itself long-term (mmco 6), which places it after every \
+                         short-term picture in the default list. Main slices \
+                         activate one list-0 entry, which is therefore always \
+                         the previous main view, so nothing surviving predicts \
+                         from an auxiliary picture. {}",
+                        self.frame_num_caveat(main_advances_by_one)
+                    );
+                }
             }
             return format!(
                 "NOT DROPPABLE as-is — {}. Shedding the auxiliary view \
@@ -833,25 +940,6 @@ impl Stats {
 
         // Separate chains. The only thing left is frame_num continuity, since
         // dropping a reference picture leaves a hole where one was expected.
-        let gaps = if main_advances_by_one {
-            None
-        } else if self.gaps_allowed == Some(true) {
-            Some(
-                "frame_num gaps would open where the auxiliary views were, and \
-                 gaps_in_frame_num_value_allowed_flag is 1, so a decoder is \
-                 required to tolerate them"
-                    .to_string(),
-            )
-        } else {
-            Some(
-                "frame_num gaps would open where the auxiliary views were, and \
-                 gaps_in_frame_num_value_allowed_flag is 0 — so the result is \
-                 not a conforming stream, though the flag is one bit in the SPS \
-                 and h264_rewrite already edits that structure"
-                    .to_string(),
-            )
-        };
-
         format!(
             "DROPPABLE, with one caveat — the two views run on separate \
              long-term reference chains: main names long-term {:?} and the \
@@ -860,10 +948,27 @@ impl Stats {
              from a dropped picture. {}",
             main_long_term,
             aux_long_term,
-            gaps.unwrap_or_else(|| "frame_num stays continuous, so there is no \
-                 caveat at all"
-                .into())
+            self.frame_num_caveat(main_advances_by_one)
         )
+    }
+
+    /// What dropping does to `frame_num`, which is the same question however
+    /// the reference chains are arranged.
+    fn frame_num_caveat(&self, main_advances_by_one: bool) -> String {
+        if main_advances_by_one {
+            return "frame_num stays continuous, so there is no caveat at all".into();
+        }
+        if self.gaps_allowed == Some(true) {
+            return "frame_num gaps would open where the auxiliary views were, \
+                    and gaps_in_frame_num_value_allowed_flag is 1, so a decoder \
+                    is required to tolerate them"
+                .into();
+        }
+        "frame_num gaps would open where the auxiliary views were, and \
+         gaps_in_frame_num_value_allowed_flag is 0 — so the result is not a \
+         conforming stream, though the flag is one bit in the SPS and \
+         h264_rewrite already edits that structure"
+            .into()
     }
 }
 
@@ -1170,6 +1275,7 @@ fn parse_slice(
         list_mods,
         mmco,
         long_term_reference,
+        num_ref_idx_l0_active: num_ref_idx_l0 + 1,
     })
 }
 
@@ -1562,6 +1668,68 @@ mod tests {
         let verdict = stats.verdict();
         assert!(verdict.starts_with("NOT DROPPABLE"), "{}", verdict);
         assert!(verdict.contains("default reference list"), "{}", verdict);
+    }
+
+    /// The statistics an xrdp-fork capture produces: no reordering anywhere,
+    /// and every auxiliary picture marking itself long-term.
+    fn xrdp_shaped_stats() -> Stats {
+        let mut stats = Stats {
+            gaps_allowed: Some(false),
+            ..Default::default()
+        };
+        stats.views[0].total = 152;
+        stats.views[0].reference = 152;
+        stats.views[0].idr = 14;
+        stats.views[2].total = 48;
+        stats.views[2].reference = 48;
+        stats.mmco_by_view[2].insert((4, 1), 48);
+        stats.mmco_by_view[2].insert((6, 0), 48);
+        stats.long_term_marked[2] = 48;
+        stats.num_ref_idx_by_view[0].insert(1, 138);
+        stats.num_ref_idx_by_view[2].insert(1, 48);
+        stats.main_deltas.insert(0, 13);
+        stats.main_deltas.insert(1, 103);
+        stats.main_deltas.insert(2, 35);
+        stats
+    }
+
+    /// The default reference list is safe when the auxiliary pictures have
+    /// moved themselves out of it and only one entry is active.
+    ///
+    /// A P slice's default list is the short-term pictures by descending
+    /// PicNum and then the long-term ones, so `mmco` 6 on every auxiliary
+    /// picture puts the previous main view at index 0.
+    #[test]
+    fn a_long_term_aux_behind_one_active_entry_is_droppable() {
+        let verdict = xrdp_shaped_stats().verdict();
+        assert!(verdict.starts_with("DROPPABLE"), "{}", verdict);
+        assert!(verdict.contains("one list-0 entry"), "{}", verdict);
+    }
+
+    /// With more entries active the same list reaches the auxiliary pictures,
+    /// and whether a macroblock picks one is below the slice header.
+    #[test]
+    fn more_active_entries_leaves_the_default_list_unproven() {
+        let mut stats = xrdp_shaped_stats();
+        stats.num_ref_idx_by_view[0].insert(2, 138);
+
+        let verdict = stats.verdict();
+        assert!(verdict.starts_with("UNPROVEN"), "{}", verdict);
+        assert!(verdict.contains("from index 1"), "{}", verdict);
+    }
+
+    /// An auxiliary picture left short-term is the most recent short-term
+    /// reference, so the default list puts it at index 0 and main predicts
+    /// straight from chroma.
+    #[test]
+    fn a_short_term_aux_on_the_default_list_is_not_droppable() {
+        let mut stats = xrdp_shaped_stats();
+        stats.long_term_marked[2] = 0;
+        stats.mmco_by_view[2].clear();
+
+        let verdict = stats.verdict();
+        assert!(verdict.starts_with("NOT DROPPABLE"), "{}", verdict);
+        assert!(verdict.contains("index 0"), "{}", verdict);
     }
 
     /// The probe is off unless asked for, and that is what keeps it free.
