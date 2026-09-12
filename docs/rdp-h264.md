@@ -411,6 +411,64 @@ in neither `copyWait` nor `combine` and was inside the unexplained window.
 With `decode`, `issue`, `copyWait`, `combine`, `queue` and `paint`, `draw` is
 fully accounted for.
 
+#### Result: it *is* `copyTo()`, in its synchronous half
+
+Measured at 2992x1648 (4.93MP) on a HiDPI laptop against a Windows host,
+hardware decode confirmed (`chrome://media-internals`: `D3D11VideoDecoder`,
+NV12, `kIsPlatformVideoDecoder: true`):
+
+```
+  issue   chroma 28.5  |  luma 34.7
+  alloc   chroma  0.0  |  luma  0.0
+  buf     chroma  0.0  |  luma  0.0
+  copy    chroma 28.5 5.77ms/MP  |  luma 34.6 7.01ms/MP
+  combine chroma  1.5  |  luma  0.9
+  paint   0.01ms/MP
+```
+
+`allocationSize()` and the buffer pool are free. **`copyTo()`'s synchronous
+prologue is the whole of it** -- the D3D11 array-texture copy and staging map,
+blocking, on the main thread. `read-back wait` reads 0.0-0.1ms because it times
+the *promise*, and by the time the promise is awaited the work is already done.
+That is why the transfer looked free for three rounds of this investigation.
+
+Two things follow from the per-megapixel figures. Both views compute to the
+same 4.93MP, so **the AVC444 auxiliary view is a full-size picture**: a paired
+picture reads back 14.8MB, two whole NV12 frames. And at ~101 copies per 5s
+this is **roughly 69% of the main thread**, which is what the rest of the
+pipeline is queueing behind -- `queue` 18-33ms, `draw` 47-62ms, flush 68ms,
+and in a worse window a decode backlog that took `decode` to 617ms before
+draining.
+
+So AVC444 does not cost twice as much because combining is expensive.
+Combining is 0.9-1.6ms. It costs twice as much because it demands a **second
+full-frame GPU-to-CPU readback**, and that readback is the pipeline.
+
+This also vindicates `COMBINE_MAX_PIXELS` while correcting the reasoning behind
+it. The 4MP threshold is right -- this session is 4.93MP and would have
+declined to combine had the measurement not overridden it -- but the cost it
+was set against was the shader and the uploads, which together are under 2ms.
+The real curve is the readback's.
+
+**What is not yet settled** is whether the cost is a transfer or a fixed stall
+per call, because only one framebuffer size has been sampled. 34.6ms for 7.4MB
+is ~214MB/s, which looks like a transfer, but a stable ms/MP at *one* size
+proves nothing about proportionality. Resizing the client and re-reading
+`copy`'s ms/MP settles it: steady means a transfer, rising as the area falls
+means a fixed stall.
+
+If it is a transfer, the fix follows the banding already built everywhere else.
+`copyTo()` accepts a `rect` and is currently handed the whole coded frame every
+picture, while the plane uploads are banded to the damage and the shader is
+scissored to it -- the narrowest stage of the pipeline feeding off the widest.
+Restricting the rect to the damaged rows would cut it in proportion, with the
+v1 auxiliary layout rounding outward to its 16-row bands as `auxV1LumaBands()`
+already does, and a resync still copying everything.
+
+It would transform desktop work and do nothing for full-screen video, which
+damages every row. For video at this resolution the answer stays lever 1 or the
+4MP gate.
+
 ## Colour range
 
 The samples an RDP host sends are **full range**. [MS-RDPEGFX Color
