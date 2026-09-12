@@ -8,7 +8,6 @@ mod drive;
 mod frame_stats;
 mod guacd;
 mod h264_aux_drop;
-mod h264_aux_drop;
 mod h264_refs;
 mod h264_rewrite;
 mod h264_sps;
@@ -39,10 +38,10 @@ use axum::{middleware, Extension, Router};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tower::{Layer, ServiceExt};
 use tower_governor::{
     governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
 };
-use tower::{Layer, ServiceExt};
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
@@ -1256,20 +1255,18 @@ async fn run_server(config: Config, database: Db) {
         // freshness directive, so Chrome caches them heuristically and never
         // revalidates -- a rebuild stays invisible until the cache ages out.
         // asset_cache_control supplies the directive, per request.
-        .fallback_service(
-            axum::middleware::from_fn(asset_cache_control).layer(
-                // ServeDir answers with its own body type; from_fn needs an
-                // axum Response, and the turbofish is what pins down which
-                // request type the mapped service is being taken over.
-                ServiceExt::<axum::http::Request<axum::body::Body>>::map_response(
-                    ServeDir::new(&static_path),
-                    |r| {
-                        use axum::response::IntoResponse;
-                        r.into_response()
-                    },
-                ),
+        .fallback_service(axum::middleware::from_fn(asset_cache_control).layer(
+            // ServeDir answers with its own body type; from_fn needs an
+            // axum Response, and the turbofish is what pins down which
+            // request type the mapped service is being taken over.
+            ServiceExt::<axum::http::Request<axum::body::Body>>::map_response(
+                ServeDir::new(&static_path),
+                |r| {
+                    use axum::response::IntoResponse;
+                    r.into_response()
+                },
             ),
-        );
+        ));
 
     let scheme = if server_tls.is_some() {
         "https"
@@ -1469,8 +1466,7 @@ async fn asset_cache_control(
     // under a versioned URL is a deployment that has gone wrong, and pinning
     // it in the cache until next year would make it outlive its cause.
     let status = response.status();
-    let cacheable =
-        status.is_success() || status == axum::http::StatusCode::NOT_MODIFIED;
+    let cacheable = status.is_success() || status == axum::http::StatusCode::NOT_MODIFIED;
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static(if versioned && cacheable {
@@ -1668,7 +1664,11 @@ mod tests {
             // Traversal, which these paths have no business doing.
             "<script src=\"/../Cargo.toml.js\"></script>",
         ] {
-            assert_eq!(version_assets(html, static_path, &mut hashes), html, "{html}");
+            assert_eq!(
+                version_assets(html, static_path, &mut hashes),
+                html,
+                "{html}"
+            );
         }
     }
 
@@ -1683,7 +1683,10 @@ mod tests {
         assert!(css.chars().all(|c| c.is_ascii_hexdigit()));
         // One entry per distinct URL, hit or miss -- a miss is cached too, so
         // a page full of broken links does not re-stat the disk per reference.
-        assert_eq!(asset_hash("/rustguac.css", static_path, &mut hashes), Some(css));
+        assert_eq!(
+            asset_hash("/rustguac.css", static_path, &mut hashes),
+            Some(css)
+        );
         assert!(asset_hash("/guac/NoSuchFile.js", static_path, &mut hashes).is_none());
         assert_eq!(hashes.len(), 3);
     }

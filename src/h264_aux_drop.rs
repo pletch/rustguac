@@ -64,25 +64,30 @@
 //! 4:4:4 stream and `SessionRecording.js` is unaffected — and before the
 //! colour rewrite and the binary blob splitter.
 //!
-//! `RUSTGUAC_H264_AUX_DROP=0` turns it off, and `=force` extends it to the
-//! streams the headers cannot clear.
+//! `RUSTGUAC_H264_AUX_DROP=0` turns it off; `=strict` narrows it to streams
+//! the slice headers can prove.
 //!
-//! # Forcing
+//! # Unproven is not unsafe, and is dropped from by default
 //!
-//! `Safety::Unproven` is not `Safety::Unsafe`. It means the auxiliary picture
-//! sits in a reference list past the index the encoder is known to use, and
-//! that the slice headers cannot say whether a macroblock reaches it -- the
-//! xrdp fork's shape, where main slices take the default list and activate two
-//! entries because the *auxiliary* slices need two to reach their own chain.
+//! `Safety::Unproven` means the auxiliary picture sits in a reference list
+//! past the index the encoder is known to use, and that the slice headers
+//! cannot say whether a macroblock reaches it. That is the xrdp fork's shape:
+//! main slices take the default list and activate two entries because the
+//! *auxiliary* slices need two to reach their own chain, so main very likely
+//! never uses index 1 -- but "very likely" is not what a header parser can
+//! report.
 //!
-//! `=force` drops on those streams as well. It does **not** extend to
-//! `Unsafe`, which is a stream whose headers say outright that main predicts
-//! from chroma; forcing there would be asking for a broken picture.
+//! It is dropped from anyway, so both hosts are covered by default. What is
+//! never dropped from is `Unsafe`, where the headers say outright that main
+//! predicts from chroma.
 //!
-//! Forcing is for finding out. The two ways to actually settle such a stream
-//! are `tests/aux-drop-replay.mjs`, which strips the auxiliary views from a
-//! recording and compares the decode against the original, and lowering the
-//! encoder's `num_ref_idx_l0_active_minus1` where the encoder is yours.
+//! **So on an unproven stream this is being tried, not proved**, and the
+//! journal says so. The failure it would produce is distinctive: corruption
+//! accumulating between keyframes and clearing at each one. Two things settle
+//! it properly -- `tests/aux-drop-replay.mjs`, which strips the auxiliary
+//! views from a recording and compares the decode against the original, and
+//! lowering the encoder's `num_ref_idx_l0_active_minus1` where the encoder is
+//! yours, which turns the question off at the source.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -109,9 +114,9 @@ enum State {
 /// Removes the auxiliary view from a stream that has proved it can spare it.
 pub struct AuxDropper {
     probe: NalProbe,
-    /// Whether to drop on streams the headers leave `Unproven`. Never extends
-    /// to `Unsafe`.
-    force: bool,
+    /// Whether to drop on streams the headers leave `Unproven`. On by default;
+    /// never extends to `Unsafe`.
+    unproven: bool,
     state: State,
     dropped_streams: HashSet<u32>,
     /// Auxiliary pictures dropped, and the payload bytes they carried.
@@ -126,13 +131,16 @@ pub struct AuxDropper {
 impl AuxDropper {
     pub fn new() -> Self {
         let setting = std::env::var("RUSTGUAC_H264_AUX_DROP").unwrap_or_default();
-        let setting = setting.trim();
-        let enabled = !matches!(setting, "0" | "off" | "false" | "no");
-        let force = matches!(setting, "force" | "unproven");
+        let setting = setting.trim().to_ascii_lowercase();
+        let enabled = !matches!(setting.as_str(), "0" | "off" | "false" | "no");
+        // Unproven streams are dropped from by default, so xrdp is covered as
+        // well as Windows. `strict` restricts it to what the slice headers can
+        // prove, which is Windows alone.
+        let unproven = !matches!(setting.as_str(), "strict" | "proven");
 
         Self {
             probe: NalProbe::for_gating(),
-            force,
+            unproven,
             state: if enabled { State::Deciding } else { State::Off },
             dropped_streams: HashSet::new(),
             dropped_pictures: 0,
@@ -157,17 +165,16 @@ impl AuxDropper {
 
         if self.state == State::Deciding {
             let safety = self.probe.safety();
-            let forced = self.force && safety == Safety::Unproven;
+            let unproven = safety == Safety::Unproven;
 
             match safety {
                 Safety::Undecided => return (Cow::Borrowed(text), lines),
-                Safety::Unproven if !forced => {
+                Safety::Unproven if !self.unproven => {
                     self.state = State::Off;
                     lines.push(format!(
-                        "auxiliary view will NOT be dropped on this stream; the \
-                         slice headers cannot rule out a reference to it, and \
-                         RUSTGUAC_H264_AUX_DROP=force is what says to try \
-                         anyway — {}",
+                        "auxiliary view will NOT be dropped on this stream: \
+                         RUSTGUAC_H264_AUX_DROP is set to strict and the slice \
+                         headers cannot prove this one — {}",
                         self.probe.verdict()
                     ));
                     return (Cow::Borrowed(text), lines);
@@ -176,8 +183,10 @@ impl AuxDropper {
                     self.state = State::Dropping;
                     lines.push(format!(
                         "auxiliary view {} on this stream — {}",
-                        if forced {
-                            "is being dropped BY FORCE, unproven"
+                        if unproven {
+                            "is being dropped, UNPROVEN — the headers cannot \
+                             rule out a reference to it, so watch for drift \
+                             between keyframes"
                         } else {
                             "is being dropped"
                         },
@@ -575,6 +584,13 @@ mod tests {
         let (out, _) = d.process(&text);
         assert!(matches!(out, Cow::Borrowed(_)), "no edit, no copy");
         assert_eq!(out, text.as_str());
+    }
+
+    /// Both hosts are covered by default: an unproven stream is dropped from
+    /// unless the setting says otherwise.
+    #[test]
+    fn unproven_streams_are_dropped_from_by_default() {
+        assert!(AuxDropper::new().unproven, "default covers xrdp too");
     }
 
     /// The env var is the kill switch, and off means never looking.
