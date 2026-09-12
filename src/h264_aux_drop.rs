@@ -136,6 +136,16 @@ pub struct AuxDropper {
     kept_idrs: u64,
     /// Main views whose `<paired>` flag was cleared.
     unpaired: u64,
+    /// Times the in-flight set was cleared wholesale for overflow.
+    ///
+    /// Instrumented rather than assumed. Entries are added when an auxiliary
+    /// view is dropped and removed at its `end`, so the set should hold one or
+    /// two at a time; if an `end` were ever missed they would accumulate, the
+    /// set would be cleared, and the blobs of anything mid-drop would leak
+    /// through as orphans -- an `h264` with no data and no end, which is
+    /// exactly the shape that hangs a client. Nothing has been seen to cause
+    /// it, which is why it is counted rather than worked around.
+    orphan_clears: u64,
 }
 
 impl AuxDropper {
@@ -183,6 +193,7 @@ impl AuxDropper {
             dropped_bytes: 0,
             kept_idrs: 0,
             unpaired: 0,
+            orphan_clears: 0,
             instructed: false,
         }
     }
@@ -269,79 +280,112 @@ impl AuxDropper {
     /// auxiliary view.
     fn filter<'a>(&mut self, text: &'a str) -> Cow<'a, str> {
         let mut out: Option<String> = None;
+        // Start of text not yet copied into `out`.
+        let mut pending = 0usize;
+        let mut pos = 0usize;
 
-        for instr in crate::frame_stats::instruction_starts(text) {
-            let action = self.classify(instr);
+        while pos < text.len() {
+            let start = pos;
 
-            match (&mut out, &action) {
-                // Still identical to the input: nothing copied yet.
-                (None, Action::Keep) => {}
-                (None, _) => {
-                    // First edit in this chunk: copy what came before it.
-                    // `instr` is a suffix of `text`, so its length gives the
-                    // offset of this instruction directly.
-                    let taken = text.len() - instr.len();
-                    let mut buf = String::with_capacity(text.len());
-                    buf.push_str(&text[..taken]);
-                    out = Some(buf);
+            // Only the three opcodes this touches are parsed past their first
+            // element; everything else is stepped over without collecting
+            // anything, which is most of the stream.
+            let Some((opcode, mut next, mut terminator)) = crate::binary_blob::element(text, pos)
+            else {
+                // Malformed or truncated. Copy the remainder verbatim and
+                // stop: a blob that cannot be parsed is passed through, never
+                // dropped, because losing one loses a picture.
+                break;
+            };
+
+            let interesting = matches!(opcode, "h264" | "blob" | "end");
+            let mut args: Vec<&str> = Vec::new();
+
+            while terminator == b',' {
+                let Some((value, after, term)) = crate::binary_blob::element(text, next) else {
+                    // Truncated mid-instruction. Everything from here is
+                    // copied verbatim by the tail below.
+                    next = text.len();
+                    break;
+                };
+                if interesting {
+                    args.push(value);
                 }
-                _ => {}
+                next = after;
+                terminator = term;
             }
 
-            if let Some(buf) = out.as_mut() {
-                match action {
-                    Action::Keep => buf.push_str(instr_slice(instr)),
-                    Action::Drop => {}
-                    Action::Replace(ref s) => buf.push_str(s),
-                }
+            pos = next;
+
+            let action = if interesting {
+                self.classify(opcode, &args)
+            } else {
+                Action::Keep
+            };
+
+            if matches!(action, Action::Keep) {
+                continue;
             }
+
+            // First edit in this chunk: copy everything before it.
+            let buf = out.get_or_insert_with(|| String::with_capacity(text.len()));
+            buf.push_str(&text[pending..start]);
+            if let Action::Replace(ref s) = action {
+                buf.push_str(s);
+            }
+            pending = pos;
         }
 
         match out {
-            Some(buf) => Cow::Owned(buf),
+            Some(mut buf) => {
+                buf.push_str(&text[pending..]);
+                Cow::Owned(buf)
+            }
             None => Cow::Borrowed(text),
         }
     }
 
-    /// What to do with one instruction.
-    fn classify(&mut self, instr: &str) -> Action {
-        if let Some(rest) = instr.strip_prefix("4.h264,") {
-            return self.classify_h264(rest);
-        }
+    /// What to do with one instruction, given its opcode and arguments.
+    fn classify(&mut self, opcode: &str, args: &[&str]) -> Action {
+        match opcode {
+            "h264" => self.classify_h264(args),
 
-        if let Some(rest) = instr.strip_prefix("4.blob,") {
-            if let Some(index) = leading_index(rest) {
-                if self.dropped_streams.contains(&index) {
-                    // Counted from the base64 length rather than by decoding:
-                    // the saving is what is not sent, and that is this.
-                    if let Some(payload) = crate::frame_stats::elements(rest).nth(1) {
-                        self.dropped_bytes += (payload.len() / 4 * 3) as u64;
-                    }
-                    return Action::Drop;
+            "blob" => {
+                let Some(index) = args.first().and_then(|v| v.parse::<u32>().ok()) else {
+                    return Action::Keep;
+                };
+                if !self.dropped_streams.contains(&index) {
+                    return Action::Keep;
                 }
+                // Counted from the base64 length rather than by decoding: the
+                // saving is what is not sent, and that is this.
+                if let Some(payload) = args.get(1) {
+                    self.dropped_bytes += (payload.len() / 4 * 3) as u64;
+                }
+                Action::Drop
             }
-            return Action::Keep;
-        }
 
-        if let Some(rest) = instr.strip_prefix("3.end,") {
-            if let Some(index) = leading_index(rest) {
+            "end" => {
+                let Some(index) = args.first().and_then(|v| v.parse::<u32>().ok()) else {
+                    return Action::Keep;
+                };
                 if self.dropped_streams.remove(&index) {
-                    return Action::Drop;
+                    Action::Drop
+                } else {
+                    Action::Keep
                 }
             }
-            return Action::Keep;
-        }
 
-        Action::Keep
+            _ => Action::Keep,
+        }
     }
 
     /// `h264,<stream>,<layer>,<keyframe>,<x>,<y>,<w>,<h>,<view>,<numrects>,
     /// [<x> <y> <w> <h>]...,<paired>`
-    fn classify_h264(&mut self, rest: &str) -> Action {
+    fn classify_h264(&mut self, args: &[&str]) -> Action {
         // Indices, counted from the first element after the opcode:
         //   0 stream, 1 layer, 2 keyframe, 3 x, 4 y, 5 width, 6 height,
         //   7 view, 8 numrects, then 4 per rect, then paired.
-        let args: Vec<&str> = crate::frame_stats::elements(rest).collect();
         if args.len() < 9 {
             return Action::Keep;
         }
@@ -363,6 +407,7 @@ impl AuxDropper {
             }
             if self.dropped_streams.len() >= MAX_DROPPED_STREAMS {
                 self.dropped_streams.clear();
+                self.orphan_clears += 1;
             }
             self.dropped_streams.insert(index);
             self.dropped_pictures += 1;
@@ -384,10 +429,10 @@ impl AuxDropper {
             return Action::Keep;
         }
 
-        let mut args = args;
-        args[paired_at] = "0";
+        let mut rewritten = args.to_vec();
+        rewritten[paired_at] = "0";
         self.unpaired += 1;
-        Action::Replace(encode_instruction("h264", &args))
+        Action::Replace(encode_instruction("h264", &rewritten))
     }
 
     /// What the session saved, for the disconnect log.
@@ -397,11 +442,21 @@ impl AuxDropper {
         }
         Some(format!(
             "dropped {} auxiliary pictures ({} KiB), kept {} auxiliary \
-             keyframes, unpaired {} main views",
+             keyframes, unpaired {} main views, {} in flight{}",
             self.dropped_pictures,
             self.dropped_bytes / 1024,
             self.kept_idrs,
-            self.unpaired
+            self.unpaired,
+            self.dropped_streams.len(),
+            if self.orphan_clears > 0 {
+                format!(
+                    ", OVERFLOWED {} times — streams were left in flight and \
+                     their blobs may have leaked through",
+                    self.orphan_clears
+                )
+            } else {
+                String::new()
+            }
         ))
     }
 
@@ -428,42 +483,6 @@ enum Action {
     Keep,
     Drop,
     Replace(String),
-}
-
-/// One instruction, up to and including its terminating `;`.
-///
-/// `instruction_starts` yields a suffix of the chunk rather than a single
-/// instruction, so the terminator has to be found again to copy just this one.
-fn instr_slice(instr: &str) -> &str {
-    match instr.find(';') {
-        Some(_) => {
-            let mut rest = instr;
-            let mut taken = 0;
-            loop {
-                let Some(dot) = rest.find('.') else {
-                    return instr;
-                };
-                let Ok(len) = rest[..dot].parse::<usize>() else {
-                    return instr;
-                };
-                let end = dot + 1 + len;
-                if end >= rest.len() {
-                    return instr;
-                }
-                taken += end + 1;
-                let separator = rest.as_bytes()[end];
-                rest = &rest[end + 1..];
-                if separator == b';' {
-                    return &instr[..taken];
-                }
-            }
-        }
-        None => instr,
-    }
-}
-
-fn leading_index(rest: &str) -> Option<u32> {
-    crate::frame_stats::elements(rest).next()?.parse().ok()
 }
 
 fn encode_instruction(opcode: &str, args: &[&str]) -> String {
@@ -716,6 +735,68 @@ mod tests {
         let (out, _) = d.process(&text);
         assert_eq!(out, text.as_str(), "passes through once stopped");
         assert_eq!(d.dropped_pictures, 1, "and drops nothing more");
+    }
+
+    /// A non-ASCII instruction must not shift the instruction boundaries.
+    ///
+    /// Guacamole element lengths count UTF-16 code units, not bytes. The first
+    /// version of this filter parsed them as bytes, which is identical for
+    /// ASCII and wrong the moment a clipboard, a name or an error string
+    /// carries anything else -- and because this rewrites the wire rather than
+    /// only reading it, a mis-sliced instruction desynchronises the client's
+    /// parser for the rest of the session. The stream has no resynchronisation
+    /// point, so that is a hang rather than a glitch.
+    #[test]
+    fn non_ascii_instructions_do_not_shift_the_boundaries() {
+        for text in [
+            "9.clipboard,1.1,10.text/plain;",
+            // Three characters, six bytes: a byte-length reader stops short.
+            "4.name,3.héé;",
+            // Outside the BMP. guacd counts codepoints when it writes the
+            // length (guac_utf8_strlen), so this is 1 and not the 2 that
+            // Guacamole's Java and JavaScript ends would write from
+            // String.length(). The parser follows the producer, since that is
+            // what is being read here; do not "fix" this to 2.
+            "4.name,1.😀;",
+            "5.error,5.wonky,4.0512;",
+        ] {
+            let mut d = dropping();
+            let aux = h264(9, false, 2, 0, false);
+            let combined = format!("{}{}{}", text, aux, text);
+
+            let (out, _) = d.process(&combined);
+            assert_eq!(
+                out,
+                format!("{}{}", text, text).as_str(),
+                "boundaries shifted around {:?}",
+                text
+            );
+            assert_eq!(d.dropped_pictures, 1, "for {:?}", text);
+        }
+    }
+
+    /// And one that needs no edit is passed through untouched rather than
+    /// re-encoded, so a chunk of clipboard traffic costs nothing.
+    #[test]
+    fn non_ascii_with_nothing_to_drop_is_not_copied() {
+        let mut d = dropping();
+        let text = "9.clipboard,1.1,10.text/plain;4.blob,1.1,8.w6nDqcOp;3.end,1.1;";
+
+        let (out, _) = d.process(text);
+        assert!(matches!(out, Cow::Borrowed(_)), "no edit, no copy");
+        assert_eq!(out, text);
+    }
+
+    /// A blob whose `h264` was never seen belongs to some other stream and is
+    /// not ours to touch.
+    #[test]
+    fn blobs_of_unknown_streams_pass_through() {
+        let mut d = dropping();
+        let text = format!("{}{}", blob(77, "YQ=="), end(77));
+
+        let (out, _) = d.process(&text);
+        assert_eq!(out, text.as_str());
+        assert_eq!(d.orphan_clears, 0);
     }
 
     /// The env var is the kill switch, and off means never looking.
