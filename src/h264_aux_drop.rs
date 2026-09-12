@@ -96,11 +96,10 @@ const MAX_DROPPED_STREAMS: usize = 256;
 /// How far the probe's own decision is trusted before the first drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// Accumulating. Everything passes through untouched.
+    /// Accumulating. Everything passes through untouched -- except that every
+    /// SPS is already being given permission to skip frame_num values, so that
+    /// permission is older than any gap could be.
     Deciding,
-    /// Proved safe. SPSes are being rewritten to permit gaps, and the next
-    /// main-view keyframe starts the drop.
-    Armed,
     /// Dropping.
     Dropping,
     /// Proved unsafe, or switched off. Never looks again.
@@ -122,11 +121,6 @@ pub struct AuxDropper {
     kept_idrs: u64,
     /// Main views whose `<paired>` flag was cleared.
     unpaired: u64,
-    /// Set at the keyframe that started the drop, so the caller can say so
-    /// once. Arming and engaging are separated by however long the host takes
-    /// to send its next keyframe, which on a quiet Windows desktop can be a
-    /// long time and is the difference between "will drop" and "is dropping".
-    engaged: bool,
 }
 
 impl AuxDropper {
@@ -145,7 +139,6 @@ impl AuxDropper {
             dropped_bytes: 0,
             kept_idrs: 0,
             unpaired: 0,
-            engaged: false,
         }
     }
 
@@ -180,15 +173,13 @@ impl AuxDropper {
                     return (Cow::Borrowed(text), lines);
                 }
                 Safety::Safe | Safety::Unproven => {
-                    self.state = State::Armed;
+                    self.state = State::Dropping;
                     lines.push(format!(
-                        "auxiliary view {} on this stream; permitting \
-                         frame_num gaps and waiting for a keyframe to start — \
-                         {}",
+                        "auxiliary view {} on this stream — {}",
                         if forced {
                             "is being dropped BY FORCE, unproven"
                         } else {
-                            "can be dropped"
+                            "is being dropped"
                         },
                         self.probe.verdict()
                     ));
@@ -204,12 +195,7 @@ impl AuxDropper {
             }
         }
 
-        let filtered = self.filter(text);
-        if self.engaged {
-            self.engaged = false;
-            lines.push("keyframe reached; auxiliary view is now being dropped".into());
-        }
-        (filtered, lines)
+        (self.filter(text), lines)
     }
 
     /// Rewrites one chunk, borrowing it unchanged when nothing needed doing --
@@ -317,13 +303,6 @@ impl AuxDropper {
             return Action::Drop;
         }
 
-        // A main view. Armed becomes Dropping at the first keyframe, so the
-        // decoder has seen an SPS permitting gaps before the first gap.
-        if self.state == State::Armed && keyframe {
-            self.state = State::Dropping;
-            self.engaged = true;
-        }
-
         if self.state != State::Dropping {
             return Action::Keep;
         }
@@ -361,10 +340,21 @@ impl AuxDropper {
     }
 
     /// Whether an SPS crossing now should be given permission to skip
-    /// `frame_num` values. True from the moment the stream proves itself, so
-    /// the permission is always older than the first gap.
+    /// `frame_num` values.
+    ///
+    /// True from the first instruction of the session, not from the moment the
+    /// stream proves itself. The flag has to be older than the first gap, and
+    /// an SPS only rides a keyframe: Windows sends three in its connect-time
+    /// burst and then can go minutes without one, so waiting to set it meant
+    /// waiting for a keyframe that might never come, with the auxiliary view
+    /// still on the wire the whole time.
+    ///
+    /// Setting it on a stream that never gets dropped from costs nothing. The
+    /// flag only permits a decoder to infer pictures for `frame_num` values it
+    /// never saw (8.2.5.2); with no gaps in the stream there is nothing to
+    /// infer and nothing behaves differently.
     pub fn wants_frame_num_gaps(&self) -> bool {
-        matches!(self.state, State::Armed | State::Dropping)
+        self.state != State::Off
     }
 }
 
@@ -535,28 +525,39 @@ mod tests {
         assert_eq!(out, text.as_str());
     }
 
-    /// Armed waits for a keyframe, so the decoder has seen an SPS permitting
-    /// gaps before the first gap reaches it.
+    /// Permission to skip frame_num values is asked for from the first
+    /// instruction, not from the moment the stream proves itself.
+    ///
+    /// An SPS only rides a keyframe, and Windows sends three at connect and
+    /// then can go minutes without one — so a flag set at the decision would
+    /// wait for a keyframe that might never come, with the auxiliary view on
+    /// the wire throughout. Setting it on a stream that never gets dropped
+    /// from is inert: it permits inferring pictures for frame_num values never
+    /// seen, and there are none.
     #[test]
-    fn arming_waits_for_a_keyframe() {
+    fn gaps_are_permitted_before_anything_is_decided() {
+        let d = AuxDropper::new();
+        assert_eq!(d.state, State::Deciding);
+        assert!(d.wants_frame_num_gaps(), "from the very first chunk");
+    }
+
+    /// And a stream that proves itself unsafe stops asking, since it will
+    /// never open a gap.
+    #[test]
+    fn a_stream_that_will_not_be_dropped_stops_asking_for_gaps() {
         let mut d = AuxDropper::new();
-        d.state = State::Armed;
+        d.state = State::Off;
+        assert!(!d.wants_frame_num_gaps());
+    }
 
-        let delta = format!(
-            "{}{}",
-            h264(1, false, 0, 0, false),
-            h264(2, false, 2, 0, false)
-        );
-        let (out, _) = d.process(&delta);
-        assert_eq!(out, delta.as_str(), "a delta must not start the drop");
-        assert_eq!(d.dropped_pictures, 0);
-
-        let key = h264(3, true, 0, 0, false);
-        d.process(&key);
-        assert_eq!(d.state, State::Dropping);
-
+    /// Dropping starts as soon as the gate clears, with no keyframe in
+    /// between.
+    #[test]
+    fn dropping_needs_no_keyframe_to_begin() {
+        let mut d = dropping();
         let aux = h264(4, false, 2, 0, false);
         let (out, _) = d.process(&aux);
+
         assert_eq!(out, "", "{}", out);
         assert_eq!(d.dropped_pictures, 1);
     }
