@@ -55,14 +55,15 @@ for (const [file, names] of [
 const align = consts.COPY_BAND_ALIGN;
 
 const scope = {};
-new Function('scope', 'override', 'MAX_CLIP_RECTS', 'COPY_BAND_ALIGN',
-        'COPY_BAND_MAX_SPAN', 'COPY_BAND_MAX_RECTS', 'BAND_LIMIT', `
+new Function('scope', 'override', 'noteBand', 'MAX_CLIP_RECTS',
+        'COPY_BAND_ALIGN', 'COPY_BAND_MAX_SPAN', 'COPY_BAND_MAX_RECTS',
+        'BAND_LIMIT', `
     ${copyBandSrc}
     ${bandsForSrc}
     ${mergeSrc}
     scope.copyBandFor = copyBandFor;
     scope.bandsFor = bandsFor;
-`)(scope, () => undefined, consts.MAX_CLIP_RECTS, align,
+`)(scope, () => undefined, () => {}, consts.MAX_CLIP_RECTS, align,
    consts.COPY_BAND_MAX_SPAN, consts.COPY_BAND_MAX_RECTS, consts.BAND_LIMIT);
 
 const { copyBandFor, bandsFor } = scope;

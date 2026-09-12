@@ -1334,6 +1334,81 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var COPY_BAND_MAX_RECTS = 32;
 
     /**
+     * How the copy band came out, over the reporting window, or null.
+     *
+     * The band is a single bounding span, so scattered damage costs exactly
+     * what solid damage does: two thin rects a thousand rows apart span a
+     * thousand rows. Whether that is worth fixing with multiple copies --
+     * each costs ~2.7ms of fixed stall, so a second one pays only if it skips
+     * more than ~139 rows -- depends entirely on what real damage looks like,
+     * which nothing so far measures.
+     *
+     * `damage` is the rows actually touched, merged; `span` is the rows the
+     * band therefore has to copy. The two being far apart on the declined
+     * copies is the whole case for multi-band, and their being close is the
+     * case for leaving it alone.
+     *
+     * @private
+     */
+    var bandStats = null;
+
+    /**
+     * Records one main view's band outcome. Only under h264CombineLog: the
+     * merged damage total below is cheap but not free, and nothing acts on
+     * these.
+     *
+     * @private
+     */
+    function noteBand(outcome, spanRows, rects, planeH) {
+
+        if (!override('h264CombineLog'))
+            return;
+
+        if (!bandStats)
+            bandStats = { banded: 0, spanSum: 0, damageSum: 0,
+                          whole: 0, tooMany: 0, tooWide: 0,
+                          wideSpanSum: 0, wideDamageSum: 0 };
+
+        /* Merged, so overlapping rects are not counted twice. */
+        var damage = 0;
+        if (rects && rects.length) {
+            var iv = [];
+            for (var i = 0; i < rects.length; i++)
+                iv.push([rects[i].y | 0,
+                        (rects[i].y | 0) + (rects[i].height | 0)]);
+            iv.sort(function(a, b) { return a[0] - b[0]; });
+            var lo = iv[0][0];
+            var hi = iv[0][1];
+            for (var j = 1; j < iv.length; j++) {
+                if (iv[j][0] <= hi)
+                    hi = Math.max(hi, iv[j][1]);
+                else {
+                    damage += hi - lo;
+                    lo = iv[j][0];
+                    hi = iv[j][1];
+                }
+            }
+            damage += hi - lo;
+        }
+
+        if (outcome === 'banded') {
+            bandStats.banded++;
+            bandStats.spanSum += spanRows / planeH;
+            bandStats.damageSum += damage / planeH;
+        }
+        else if (outcome === 'whole')
+            bandStats.whole++;
+        else if (outcome === 'tooMany')
+            bandStats.tooMany++;
+        else {
+            bandStats.tooWide++;
+            bandStats.wideSpanSum += spanRows / planeH;
+            bandStats.wideDamageSum += damage / planeH;
+        }
+
+    }
+
+    /**
      * The rows of a main view that its regions touch, as {y0, h} in plane
      * rows, or null to copy the whole frame.
      *
@@ -1352,9 +1427,18 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     function copyBandFor(rects, planeH) {
 
-        if (override('h264CopyBands') === false || !rects || !rects.length
-                || rects.length > COPY_BAND_MAX_RECTS)
+        if (override('h264CopyBands') === false)
             return null;
+
+        if (!rects || !rects.length) {
+            noteBand('whole', planeH, rects, planeH);
+            return null;
+        }
+
+        if (rects.length > COPY_BAND_MAX_RECTS) {
+            noteBand('tooMany', planeH, rects, planeH);
+            return null;
+        }
 
         var y0 = Infinity;
         var y1 = -Infinity;
@@ -1368,8 +1452,10 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 y1 = bottom;
         }
 
-        if (!isFinite(y0) || y1 <= y0)
+        if (!isFinite(y0) || y1 <= y0) {
+            noteBand('whole', planeH, rects, planeH);
             return null;
+        }
 
         y0 = Math.max(0, Math.floor(y0 / COPY_BAND_ALIGN) * COPY_BAND_ALIGN);
         y1 = Math.min(planeH,
@@ -1378,9 +1464,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         /* Nothing saved, or so much of the plane that the renderer would
          * decline to band the upload -- see COPY_BAND_MAX_SPAN. Either way
          * the whole-plane copy is the simpler and the safer path. */
-        if (y1 <= y0 || (y1 - y0) >= planeH * COPY_BAND_MAX_SPAN)
+        if (y1 <= y0 || (y1 - y0) >= planeH * COPY_BAND_MAX_SPAN) {
+            noteBand('tooWide', y1 - y0, rects, planeH);
             return null;
+        }
 
+        noteBand('banded', y1 - y0, rects, planeH);
         return { y0: y0, h: y1 - y0 };
 
     }
@@ -1480,6 +1569,25 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 + perMP(stats['paintbuf:bitmap'])
                 + '  |  canvas ' + perMP(stats['paintbuf:canvas']));
 
+        if (bandStats) {
+
+            var b = bandStats;
+            var tried = b.banded + b.whole + b.tooMany + b.tooWide;
+            var pct = function(x) { return (100 * x).toFixed(0) + '%'; };
+
+            lines.push('  band    ' + tried + ' main views: banded ' + b.banded
+                    + (tried ? ' (' + pct(b.banded / tried) + ')' : '')
+                    + (b.banded ? ' span ' + pct(b.spanSum / b.banded)
+                        + ' damage ' + pct(b.damageSum / b.banded) : '')
+                    + '  |  declined ' + (b.whole + b.tooMany + b.tooWide)
+                    + ': ' + b.whole + ' no-rects, ' + b.tooMany + ' >'
+                    + COPY_BAND_MAX_RECTS + ' rects, ' + b.tooWide + ' wide'
+                    + (b.tooWide ? ' (span ' + pct(b.wideSpanSum / b.tooWide)
+                        + ' damage ' + pct(b.wideDamageSum / b.tooWide) + ')'
+                        : ''));
+
+        }
+
         var tail = [];
         if (copyWait && copyWait.n)
             tail.push('read-back wait mean '
@@ -1495,6 +1603,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         stats = null;
         copyWait = null;
+        bandStats = null;
         watchdogFires = 0;
         syncTimeouts = 0;
 
