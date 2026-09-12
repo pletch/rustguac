@@ -1290,6 +1290,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var lastPictureSize = null;
 
     /**
+     * The plane size of the last auxiliary view combined, as [w, h], or null.
+     * Tracked apart from the picture's: the v1 layout pads the auxiliary
+     * frame to a multiple of 16 rows, so the two are not the same number.
+     *
+     * @private
+     */
+    var lastAuxSize = null;
+
+    /**
      * Rows are rounded outward to a multiple of this before being copied.
      *
      * Two reasons, neither about correctness -- the bands the renderer uploads
@@ -1359,7 +1368,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *
      * @private
      */
-    function noteBand(outcome, spanRows, rects, planeH) {
+    function noteBand(outcome, spanRows, rects, planeH, isAux) {
 
         if (!override('h264CombineLog'))
             return;
@@ -1368,7 +1377,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             bandStats = { banded: 0, spanSum: 0, damageSum: 0,
                           whole: 0, tooMany: 0, tooWide: 0,
                           wideSpanSum: 0, wideDamageSum: 0,
-                          aux: 0, auxWhole: 0, auxSpanSum: 0,
+                          aux: 0, auxBanded: 0, auxSpanSum: 0,
                           auxDamageSum: 0 };
 
         /* Merged, so overlapping rects are not counted twice. */
@@ -1393,12 +1402,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             damage += hi - lo;
         }
 
-        if (outcome === 'aux') {
+        if (isAux) {
             bandStats.aux++;
-            bandStats.auxSpanSum += spanRows / planeH;
-            bandStats.auxDamageSum += damage / planeH;
-            if (damage >= planeH)
-                bandStats.auxWhole++;
+            if (outcome === 'banded') {
+                bandStats.auxBanded++;
+                bandStats.auxSpanSum += spanRows / planeH;
+                bandStats.auxDamageSum += damage / planeH;
+            }
             return;
         }
 
@@ -1436,18 +1446,18 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *
      * @private
      */
-    function copyBandFor(rects, planeH) {
+    function copyBandFor(rects, planeH, isAux) {
 
         if (override('h264CopyBands') === false)
             return null;
 
         if (!rects || !rects.length) {
-            noteBand('whole', planeH, rects, planeH);
+            noteBand('whole', planeH, rects, planeH, isAux);
             return null;
         }
 
         if (rects.length > COPY_BAND_MAX_RECTS) {
-            noteBand('tooMany', planeH, rects, planeH);
+            noteBand('tooMany', planeH, rects, planeH, isAux);
             return null;
         }
 
@@ -1464,7 +1474,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         }
 
         if (!isFinite(y0) || y1 <= y0) {
-            noteBand('whole', planeH, rects, planeH);
+            noteBand('whole', planeH, rects, planeH, isAux);
             return null;
         }
 
@@ -1476,11 +1486,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * decline to band the upload -- see COPY_BAND_MAX_SPAN. Either way
          * the whole-plane copy is the simpler and the safer path. */
         if (y1 <= y0 || (y1 - y0) >= planeH * COPY_BAND_MAX_SPAN) {
-            noteBand('tooWide', y1 - y0, rects, planeH);
+            noteBand('tooWide', y1 - y0, rects, planeH, isAux);
             return null;
         }
 
-        noteBand('banded', y1 - y0, rects, planeH);
+        noteBand('banded', y1 - y0, rects, planeH, isAux);
         return { y0: y0, h: y1 - y0 };
 
     }
@@ -1598,10 +1608,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                         : ''));
 
             if (b.aux)
-                lines.push('          aux ' + b.aux + ' views (not banded):'
-                        + ' span ' + pct(b.auxSpanSum / b.aux)
-                        + ' damage ' + pct(b.auxDamageSum / b.aux)
-                        + ', ' + b.auxWhole + ' whole-frame');
+                lines.push('          aux ' + b.aux + ' views: banded '
+                        + b.auxBanded + ' (' + pct(b.auxBanded / b.aux) + ')'
+                        + (b.auxBanded
+                            ? ' span ' + pct(b.auxSpanSum / b.auxBanded)
+                                + ' damage ' + pct(b.auxDamageSum / b.auxBanded)
+                            : ''));
 
         }
 
@@ -2094,36 +2106,32 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         /* Narrowed to the damaged rows where that is safe: a main view, with
          * regions, whose textures already exist at this size (a resync has to
          * carry every row, and so does the first picture after a resize). */
-        var sameSize = !!lastPictureSize && lastPictureSize[0] === pictureW
-                && lastPictureSize[1] === pictureH;
+        var sameSize = (view === 0)
+            ? (!!lastPictureSize && lastPictureSize[0] === pictureW
+                && lastPictureSize[1] === pictureH)
+            : (!!lastAuxSize && lastAuxSize[0] === planeW
+                && lastAuxSize[1] === planeH);
 
-        var copyBand = (view === 0 && !resyncNeeded && sameSize)
-                ? copyBandFor(frameState.rects, planeH) : null;
-
-        /* An auxiliary view is measured but never banded. Its copy is now the
-         * larger half of what is left -- on a Windows host it is one picture
-         * in two or three, against xrdp's one in nine, and it reads the whole
-         * plane every time -- but its plane rows are not its picture rows:
-         * the v1 layout scatters an output row across 16-row bands, and
-         * Yuv444.js needs auxV1LumaBands() to invert it. Worth building only
-         * if the rects turn out to describe real damage, which is what this
-         * says. xrdp declares a full frame here deliberately; Windows is an
-         * open question. */
-        if (view !== 0 && frameState.rects && frameState.rects.length) {
-            var aY0 = Infinity;
-            var aY1 = -Infinity;
-            for (var ai = 0; ai < frameState.rects.length; ai++) {
-                var aTop = frameState.rects[ai].y | 0;
-                var aBot = aTop + (frameState.rects[ai].height | 0);
-                if (aTop < aY0) aY0 = aTop;
-                if (aBot > aY1) aY1 = aBot;
-            }
-            if (isFinite(aY0) && aY1 > aY0)
-                noteBand('aux', aY1 - aY0, frameState.rects, pictureH);
-        }
+        /* Both views, and the same band arithmetic for each.
+         *
+         * An auxiliary view's plane rows are not its picture rows, but the
+         * rounding already reconciles them: the band is rounded outward to
+         * 16, which is exactly what auxV1LumaBands() does to reach the v1
+         * layout's 16-row bands, and a superset of the v2 layout's
+         * one-to-one rows and of both layouts' chroma rows at y >> 1.
+         * Checked against that inverse in tests/h264-copy-band.mjs rather
+         * than argued from here.
+         *
+         * Worth the care because the auxiliary view is the larger half of
+         * what is left: on a Windows host it is one picture in two or three,
+         * against xrdp's one in nine under CHROMA_INTERVAL=8. */
+        var copyBand = (!resyncNeeded && sameSize)
+                ? copyBandFor(frameState.rects, planeH, view !== 0) : null;
 
         if (view === 0)
             lastPictureSize = [pictureW, pictureH];
+        else
+            lastAuxSize = [planeW, planeH];
 
         var options = copyBand
             ? { rect: { x: 0, y: copyBand.y0,
@@ -2298,8 +2306,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 if (resyncNeeded)
                     combineResynced = true;
 
-                renderer.uploadAux(y, u, v, strides, planeW, planeH, view,
-                        resyncNeeded ? null : frameState.rects);
+                if (!renderer.uploadAux(y, u, v, strides, planeW, planeH,
+                        view, resyncNeeded ? null : frameState.rects,
+                        copyBand ? copyBand.y0 : undefined)) {
+                    resyncNeeded = true;
+                    lastAuxSize = null;
+                    return;
+                }
 
             }
 

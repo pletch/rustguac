@@ -30,11 +30,13 @@ function lift(file, name, start) {
 }
 
 const copyBandSrc = lift('../static/guac/H264Decoder.js', 'copyBandFor',
-        'function copyBandFor(rects, planeH)');
+        'function copyBandFor(rects, planeH, isAux)');
 const bandsForSrc = lift('../static/guac/Yuv444.js', 'bandsFor',
         'function bandsFor(rects, shift, planeHeight)');
 const mergeSrc = lift('../static/guac/Yuv444.js', 'merge',
         'function merge(bands, planeHeight)');
+const auxV1Src = lift('../static/guac/Yuv444.js', 'auxV1LumaBands',
+        'function auxV1LumaBands(rects, planeHeight)');
 
 /* Read from the sources too, so changing one cannot quietly leave this test
  * checking the old value. */
@@ -61,12 +63,14 @@ new Function('scope', 'override', 'noteBand', 'MAX_CLIP_RECTS',
     ${copyBandSrc}
     ${bandsForSrc}
     ${mergeSrc}
+    ${auxV1Src}
     scope.copyBandFor = copyBandFor;
     scope.bandsFor = bandsFor;
+    scope.auxV1LumaBands = auxV1LumaBands;
 `)(scope, () => undefined, () => {}, consts.MAX_CLIP_RECTS, align,
    consts.COPY_BAND_MAX_SPAN, consts.COPY_BAND_MAX_RECTS, consts.BAND_LIMIT);
 
-const { copyBandFor, bandsFor } = scope;
+const { copyBandFor, bandsFor, auxV1LumaBands } = scope;
 
 let failures = 0;
 function check(name, ok, detail) {
@@ -122,6 +126,41 @@ for (const [name, rects, planeH] of cases) {
             b => b.y0 >= (y0 >> 1) && b.y1 <= (y1 >> 1));
     check(name + ' covers the chroma bands', chromaOk,
             JSON.stringify(chroma) + ` vs [${y0 >> 1},${y1 >> 1})`);
+}
+
+/* The same band is handed to the auxiliary view, whose plane rows are not
+ * its picture rows. The v1 layout scatters an output row across 16-row bands
+ * and both layouts read their chroma at y >> 1, so the band's outward
+ * rounding to 16 has to cover all three mappings -- reasoned about when this
+ * was written, and checked here so it stays true.
+ *
+ * The aux plane may be taller than the picture: v1 pads to a multiple of 16.
+ */
+for (const [name, rects, planeH] of cases) {
+
+    const band = copyBandFor(rects, planeH, true);
+    if (!band) continue;
+
+    const y0 = band.y0, y1 = band.y0 + band.h;
+
+    const v1 = auxV1LumaBands(rects, planeH);
+    check('aux v1 ' + name + ' bands exist', v1 !== null);
+    check('aux v1 ' + name + ' covered',
+            (v1 || []).every(b => b.y0 >= y0 && b.y1 <= y1),
+            JSON.stringify(v1) + ` vs [${y0},${y1})`);
+
+    const v2 = bandsFor(rects, 0, planeH);
+    check('aux v2 ' + name + ' bands exist', v2 !== null);
+    check('aux v2 ' + name + ' covered',
+            (v2 || []).every(b => b.y0 >= y0 && b.y1 <= y1),
+            JSON.stringify(v2) + ` vs [${y0},${y1})`);
+
+    const halfH = (planeH + 1) >> 1;
+    const ac = bandsFor(rects, 1, halfH);
+    check('aux chroma ' + name + ' covered',
+            (ac || []).every(b => b.y0 >= (y0 >> 1) && b.y1 <= (y1 >> 1)),
+            JSON.stringify(ac) + ` vs [${y0 >> 1},${y1 >> 1})`);
+
 }
 
 /* No regions means the whole picture is valid, and there is nothing to

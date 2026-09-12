@@ -797,11 +797,17 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      *                            region touches depends on it.
      * @param {Array} [rects] - The regions this view updates, in picture
      *                          coordinates, or null for the whole picture.
+     * @param {number} [copyY0] - The plane row the caller's buffer begins at,
+     *                            when it copied only part of the frame out.
+     *                            Absent means whole planes.
+     * @returns {!boolean} False if the planes could not be uploaded from a
+     *                     partial buffer, in which case nothing was written.
      */
-    this.uploadAux = function uploadAux(y, u, v, strides, w, h, layout, rects) {
+    this.uploadAux = function uploadAux(y, u, v, strides, w, h, layout, rects,
+            copyY0) {
 
         if (!renderer.supported)
-            return;
+            return false;
 
         auxWidth = w;
         auxHeight = h;
@@ -820,14 +826,40 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
             : (layout === 2 ? bandsFor(rects, 0, h) : null);
         var chromaBands = layout ? bandsFor(rects, 1, halfH) : null;
 
-        uploadPlane('uAuxY', y, strides[0], w, h, 1, lumaBands);
+        /* As uploadLuma(): a partial buffer can only add rows to textures
+         * that already exist at this shape, and only where there are bands
+         * saying which rows. Checked for every plane before any is written.
+         *
+         * The caller's band covers both plane spaces. Its rows are rounded
+         * outward to 16, which is exactly what auxV1LumaBands() does to reach
+         * the v1 layout's 16-row bands, and a superset of the v2 layout's
+         * one-to-one rows and of both layouts' chroma rows at y >> 1. */
+        var partial = (typeof copyY0 === 'number');
+
+        if (partial && (!lumaBands || !chromaBands
+                || !allocatedAt('uAuxY', w, h, 1)
+                || (auxInterleaved
+                    ? !allocatedAt('uAuxU', halfW, halfH, 2)
+                    : (!allocatedAt('uAuxU', halfW, halfH, 1)
+                        || !allocatedAt('uAuxV', halfW, halfH, 1)))))
+            return false;
+
+        var lumaY0 = partial ? copyY0 : 0;
+        var chromaY0 = partial ? (copyY0 >> 1) : 0;
+
+        uploadPlane('uAuxY', y, strides[0], w, h, 1, lumaBands, lumaY0);
 
         if (auxInterleaved)
-            uploadPlane('uAuxU', u, strides[1], halfW, halfH, 2, chromaBands);
+            uploadPlane('uAuxU', u, strides[1], halfW, halfH, 2, chromaBands,
+                    chromaY0);
         else {
-            uploadPlane('uAuxU', u, strides[1], halfW, halfH, 1, chromaBands);
-            uploadPlane('uAuxV', v, strides[2], halfW, halfH, 1, chromaBands);
+            uploadPlane('uAuxU', u, strides[1], halfW, halfH, 1, chromaBands,
+                    chromaY0);
+            uploadPlane('uAuxV', v, strides[2], halfW, halfH, 1, chromaBands,
+                    chromaY0);
         }
+
+        return true;
 
     };
 
