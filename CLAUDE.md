@@ -316,16 +316,16 @@ not the banding: 12.2 pictures a second at 15.4ms is an 18.9% share and 3.1 a
 second is 4.2%, both well under the gate, against 39-47 a second while
 scrolling hard.
 
-**The unexplained part is 99% damage at 3.1 pictures a second.** A session that
-quiet damages a cursor blink and a clock. It is not the `MAX_CAPTURE_RECTS`
-extents collapse either, which needs sixteen rects and a near-idle desktop has
-no such thing -- something upstream declares nearly the whole screen for very
-small changes. Not yet conclusive, because the capture included scrolling and
-scrolling legitimately repaints the viewport. **A reading-only capture would
-settle it**, and if damage is still ~98% at 2-3 pictures a second then xrdp's
-damage reporting is where the remaining win is -- see `docs/rdp-h264.md`.
-Earlier xrdp numbers here were all taken with glxgears running, which
-legitimately damages the window it animates.
+**That capture was full-screen text scrolling throughout**, including the
+quiet-looking window at 3.1 pictures a second, which is the tail of the scroll
+rather than an idle desktop -- so 98-99% damage is simply correct for it, and
+says nothing about what xrdp declares when little has changed. Earlier xrdp
+numbers here were all taken with glxgears running, which likewise damages the
+window it animates. **There is still no capture of an xrdp desktop that is
+genuinely idle** -- a clock ticking, a cursor blinking, nothing else -- and
+that is the one that would say whether xrdp over-declares damage and whether
+banding could ever fire there. Until it exists, do not read any of these
+damage figures as evidence about `MAX_CAPTURE_RECTS` in xorgxrdp.
 
 **`tests/bench` cannot see the dominant cost, by construction.** Its
 `copyTo()` row reads 0.29ms at 1080p against ~14ms in the field, because it
