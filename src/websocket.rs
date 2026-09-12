@@ -550,6 +550,11 @@ async fn guacd_to_ws(
     // it, which is every host but Windows. See crate::h264_rewrite.
     let mut sps_rewriter = crate::h264_rewrite::SpsRewriter::new();
 
+    // Off unless RUSTGUAC_H264_NAL_PROBE asks for it, and None rather than
+    // disabled when off, so the instruction scan is never entered. See
+    // crate::h264_refs for what it is for.
+    let mut nal_probe = crate::h264_refs::NalProbe::new();
+
     loop {
         let n = guacd.read(&mut buf).await?;
         if n == 0 {
@@ -624,6 +629,15 @@ async fn guacd_to_ws(
         // screen. See FrameStats::observe_h264_colour.
         if let Some(line) = frame_stats.observe_h264_colour(&text) {
             tracing::info!(session_id = %session_id, "H.264 colour: {}", line);
+        }
+
+        // The reference structure of an AVC444 stream, when asked for. Reads
+        // the wire form for the same reason the colour line does: the question
+        // it answers is what the host sent.
+        if let Some(probe) = nal_probe.as_mut() {
+            for line in probe.observe(&text) {
+                tracing::info!(session_id = %session_id, "H.264 NAL probe: {}", line);
+            }
         }
 
         // Splice a colour description into the SPS where the host left one

@@ -118,24 +118,29 @@ impl ColourSignal {
 }
 
 /// Reads bits big-endian, with the exp-Golomb codings the SPS is written in.
-struct BitReader<'a> {
+///
+/// Shared with `crate::h264_refs`, which reads slice headers out of the same
+/// streams: the two parsers walk different syntax structures but the same
+/// bit-level codings, and a second copy of these four methods is a second
+/// place for an off-by-one to live.
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
 
-    fn bit(&mut self) -> Option<u32> {
+    pub(crate) fn bit(&mut self) -> Option<u32> {
         let byte = self.data.get(self.pos >> 3)?;
         let bit = (byte >> (7 - (self.pos & 7))) & 1;
         self.pos += 1;
         Some(u32::from(bit))
     }
 
-    fn bits(&mut self, count: u32) -> Option<u32> {
+    pub(crate) fn bits(&mut self, count: u32) -> Option<u32> {
         // Every field read here is at most 32 bits wide; a wider read is a bug
         // in the caller rather than something to handle.
         debug_assert!(count <= 32);
@@ -147,7 +152,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Unsigned exp-Golomb.
-    fn ue(&mut self) -> Option<u32> {
+    pub(crate) fn ue(&mut self) -> Option<u32> {
         let mut zeros = 0u32;
         while self.bit()? == 0 {
             zeros += 1;
@@ -164,7 +169,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Signed exp-Golomb.
-    fn se(&mut self) -> Option<i32> {
+    pub(crate) fn se(&mut self) -> Option<i32> {
         let k = self.ue()?;
         Some(if k % 2 == 0 {
             -((k / 2) as i32)
@@ -175,7 +180,7 @@ impl<'a> BitReader<'a> {
 }
 
 /// Strips emulation prevention bytes: 00 00 03 in the payload means 00 00.
-fn unescape(nal: &[u8]) -> Vec<u8> {
+pub(crate) fn unescape(nal: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(nal.len());
     let mut i = 0;
     while i < nal.len() {
@@ -222,23 +227,47 @@ enum SpliceSite {
 ///
 /// The position is `None` when the walk never reached that flag, which is the
 /// case for an SPS with no VUI or no `video_signal_type`.
-fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
-    let mut r = BitReader::new(rbsp);
+/// What the SPS says before `log2_max_frame_num_minus4`, for the readers that
+/// need it: `chroma_array_type` sizes the weighted prediction tables a slice
+/// header has to be walked past, and `seq_parameter_set_id` is what a PPS
+/// names.
+pub(crate) struct SpsPrefix {
+    pub(crate) seq_parameter_set_id: u32,
+    pub(crate) chroma_array_type: u32,
+    /// Set only by the 4:4:4 high profiles, and the reason a slice header
+    /// carries a `colour_plane_id`.
+    pub(crate) separate_colour_plane: bool,
+}
 
+/// Walks an SPS RBSP from its first byte up to `log2_max_frame_num_minus4`.
+///
+/// Shared with `crate::h264_refs` rather than copied into it: the high-profile
+/// chroma format and the optional scaling lists are the fiddliest part of the
+/// walk and the part whose cost of drifting is silent — both readers would
+/// still return values, just from the wrong bits.
+pub(crate) fn read_sps_prefix(r: &mut BitReader) -> Option<SpsPrefix> {
     let profile_idc = r.bits(8)?;
     r.bits(8)?; // constraint flags + reserved
     r.bits(8)?; // level_idc
-    r.ue()?; // seq_parameter_set_id
+    let seq_parameter_set_id = r.ue()?;
 
     // The high profiles carry a chroma format and optional scaling lists that
     // have to be walked past to reach the fields below.
+    let mut chroma_array_type = 1;
+    let mut separate_colour_plane = false;
     if matches!(
         profile_idc,
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
     ) {
         let chroma_format_idc = r.ue()?;
+        chroma_array_type = chroma_format_idc;
         if chroma_format_idc == 3 {
-            r.bit()?; // separate_colour_plane_flag
+            // separate_colour_plane_flag: with the planes coded separately
+            // there is no chroma to weight, and ChromaArrayType is 0.
+            separate_colour_plane = r.bit()? == 1;
+            if separate_colour_plane {
+                chroma_array_type = 0;
+            }
         }
         r.ue()?; // bit_depth_luma_minus8
         r.ue()?; // bit_depth_chroma_minus8
@@ -262,6 +291,18 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
             }
         }
     }
+
+    Some(SpsPrefix {
+        seq_parameter_set_id,
+        chroma_array_type,
+        separate_colour_plane,
+    })
+}
+
+fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
+    let mut r = BitReader::new(rbsp);
+
+    read_sps_prefix(&mut r)?;
 
     r.ue()?; // log2_max_frame_num_minus4
     let pic_order_cnt_type = r.ue()?;
@@ -534,7 +575,7 @@ pub fn find_sps_range(annexb: &[u8]) -> Option<std::ops::Range<usize>> {
     None
 }
 
-fn next_start_code(data: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn next_start_code(data: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i + 3 <= data.len() {
         if data[i] == 0 && data[i + 1] == 0 && (data[i + 2] == 1 || data[i + 2] == 3) {
