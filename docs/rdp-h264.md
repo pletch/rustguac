@@ -158,87 +158,86 @@ drops them unused (`docs/xrdp-dpi-scaling.md`), so a session script setting
 `/Gdk/WindowScalingFactor` or `/Xft/DPI` remains the only thing scaling that
 desktop.
 
-### 4:4:4 combining is declined above 4 megapixels
+### When 4:4:4 combining is declined, and when it is given up
 
-An AVC444 stream above `COMBINE_MAX_PIXELS` is decoded but painted at 4:2:0.
-The combine is a plane read-back, six texture uploads and a shader pass per
-picture, all proportional to pixels and all contending with the hardware video
-decoder on the same GPU. From `tests/bench` it costs about **1.37 ms per
-megapixel**:
+An AVC444 stream that is not combined is still decoded; it is painted at 4:2:0,
+from the main view alone. Three things can cause that, in the order they act.
 
-| framebuffer | combine | share of a 60fps frame |
-|---|---|---|
-| 1080p (2.1 MP) | 2.8 ms | 17% |
-| 1440p (3.7 MP) | 5.1 ms | 30% |
-| native HiDPI (5.5 MP) | 7.5 ms | 45% |
-| 4K (8.3 MP) | 11.4 ms | 68% |
+**A prior on framebuffer area** (`COMBINE_MAX_PIXELS`, 4K). A ceiling on the
+worst case a session may open with before anything has been measured, and no
+longer the thing that decides. It was 4MP until 2026-09-12, set against the
+plane uploads and the shader pass; those were later measured at under 2ms
+together, while the cost that matters is not a function of the framebuffer at
+all once the copy is limited to the damaged rows. A 4.93MP Windows session
+doing desktop work copies 3-5% of its planes and spends ~9ms a picture, which
+the old threshold declined outright.
 
-The 5.5 MP row is not theoretical — it showed up as a frame backlog 8-11 deep
-and repeated sync timeouts, with `h264CombineLog` still reporting the combine
-at under a millisecond because it times submission rather than execution.
+**A gate on the measured copy** (`COMBINE_COPY_TRIP_MS`, 16ms -- one frame at
+60Hz). Gives up when the mean *synchronous* copy per picture over a busy 10s
+window exceeds it. `VideoFrame.copyTo()`'s synchronous half is the cost of
+combining -- see the investigation below -- and it is blocking main-thread
+time, so it is both what the user feels and a wall-clock delta that is exact
+and free to measure. Typing at 4.93MP measures ~9ms a picture and full-screen
+video ~42ms; neither is near the line.
 
-**Keyed on framebuffer area rather than the desktop scale**, which was the
-first thing tried and is wrong twice over. The scale only says whether HiDPI
-scaling was applied, so a 4K display at `devicePixelRatio` 1 slips past it and
-combines at the most expensive size there is. And the cost is not a property of
-the host: the same picture costs the same to combine whatever sent it, which is
-why this was taken for an xrdp problem until a Windows session was run at
-native resolution.
+**Two latches beneath both**, on sync-gate timeouts and on slow display
+flushes. Their minimums decide which fires first: the sync-timeout latch has
+none (3 timeouts in 10s), the copy gate needs 30 pictures in its window, the
+flush latch 100 syncs. So a session degraded to a few frames a second -- what
+full-screen video at high resolution does, once every row is damaged and the
+copies go back to whole planes -- is caught by the sync-timeout latch within
+seconds, and by the copy gate at the next window boundary, while the flush
+latch may never reach its minimum.
 
-`?h264Chroma444=on` overrides, `?h264CombineMaxPixels=` moves the line for a
-faster or slower GPU, and the declined case logs once saying why.
+**The area prior is keyed on framebuffer area rather than the desktop scale**,
+which was the first thing tried and is wrong twice over. The scale only says
+whether HiDPI scaling was applied, so a 4K display at `devicePixelRatio` 1
+slips past it. And the cost is not a property of the host: the same picture
+costs the same to combine whatever sent it, which is why this was taken for an
+xrdp problem until a Windows session was run at native resolution.
 
-### And a latch under it, for when the threshold is wrong
+`?h264Chroma444=on` overrides, `?h264CombineMaxPixels=` moves the prior, and
+the declined case logs once saying why. Setting the override disables every
+gate above, since an override is an instruction rather than a preference.
 
-The threshold is a constant measured on one GPU, so it cannot know the client
-it is running on. Under it sits a latch: if the decode backlog stays over
-`MAX_PIPELINE_DEPTH * 3` for two seconds while combining, the session gives up
-combining for good and reports it:
+### Why the gates are latches rather than controllers
 
-```
-Client diagnostic: gave up 4:4:4 combining: 9 frames pending for 2.1s ...
-  event=chroma_suspended
-```
+They are **one-way** on purpose. An earlier version measured the combine
+against a frame budget whose divisor was the observed interval between
+pictures -- which is what `012`'s frame-ack back-pressure has already throttled
+the server to, and that back-pressure reacts to the lag combining causes. It
+read its own output as its input. A latch has no loop.
 
-It gates on the **backlog**, not on the combine's measured cost, because
-measuring GPU execution needs a `gl.finish()` per picture — stalling the
-pipeline the gate protects — or timer queries that are not reliably available.
-A healthy session sits at or below `MAX_PIPELINE_DEPTH`; a drowning one was
-measured in the field at 8–11 with sync timeouts alongside.
-
-It is **one-way** on purpose. An earlier version measured the combine against a
-frame budget whose divisor was the observed interval between pictures — which
-is what `012`'s frame-ack back-pressure has already throttled the server to,
-and that back-pressure reacts to the lag combining causes. It read its own
-output as its input. A latch has no loop.
-
-A backlog caused by something else — a slow link, a struggling decoder — gives
+A trip caused by something else -- a slow link, a struggling decoder -- gives
 up chroma for nothing. That is the accepted cost: a little colour resolution,
-no frames, and `?h264Chroma444=on` brings it back. Setting that override also
-disables the gate entirely, since an override is an instruction rather than a
-preference.
+no frames, and `?h264Chroma444=on` brings it back.
 
-**It resumes once the load passes.** After the backlog has stayed within
-`MAX_PIPELINE_DEPTH` for 30 seconds, combining is tried again
-(`chroma_resumed`), up to three times per session; after the third it stays off
-for good. Tripping during a video and resuming afterwards is the expected
-shape — heavy video is exactly where 4:2:0 chroma costs least and where the
-combine costs most, and reading text afterwards is where the aux stream earns
-its keep.
+**They resume once the load passes.** After the session has stayed *quiet* for
+`COMBINE_RECOVER_MS`, combining is tried again (`chroma_resumed`), up to three
+times per session; after the third it stays off for good. Quiet rather than
+merely clean: 4:2:0 never flushes slowly, so a "clean" test resumed mid-video
+and spent every attempt on the same one. Tripping during a video and resuming
+once it stops is the expected shape -- heavy video is exactly where 4:2:0
+chroma costs least and where the combine costs most, and reading text
+afterwards is where the auxiliary stream earns its keep.
 
 The long recovery window is not about hiding a visible flap; there barely is
 one, since only newly painted regions change chroma resolution. It is about the
-**resync**: the first combine after a gap uploads whole planes rather than
-damaged rows, which is the most expensive kind of combine there is, and
+**resync**: the first combine after a gap copies and uploads whole planes
+rather than damaged rows, which is the most expensive kind there is, and
 delivering that to a client that has only just stopped struggling is how a gate
 makes things worse. Three attempts then draws the line between a desktop that
-had a video playing and a client that simply cannot sustain the combine — sample
-by sample the two look identical, and only time separates them.
+had a video playing and a client that simply cannot sustain the combine --
+sample by sample the two look identical, and only time separates them.
 
-**`h264CombineLog` cannot measure this.** It brackets GPU submission, not
-execution — there is no `gl.finish()` in the render path — and reports the same
-work at under a millisecond. Use `tests/bench`, which forces completion, before
-concluding the combine is cheap.
+**Measuring the combine's GPU work is still the hard part**, and is why the
+latches gate on symptoms. Timing GPU execution needs a `gl.finish()` per
+picture -- stalling the pipeline the gate protects -- or timer queries that are
+not reliably available. `h264CombineLog` now calls `Yuv444Renderer.finish()`
+before stamping, so its `combine` figure is execution rather than submission,
+at the cost of that stall; it is a diagnostic, not something a gate could use.
+None of this applies to `COMBINE_COPY_TRIP_MS`, which times a synchronous call
+on the main thread rather than GPU work.
 
 ### Is it the combine, or the handoff? (investigation)
 
