@@ -104,7 +104,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * that could afford it.
      *
      * So this is now only a ceiling on the worst case a session can open
-     * with, before COMBINE_COPY_TRIP_MS has had a window to measure anything:
+     * with, before COMBINE_COPY_TRIP_SHARE has had a window to measure it:
      * 4K, beyond which even a banded copy's per-call floor and the whole-plane
      * copy of a resync are more than a session should risk unmeasured.
      * Between that and the measured gate, resolution is no longer the
@@ -1075,57 +1075,30 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
     }
 
-    /**
-     * Mean synchronous copy time per picture, in ms, above which a busy
-     * window while combining gives the combine up.
-     *
-     * This is the gate the other two are proxies for. VideoFrame.copyTo()'s
-     * synchronous prologue is the cost of combining -- measured at 5-10ms of
-     * fixed per-call stall plus ~6.5ms per megapixel copied -- and everything
-     * downstream of it, the shader and the uploads and the blit, is under 2ms
-     * together. It is also blocking main-thread time, so it is what the user
-     * feels.
-     *
-     * Deliberately *not* the reason adaptive suspension was abandoned before.
-     * That design failed because timing GPU execution needs a gl.finish() per
-     * picture, stalling the pipeline the gate exists to protect. None of that
-     * applies here: this is a wall-clock delta across a synchronous call,
-     * exact and free, on a path that was already paying it.
-     *
-     * 20ms is a little over one frame at 60Hz. Measured per picture at
-     * 4.93MP: Windows typing 8-12ms, xrdp with glxgears 17ms, full-screen
-     * video copying whole planes ~42ms.
-     *
-     * **Necessary but not sufficient** -- COMBINE_COPY_TRIP_SHARE must also
-     * be exceeded. Per picture alone systematically over-reports on an idle
-     * session, because the per-call cost falls as a session gets busier: part
-     * of it is waiting for the decoder to have a frame ready, which shrinks
-     * when frames are already queued. A near-idle Windows desktop measured
-     * 33-38ms a picture while spending 4.6% of the main thread on copies --
-     * over any threshold worth setting, and the case where 4:4:4 is worth
-     * most and costs least.
-     *
-     * @private
-     * @constant
-     * @type {!number}
-     */
-    var COMBINE_COPY_TRIP_MS = 20;
 
     /**
      * Share of wall clock spent inside copyTo() above which a busy window
-     * while combining gives the combine up, alongside COMBINE_COPY_TRIP_MS.
+     * while combining gives the combine up. **The only copy condition.**
      *
-     * The other half of the pair, and wrong on its own in the opposite
-     * direction: it under-reports once a session has already been throttled
-     * to a crawl, since few pictures cost little however dear each one is.
-     * Per picture catches the latency each frame carries; the share catches
-     * the client becoming the bottleneck. Requiring both is what tells a
-     * desktop that is merely quiet from one that is drowning.
+     * A mean-per-picture threshold sat beside this until 2026-09-12, and both
+     * had to be exceeded. That was wrong, and the case that showed it is the
+     * one this gate most needs to catch: xrdp at 1920x1080 dragging a VS Code
+     * scrollbar ran 39-47 pictures a second at 12ms each -- 46-60% of the main
+     * thread, and drags that lost the scrollbar thumb -- while the per-picture
+     * figure sat under any sane threshold and vetoed the trip. Many cheap
+     * copies is the shape that hurts, and per picture is blind to it by
+     * construction.
      *
-     * Measured shares: Windows idle 4.6%, Windows typing 17-19%, xrdp with
-     * glxgears 70%. 30% sits in the gap with room either side, but it is the
-     * least evidenced constant here -- no capture yet shows a session
-     * genuinely suffering at a share between 20% and 60%.
+     * The near-idle desktop that the per-picture condition was added to
+     * protect (33-38ms a picture) needs no protecting: it spends 4.6% of the
+     * main thread and this declines on its own. Measured shares: Windows idle
+     * 4.6%, Windows typing 17-19%, full-screen video ~45%, xrdp scrolling
+     * 46-60%, xrdp with glxgears 70%. Every one of them lands on the right
+     * side of 30% without help.
+     *
+     * The pathological case per picture would have caught -- one enormous copy
+     * against an otherwise idle session -- is covered: a block long enough to
+     * matter exceeds SYNC_WAIT_TIMEOUT_MS and the sync-timeout latch takes it.
      *
      * @private
      * @constant
@@ -1137,33 +1110,30 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * Mean flush time, in ms, above which a busy window while combining gives
      * the combine up.
      *
-     * **Derived from COMBINE_COPY_TRIP_MS rather than set, because a flush
-     * threshold below the copy threshold can only ever pre-empt it.** A flush
-     * is the display waiting for the decoder, and under combining that wait
-     * is mostly the copy: flush is roughly copy + decode + the display's own
-     * work. So a session sitting exactly at the copy gate's limit flushes at
-     * something above it by construction, and a lower number here fires
-     * first every time -- on a cost the copy gate has already judged
-     * affordable, and without being able to say why.
+     * A flush is the display waiting for the decoder, and under combining
+     * that wait is mostly the copy -- flush is roughly copy + decode + the
+     * display's own work -- so this is the same cost seen from further
+     * downstream, and it is the backstop for congestion the copy share does
+     * not explain.
      *
-     * That is not hypothetical. This was 8ms, measured 2026-09-09 against a
-     * session where 4:2:0 flushed at 0.6ms and 4:4:4 at 16-22ms, when
-     * combining cost 30-60ms a picture. Once both views' copies were banded
-     * the same client ran at ~12ms of copy a picture and flushed at 11.1ms --
-     * healthy by every other measure, 14-22 syncs/s, decode 1-3ms, combine
-     * 0.4ms -- and the old threshold condemned it while the copy gate
-     * correctly held off.
+     * It was 8ms, measured 2026-09-09 when combining cost 30-60ms a picture,
+     * and condemned healthy sessions once the copies were banded: the same
+     * client at ~12ms of copy a picture flushed at 11.1ms with decode 1-3ms
+     * and combine 0.4ms. It was then derived as 1.5x a per-picture copy
+     * threshold, to stop it pre-empting that gate; when the per-picture
+     * condition was removed the derivation lost its anchor and 30ms stayed as
+     * a measured constant.
      *
-     * The multiplier is headroom for the decode and the display work that sit
-     * between the two figures. What this latch is still for is main-thread
-     * congestion the copy does not explain, and for that it has to sit above
-     * the copy gate rather than below it.
+     * 30ms is well evidenced: it is what caught the xrdp VS Code scrolling
+     * case (`mean flush 30.0ms over 128 syncs in 10s`) while the copy gate,
+     * still requiring a per-picture threshold at the time, declined. Roughly
+     * two frames at 60Hz of the display waiting.
      *
      * @private
      * @constant
      * @type {!number}
      */
-    var COMBINE_FLUSH_TRIP_MS = COMBINE_COPY_TRIP_MS * 1.5;
+    var COMBINE_FLUSH_TRIP_MS = 30;
 
 
     /**
@@ -1285,15 +1255,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         var share = span > 0 ? copyMsInWindow / span : 0;
 
-        if (mean > COMBINE_COPY_TRIP_MS && share > COMBINE_COPY_TRIP_SHARE)
-            suspendCombining((probing ? 'probe: mean copy ' : 'mean copy ')
-                    + mean.toFixed(1) + 'ms a picture over ' + pictures
-                    + ' in ' + (span / 1000).toFixed(1) + 's, and '
+        if (share > COMBINE_COPY_TRIP_SHARE)
+            suspendCombining((probing ? 'probe: ' : '')
                     + (share * 100).toFixed(0) + '% of the main thread spent'
-                    + ' copying -- over both the ' + COMBINE_COPY_TRIP_MS
-                    + 'ms a picture and the '
+                    + ' copying, over the '
                     + (COMBINE_COPY_TRIP_SHARE * 100).toFixed(0)
-                    + '% share the combine is worth');
+                    + '% the combine is worth (' + pictures + ' pictures in '
+                    + (span / 1000).toFixed(1) + 's, ' + mean.toFixed(1)
+                    + 'ms each)');
 
     }
 

@@ -189,8 +189,8 @@ all once the copy is limited to the damaged rows. A 4.93MP Windows session
 doing desktop work copies 3-5% of its planes and spends ~9ms a picture, which
 the old threshold declined outright.
 
-**A gate on the measured copy** (`COMBINE_COPY_TRIP_MS`, 20ms a picture, and
-`COMBINE_COPY_TRIP_SHARE`, 30% of wall clock -- both, or it does not fire). Gives up when the mean *synchronous* copy per picture over a busy 10s
+**A gate on the measured copy** (`COMBINE_COPY_TRIP_SHARE`, 30% of wall clock
+spent inside `copyTo()`). Gives up when the mean *synchronous* copy per picture over a busy 10s
 window exceeds it. `VideoFrame.copyTo()`'s synchronous half is the cost of
 combining -- see the investigation below -- and it is blocking main-thread
 time, so it is both what the user feels and a wall-clock delta that is exact
@@ -258,7 +258,7 @@ picture -- stalling the pipeline the gate protects -- or timer queries that are
 not reliably available. `h264CombineLog` now calls `Yuv444Renderer.finish()`
 before stamping, so its `combine` figure is execution rather than submission,
 at the cost of that stall; it is a diagnostic, not something a gate could use.
-None of this applies to `COMBINE_COPY_TRIP_MS`, which times a synchronous call
+None of this applies to `COMBINE_COPY_TRIP_SHARE`, which times synchronous calls
 on the main thread rather than GPU work.
 
 ### Is it the combine, or the handoff? (investigation)
@@ -349,7 +349,7 @@ blocks the main thread, which delays the decoder's output callbacks, which
 inflates decode latency, which is what flush measures -- so combining does
 influence the signal and suspending it does reduce it. The chain is real, just
 indirect. What is true is weaker: the flush latch reads the cost at three
-removes where `COMBINE_COPY_TRIP_MS` reads it directly, and it has the
+removes where `COMBINE_COPY_TRIP_SHARE` reads it directly, and it has the
 strictest minimum of the three latches -- 100 syncs in 10s against the copy
 gate's 30 pictures and the sync-timeout latch's none -- so it is the least
 likely of them to fire first. Subsumed and second-hand, not misdirected, and
@@ -509,21 +509,25 @@ function of framebuffer area, which is all `COMBINE_MAX_PIXELS` could see: at
 4.93MP it declined to combine on sessions costing ~9ms a picture.
 
 So the threshold is now a prior only, raised to 4K, with a measured gate
-underneath: a busy window gives up combining when it exceeds both
-`COMBINE_COPY_TRIP_MS` (20ms a picture) and `COMBINE_COPY_TRIP_SHARE` (30% of
-wall clock inside `copyTo()`).
+underneath: a busy window gives up combining when more than
+`COMBINE_COPY_TRIP_SHARE` (30%) of wall clock goes inside `copyTo()`.
 
-Both, because each is wrong alone. Per picture over-reports on an idle
-session: the per-call cost falls as a session gets busier, since part of it is
-waiting for the decoder to have a frame ready, so a near-idle Windows desktop
-measured 33-38ms a picture while spending 4.6% of the main thread -- over any
-threshold worth setting, in the case where 4:4:4 is worth most and costs
-least. The share is wrong in the opposite direction: it under-reports once a
-session has been throttled to a crawl, since few pictures cost little however
-dear each is. Measured pairs, per picture against share: Windows idle
-33-38ms/4.6%, Windows typing 8-12ms/17-19%, xrdp with glxgears 17ms/70%,
-full-screen video ~42ms/45%. 30% is the least evidenced constant here -- no
-capture yet shows a session genuinely suffering between 20% and 60%.
+**Share, not cost per picture.** A mean-per-picture threshold sat beside this
+until 2026-09-12 and both had to be exceeded, which vetoed the one case the
+gate most needed to catch: xrdp at 1920x1080 dragging a VS Code scrollbar ran
+39-47 pictures a second at 12ms each -- 46-60% of the main thread, and drags
+that lost the scrollbar thumb -- while the per-picture figure sat under any
+sane threshold. Many cheap copies is the shape that hurts, and per picture is
+blind to it by construction.
+
+The near-idle desktop the per-picture condition was added to protect (33-38ms
+a picture, where the per-call cost rises because part of it is waiting for a
+frame to be ready) needs no protecting: it spends 4.6% of the main thread.
+Measured shares -- Windows idle 4.6%, Windows typing 17-19%, full-screen video
+~45%, xrdp scrolling 46-60%, glxgears 70% -- all fall on the right side of 30%
+unaided. And the pathological case per picture would have caught, one enormous
+copy against an otherwise idle session, exceeds `SYNC_WAIT_TIMEOUT_MS`, so the
+sync-timeout latch takes it.
 
 **This is not the mistake adaptive suspension made.** That design failed
 because timing GPU execution needs a `gl.finish()` per picture, stalling the
@@ -619,7 +623,7 @@ any of this.
 gave up 4:4:4 combining: mean flush 11.1ms over 142 syncs in 10s, over the 8ms
 ```
 
-Copy was ~12ms a picture, under `COMBINE_COPY_TRIP_MS`, so the gate
+Copy was ~12ms a picture and well under the share threshold, so the gate
 that measures the cost directly correctly held off -- and the flush latch
 overrode it. `COMBINE_FLUSH_TRIP_MS` was 8ms, set in September when combining
 cost 30-60ms a picture and 4:4:4 flushed at 16-22ms against 4:2:0's 0.6ms.
@@ -629,7 +633,7 @@ is mostly the copy -- flush is roughly copy + decode + the display's own work.
 So **a flush threshold below the copy threshold fires first every time**, by
 construction, on a cost the copy gate has already judged affordable and
 without being able to say why. It is now derived as
-`COMBINE_COPY_TRIP_MS * 1.5`, so the two cannot drift apart again. What the
+30ms, measured rather than derived. What the
 latch is still for is main-thread congestion the copy does not explain, and
 for that it has to sit above the copy gate rather than below it.
 

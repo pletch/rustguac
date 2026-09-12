@@ -353,7 +353,7 @@ and **sync gate timeouts from 2026-09-11**:
   exists to protect -- or timer queries that are not reliably available. A held
   sync ack needs neither and is what the user actually feels. That reasoning
   still holds, and it is exactly why it does **not** apply to
-  `COMBINE_COPY_TRIP_MS` (lever 3): `copyTo()`'s prologue is blocking
+  `COMBINE_COPY_TRIP_SHARE` (lever 3): `copyTo()`'s prologue is blocking
   main-thread time, so timing it is a wall-clock delta across a synchronous
   call -- exact, free, on a path already paying it. The old argument was about
   GPU work, and the dominant cost turned out not to be GPU work.
@@ -491,33 +491,36 @@ three sit at levels the others cannot reach:
    the same load; a drag does not, which is why the thresholds are worth more
    than their frame-rate justification suggests.
 
-   * `COMBINE_COPY_TRIP_MS` **and** `COMBINE_COPY_TRIP_SHARE` together --
-     20ms of synchronous copy per picture *and* 30% of wall clock spent
-     inside `copyTo()`, over a busy window. This is the pair that decides.
-     Each is wrong alone: per picture over-reports on an idle session, where
-     the per-call cost rises because part of it is waiting for a frame to be
-     ready (a near-idle Windows desktop measured 33-38ms a picture at 4.6% of
-     the main thread); the share under-reports once a session has already
-     been throttled to a crawl. Measured pairs: Windows typing 8-12ms/17-19%,
-     xrdp with glxgears 17ms/70%, full-screen video ~42ms/45%.
-   **The flush latch is what caught the first real input case**, and the copy
-   gate did not. Measured 2026-09-12, xrdp at 1920x1080, dragging a VS Code
-   scrollbar: `mean flush 30.0ms over 128 syncs in 10s`, against the derived
-   30ms. Flush is roughly copy plus decode plus display work, so a 30ms flush
-   at 12.8 pictures a second implies ~20-25ms of copy and a ~25-28% share --
-   just under `COMBINE_COPY_TRIP_SHARE`. (Inference from the flush figure, not
-   measured; `h264CombineLog` on the same workload would settle it.)
+   * `COMBINE_COPY_TRIP_SHARE` -- 30% of wall clock spent inside `copyTo()`
+     over a busy window, and **the only copy condition**. A mean-per-picture
+     threshold sat beside it until 2026-09-12, both required; that was wrong,
+     and the case that showed it is the one the gate most needs to catch.
+     xrdp at 1920x1080 dragging a VS Code scrollbar ran 39-47 pictures a
+     second at 12ms each -- 46-60% of the main thread, drags losing the
+     thumb -- while the per-picture figure sat under any sane threshold and
+     vetoed the trip. Many cheap copies is the shape that hurts, and per
+     picture is blind to it. The near-idle desktop it was added to protect
+     (33-38ms a picture) needs no protecting: 4.6% share declines on its own.
+     Measured shares -- Windows idle 4.6%, Windows typing 17-19%, video ~45%,
+     xrdp scrolling 46-60%, glxgears 70% -- all land on the right side of 30%
+     unaided. The pathological case per picture would have caught, one
+     enormous copy against an idle session, exceeds `SYNC_WAIT_TIMEOUT_MS`
+     and the sync-timeout latch takes it.
+   **The flush latch caught the first real input case and the copy gate did
+   not**, which is what removed the per-picture condition. xrdp at 1920x1080,
+   dragging a VS Code scrollbar: `mean flush 30.0ms over 128 syncs in 10s`.
+   **Syncs are not pictures** -- guacd batches several `h264` instructions into
+   one frame, so 12.8 syncs a second was 39-47 pictures a second, and reading
+   the sync rate as the picture rate put the first estimate of this case out by
+   a factor of three in both directions. `h264CombineLog` settled it: 12ms a
+   picture, 46-60% share. The share was never the problem; the per-picture
+   veto was.
 
-   That is the first evidence bearing on the 30% share, and it does not say
-   lower it: Windows typing sits at 17-19% and is healthy, so 20% would trip a
-   session that is fine. The two regimes are a few points apart on share alone,
-   which is the argument for layering rather than against the number.
-
-   **It does expose a gap.** The flush latch needs 100 syncs in 10s and got
-   128. A session at eight a second with a 25% share is caught by neither --
-   the copy gate fails on share, the flush latch on its minimum. Same
-   minimum-rate shape as the copy window that used to be discarded for having
-   too few pictures, and not yet fixed here.
+   **A gap remains.** The flush latch needs 100 syncs in 10s and got 128. A
+   session at eight syncs a second with a 25% share is caught by neither --
+   under the share threshold, under the latch's minimum. Same shape as the copy
+   window that used to be discarded for having too few pictures, and not yet
+   fixed here.
 
    * The sync-timeout and slow-flush latches, as the safety net beneath both.
      Their minimums are what decides which fires: the sync-timeout latch has
@@ -782,9 +785,8 @@ adjustable on the host where a resample is neither.
 
 **4:4:4 combining is declined above 4K** (`COMBINE_MAX_PIXELS` in
 `H264Decoder.js`, overridable as `h264CombineMaxPixels`) **and given up when
-the copy costs too much** (`COMBINE_COPY_TRIP_MS`, 20ms of mean synchronous
-copy per picture, together with `COMBINE_COPY_TRIP_SHARE`, 30% of wall clock
-spent copying -- both, over a busy window).
+the copy costs too much** (`COMBINE_COPY_TRIP_SHARE`, 30% of wall clock spent
+inside `copyTo()` over a busy window).
 
 The threshold was 4MP until 2026-09-12, on the reasoning that the combine is a
 read-back, six texture uploads and a shader pass, all proportional to pixels.

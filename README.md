@@ -127,11 +127,11 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   follows the measured cost rather than the resolution. `COMBINE_MAX_PIXELS`
   (4K) is a prior only, a ceiling on what a session may open with before
   anything has been measured; the combine is given up when a busy window
-  exceeds **both** `COMBINE_COPY_TRIP_MS` (20ms of synchronous copy per
-  picture) and `COMBINE_COPY_TRIP_SHARE` (30% of wall clock spent copying).
-  Each is wrong alone: per picture over-reports on an idle session, where the
-  per-call cost rises because part of it is waiting for a frame to be ready;
-  the share under-reports once a session is already throttled to a crawl.
+  spends more than `COMBINE_COPY_TRIP_SHARE` (30%) of wall clock inside
+  `copyTo()`. Share rather than cost per picture, because many cheap copies
+  is the shape that hurts: a session scrolling at 40+ pictures a second and
+  12ms each is half the main thread, and blocks the thread mouse events
+  arrive on, so drags lose what they are dragging.
   Measuring is legitimate here where it was not for the GPU work: this is a
   wall-clock delta across a synchronous call, not execution needing a
   `gl.finish()` that would stall the pipeline the gate protects. Sync-timeout
