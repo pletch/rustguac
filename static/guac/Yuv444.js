@@ -627,8 +627,15 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      *                          reallocated: the rows outside the bands are
      *                          meant to still hold the previous picture's, and
      *                          a fresh texture holds nothing.
+     * @param {number} [srcY0=0] - The plane row `data` begins at. Non-zero
+     *                             when the caller copied only part of the
+     *                             plane out of the frame, which is the
+     *                             expensive half of this pipeline -- see
+     *                             uploadLuma().
      */
-    function uploadPlane(name, data, stride, w, h, channels, bands) {
+    function uploadPlane(name, data, stride, w, h, channels, bands, srcY0) {
+
+        srcY0 = srcY0 || 0;
 
         channels = channels || 1;
 
@@ -645,6 +652,9 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         gl.pixelStorei(gl.UNPACK_ROW_LENGTH, (stride / channels) | 0);
 
         if (slot.w !== w || slot.h !== h || slot.channels !== channels) {
+            /* Callers with partial data are refused before any upload begins
+             * -- see canUploadPartial() -- so reaching here means data spans
+             * the whole plane. */
             gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0,
                     format, gl.UNSIGNED_BYTE, data);
             slot.w = w;
@@ -663,7 +673,7 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
                 if (rows > 0)
                     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, bands[i].y0, w, rows,
                             format, gl.UNSIGNED_BYTE, data,
-                            bands[i].y0 * stride);
+                            (bands[i].y0 - srcY0) * stride);
             }
         }
 
@@ -673,6 +683,18 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
 
         gl.pixelStorei(gl.UNPACK_ROW_LENGTH, 0);
 
+    }
+
+    /**
+     * Whether a texture is already allocated at the given shape, and so can
+     * take rows without being reallocated from data that does not span it.
+     *
+     * @private
+     */
+    function allocatedAt(name, w, h, channels) {
+        var slot = textures[name];
+        return !!slot && slot.w === w && slot.h === h
+                && slot.channels === channels;
     }
 
     /**
@@ -686,15 +708,19 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
      * @param {!number[]} strides - Bytes per row for [y, u, v].
      * @param {!number} w - Picture width.
      * @param {!number} h - Picture height.
+     * @param {number} [copyY0] - The plane row the caller's buffer begins
+     *                              at, when it copied only part of the frame
+     *                              out. Absent means whole planes.
      * @param {Array} [rects] - The regions this view updates, in picture
      *                          coordinates. Only the rows they touch are
      *                          uploaded; omit, or pass null, to upload the
      *                          whole picture.
      */
-    this.uploadLuma = function uploadLuma(y, u, v, strides, w, h, rects) {
+    this.uploadLuma = function uploadLuma(y, u, v, strides, w, h, rects,
+            copyY0) {
 
         if (!renderer.supported)
-            return;
+            return false;
 
         if (width !== w || height !== h) {
             width = w;
@@ -711,14 +737,44 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         var lumaBands = bandsFor(rects, 0, h);
         var chromaBands = bandsFor(rects, 1, halfH);
 
-        uploadPlane('uLumaY', y, strides[0], w, h, 1, lumaBands);
+        /* A partial copy can only ever add rows to textures that already
+         * exist at this shape: there is nothing to initialise the rows it does
+         * not carry with, and texImage2D from a short buffer is a GL error at
+         * best and a torn picture at worst. Checked for every plane before any
+         * of them is written, so a refusal leaves the textures exactly as they
+         * were and the caller can resync rather than repair.
+         *
+         * The same applies to the bands: without them there is no destination
+         * row to write partial data at. */
+        var partial = (typeof copyY0 === 'number');
+
+        if (partial && (!lumaBands || !chromaBands
+                || !allocatedAt('uLumaY', w, h, 1)
+                || (lumaInterleaved
+                    ? !allocatedAt('uLumaU', halfW, halfH, 2)
+                    : (!allocatedAt('uLumaU', halfW, halfH, 1)
+                        || !allocatedAt('uLumaV', halfW, halfH, 1)))))
+            return false;
+
+        /* Chroma is subsampled vertically, so a luma row origin is a chroma
+         * row origin halved. The caller rounds the copy to even rows so this
+         * cannot land between two. */
+        var lumaY0 = partial ? copyY0 : 0;
+        var chromaY0 = partial ? (copyY0 >> 1) : 0;
+
+        uploadPlane('uLumaY', y, strides[0], w, h, 1, lumaBands, lumaY0);
 
         if (lumaInterleaved)
-            uploadPlane('uLumaU', u, strides[1], halfW, halfH, 2, chromaBands);
+            uploadPlane('uLumaU', u, strides[1], halfW, halfH, 2, chromaBands,
+                    chromaY0);
         else {
-            uploadPlane('uLumaU', u, strides[1], halfW, halfH, 1, chromaBands);
-            uploadPlane('uLumaV', v, strides[2], halfW, halfH, 1, chromaBands);
+            uploadPlane('uLumaU', u, strides[1], halfW, halfH, 1, chromaBands,
+                    chromaY0);
+            uploadPlane('uLumaV', v, strides[2], halfW, halfH, 1, chromaBands,
+                    chromaY0);
         }
+
+        return true;
 
     };
 

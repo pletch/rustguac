@@ -1280,6 +1280,112 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var lastFrameFormat = null;
 
     /**
+     * The picture size of the last main view combined, as [w, h], or null.
+     * A copy narrowed to the damaged rows may only be uploaded into textures
+     * that already exist at the current size, so the first picture at a new
+     * size is copied whole.
+     *
+     * @private
+     */
+    var lastPictureSize = null;
+
+    /**
+     * Rows are rounded outward to a multiple of this before being copied.
+     *
+     * Two reasons, neither about correctness -- the bands the renderer uploads
+     * are computed from the rects independently and are always inside this.
+     * It keeps the number of distinct copy sizes down, so the buffer pool
+     * keeps hitting (it is keyed by exact length, four deep per size), and it
+     * keeps the origin even, which chroma subsampling requires.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_ALIGN = 16;
+
+    /**
+     * The share of the plane a band may span before the whole frame is copied
+     * instead.
+     *
+     * Not a tuning constant -- it keeps the copy and the upload agreeing.
+     * Yuv444.js's merge() gives up and returns no bands at all once the
+     * damage covers BAND_LIMIT (0.75) of a plane, and a partial copy with no
+     * bands to upload it into has to be thrown away and resynced. Half is
+     * comfortably under that for the chroma planes too, which are half the
+     * height and so reach the limit sooner, and by the time damage spans half
+     * the screen the copy saves little anyway.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_MAX_SPAN = 0.5;
+
+    /**
+     * More regions than this and the renderer uploads whole planes, so a
+     * narrowed copy would have nothing to land in. Mirrors MAX_CLIP_RECTS in
+     * Yuv444.js.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_MAX_RECTS = 32;
+
+    /**
+     * The rows of a main view that its regions touch, as {y0, h} in plane
+     * rows, or null to copy the whole frame.
+     *
+     * This is the one stage of the pipeline that was still reading everything.
+     * The plane uploads are banded to the damage and the shader is scissored
+     * to it, but copyTo() was handed the whole coded frame every picture --
+     * and copyTo()'s synchronous half is ~92% area-proportional at roughly
+     * 6.5ms per megapixel, which made it about 70% of the main thread at
+     * 4.93MP. Reading only the damaged rows cuts it in proportion.
+     *
+     * Main views only. An auxiliary view's plane rows are not its picture
+     * rows -- the v1 layout scatters an output row across 16-row bands -- and
+     * at CHROMA_INTERVAL=8 it is one copy in nine, so the risk buys little.
+     *
+     * @private
+     */
+    function copyBandFor(rects, planeH) {
+
+        if (override('h264CopyBands') === false || !rects || !rects.length
+                || rects.length > COPY_BAND_MAX_RECTS)
+            return null;
+
+        var y0 = Infinity;
+        var y1 = -Infinity;
+
+        for (var i = 0; i < rects.length; i++) {
+            var top = rects[i].y | 0;
+            var bottom = top + (rects[i].height | 0);
+            if (top < y0)
+                y0 = top;
+            if (bottom > y1)
+                y1 = bottom;
+        }
+
+        if (!isFinite(y0) || y1 <= y0)
+            return null;
+
+        y0 = Math.max(0, Math.floor(y0 / COPY_BAND_ALIGN) * COPY_BAND_ALIGN);
+        y1 = Math.min(planeH,
+                Math.ceil(y1 / COPY_BAND_ALIGN) * COPY_BAND_ALIGN);
+
+        /* Nothing saved, or so much of the plane that the renderer would
+         * decline to band the upload -- see COPY_BAND_MAX_SPAN. Either way
+         * the whole-plane copy is the simpler and the safer path. */
+        if (y1 <= y0 || (y1 - y0) >= planeH * COPY_BAND_MAX_SPAN)
+            return null;
+
+        return { y0: y0, h: y1 - y0 };
+
+    }
+
+    /**
      * Records one sample against a named stage, split by whether the picture
      * carried an auxiliary view, and reports every few seconds. Cheap enough
      * to leave in the path: one comparison when off.
@@ -1854,14 +1960,30 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * pads the auxiliary view to a multiple of 16 rows and addresses that
          * padding, so cropping to the visible rect would drop rows the combine
          * reads. */
-        var options = rect
-            ? { rect: { x: 0, y: 0, width: rect.width, height: rect.height } }
-            : {};
-
         var planeW = rect ? rect.width : frame.codedWidth;
         var planeH = rect ? rect.height : frame.codedHeight;
         var pictureW = frame.displayWidth;
         var pictureH = frame.displayHeight;
+
+        /* Narrowed to the damaged rows where that is safe: a main view, with
+         * regions, whose textures already exist at this size (a resync has to
+         * carry every row, and so does the first picture after a resize). */
+        var sameSize = !!lastPictureSize && lastPictureSize[0] === pictureW
+                && lastPictureSize[1] === pictureH;
+
+        var copyBand = (view === 0 && !resyncNeeded && sameSize)
+                ? copyBandFor(frameState.rects, planeH) : null;
+
+        if (view === 0)
+            lastPictureSize = [pictureW, pictureH];
+
+        var options = copyBand
+            ? { rect: { x: 0, y: copyBand.y0,
+                        width: planeW, height: copyBand.h } }
+            : (rect
+                ? { rect: { x: 0, y: 0, width: rect.width,
+                            height: rect.height } }
+                : {});
 
         var buffer = null;
         var size = 0;
@@ -1927,7 +2049,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * the thing to reduce is then the number of copies, not their size.
          * The two lead to different fixes, so measure before building
          * either. */
-        recordStat('copy', view !== 0, nowMs() - copyAt, planeW * planeH);
+        recordStat('copy', view !== 0, nowMs() - copyAt,
+                planeW * (copyBand ? copyBand.h : planeH));
 
         /* The chain below is this copy's real error handler, but it may not
          * attach for some time, and a rejection with nothing attached yet is
@@ -2009,8 +2132,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 if (resyncNeeded)
                     combineResynced = true;
 
-                renderer.uploadLuma(y, u, v, strides, pictureW, pictureH,
-                        resyncNeeded ? null : frameState.rects);
+                /* A refusal means nothing was uploaded -- the check happens
+                 * before the first plane is written -- so the textures still
+                 * match the screen and the next picture can carry every row
+                 * rather than this one repairing a half-written state. */
+                if (!renderer.uploadLuma(y, u, v, strides, pictureW, pictureH,
+                        resyncNeeded ? null : frameState.rects,
+                        copyBand ? copyBand.y0 : undefined)) {
+                    resyncNeeded = true;
+                    lastPictureSize = null;
+                    return;
+                }
 
             }
             else {
