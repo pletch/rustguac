@@ -943,26 +943,6 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
-     * Mean flush time, in ms, above which a busy window while combining gives
-     * combining up; the window's length; and the syncs it must hold to count.
-     *
-     * Measured at 1920x1072 on one client, playing the same video against the
-     * xrdp fork: 4:2:0 ran at 54.7 syncs/s with a mean flush of 0.6ms; 4:4:4
-     * at 33-41/s with 16-22ms, and 14ms even at 1920x896. No sync was held and
-     * none timed out in either mode, so the timeout trip could never see it:
-     * the client kept up, it just set a frame rate 40% lower. 8ms sits more
-     * than ten times above the one and well under the other.
-     *
-     * The minimum count keeps a static desktop combining. It sends a few
-     * syncs a second, well under 100 in a window, and its full chroma is what
-     * combining is for; only motion is worth giving it up for.
-     *
-     * @private
-     * @constant
-     */
-    var COMBINE_FLUSH_TRIP_MS = 8;
-
-    /**
      * Mean synchronous copy time per picture, in ms, above which a busy
      * window while combining gives the combine up.
      *
@@ -990,6 +970,39 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @type {!number}
      */
     var COMBINE_COPY_TRIP_MS = 16;
+
+    /**
+     * Mean flush time, in ms, above which a busy window while combining gives
+     * the combine up.
+     *
+     * **Derived from COMBINE_COPY_TRIP_MS rather than set, because a flush
+     * threshold below the copy threshold can only ever pre-empt it.** A flush
+     * is the display waiting for the decoder, and under combining that wait
+     * is mostly the copy: flush is roughly copy + decode + the display's own
+     * work. So a session sitting exactly at the copy gate's limit flushes at
+     * something above it by construction, and a lower number here fires
+     * first every time -- on a cost the copy gate has already judged
+     * affordable, and without being able to say why.
+     *
+     * That is not hypothetical. This was 8ms, measured 2026-09-09 against a
+     * session where 4:2:0 flushed at 0.6ms and 4:4:4 at 16-22ms, when
+     * combining cost 30-60ms a picture. Once both views' copies were banded
+     * the same client ran at ~12ms of copy a picture and flushed at 11.1ms --
+     * healthy by every other measure, 14-22 syncs/s, decode 1-3ms, combine
+     * 0.4ms -- and the old threshold condemned it while the copy gate
+     * correctly held off.
+     *
+     * The multiplier is headroom for the decode and the display work that sit
+     * between the two figures. What this latch is still for is main-thread
+     * congestion the copy does not explain, and for that it has to sit above
+     * the copy gate rather than below it.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_FLUSH_TRIP_MS = COMBINE_COPY_TRIP_MS * 1.5;
+
 
     /**
      * Pictures a window must carry before its mean copy time is acted on.

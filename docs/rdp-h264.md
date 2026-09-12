@@ -565,6 +565,46 @@ sufficient alone:
   rects, a single bounding span is defeated by a clock in the corner. See
   `copyBandsFor()`.
 
+#### The per-call floor, and a threshold that outlived its calibration
+
+Windows, light typing at 4.93MP, both views banded to 3% of their planes, one
+band each (multi-band never fires there -- the rects are tight and
+contiguous):
+
+```
+  copy    chroma 8.1ms 53.71ms/MP  |  luma 8.8ms 59.02ms/MP
+  band    78 main: banded 78 (100%) copied 3% damage 3% in 1.0 bands
+          aux 32 views: banded 32 (100%) copied 3% damage 3% in 1.0 bands
+```
+
+3% of 4.93MP is 0.148MP, which at 6.5ms/MP is under a millisecond of
+transfer. The copies cost 8-12ms. **The per-call floor on this client is
+~8-12ms, not the 2.7ms the two-point fit suggested**, so banding has reached
+its limit: narrowing further buys nothing, and AVC444 costs at least two of
+those floors per paired picture whatever the damage. That is the number to
+design against, and it is a property of the client rather than of the host or
+the resolution.
+
+**And it exposed a stale threshold.** That session suspended combining:
+
+```
+gave up 4:4:4 combining: mean flush 11.1ms over 142 syncs in 10s, over the 8ms
+```
+
+Copy was ~12ms a picture, under `COMBINE_COPY_TRIP_MS` (16ms), so the gate
+that measures the cost directly correctly held off -- and the flush latch
+overrode it. `COMBINE_FLUSH_TRIP_MS` was 8ms, set in September when combining
+cost 30-60ms a picture and 4:4:4 flushed at 16-22ms against 4:2:0's 0.6ms.
+
+A flush is the display waiting for the decoder, and under combining that wait
+is mostly the copy -- flush is roughly copy + decode + the display's own work.
+So **a flush threshold below the copy threshold fires first every time**, by
+construction, on a cost the copy gate has already judged affordable and
+without being able to say why. It is now derived as
+`COMBINE_COPY_TRIP_MS * 1.5`, so the two cannot drift apart again. What the
+latch is still for is main-thread congestion the copy does not explain, and
+for that it has to sit above the copy gate rather than below it.
+
 ## Colour range
 
 The samples an RDP host sends are **full range**. [MS-RDPEGFX Color
