@@ -479,6 +479,18 @@ three sit at levels the others cannot reach:
      may open with before anything has been measured. It was 4MP, set against
      the shader and the uploads, which were later measured at under 2ms
      together; it was declining to combine on sessions costing ~9ms a picture.
+   **What the gate protects is input as much as frame rate**, which was not
+   part of its design. `client.sendMouseState()` runs synchronously in the DOM
+   handler, on the thread `copyTo()` blocks, and the browser coalesces the
+   `mousemove` events that pile up behind it -- so the intermediate positions
+   of a drag are lost, not merely delayed. Observed 2026-09-12 on xrdp at
+   1920x1080: dragging a VS Code scrollbar repeatedly lost the thumb, and
+   stopped doing so the moment the gate suspended combining. Only 2.07MP, but
+   scrolling repaints the whole editor pane, so banding declines and the copies
+   go back to whole planes twice a picture. A video degrades gracefully under
+   the same load; a drag does not, which is why the thresholds are worth more
+   than their frame-rate justification suggests.
+
    * `COMBINE_COPY_TRIP_MS` **and** `COMBINE_COPY_TRIP_SHARE` together --
      20ms of synchronous copy per picture *and* 30% of wall clock spent
      inside `copyTo()`, over a busy window. This is the pair that decides.
