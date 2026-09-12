@@ -206,6 +206,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var combineCleanSince = 0;
 
     /**
+     * Whether the "combining is switched off" note has been made this session.
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var combineDisabledLogged = false;
+
+    /**
      * How long the session must be calm before the next attempt: the base
      * window doubled once per trip so far, capped.
      *
@@ -3305,6 +3313,32 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                         if (chroma444Enabled() && framebufferSettled()
                                 && ensureYuv444())
                             combining = true;
+
+                        /* Say so when a server is sending auxiliary views and
+                         * nothing combines them. An explicit override returns
+                         * from chroma444Enabled() before the decline is
+                         * logged, and the whole apparatus is silent -- which
+                         * reads exactly like a server that never sent AVC444
+                         * at all, and cost an afternoon proving otherwise once
+                         * the wire turned out to be carrying codec 0x000f the
+                         * whole time. Once per session, and only where the
+                         * question can arise. */
+                        else if (!combineDisabledLogged
+                                && override('h264Chroma444') !== undefined) {
+
+                            combineDisabledLogged = true;
+
+                            diagnostic('chroma_off', 'the server is sending '
+                                    + 'AVC444 auxiliary views and 4:4:4 '
+                                    + 'combining is switched off by an '
+                                    + 'explicit h264Chroma444 override, so '
+                                    + 'they are decoded and discarded. Check '
+                                    + 'window.__h264Chroma444 (the entry\'s '
+                                    + '"never combined" setting sets it) and '
+                                    + 'the h264Chroma444 key in localStorage.',
+                                    true);
+
+                        }
 
                         /* Not an image on its own: drawing packed chroma would
                          * paint garbage over the screen. Leave canvas null so

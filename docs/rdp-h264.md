@@ -106,9 +106,26 @@ journalctl -u rustguac-guacd --since '2 min ago' | grep "RDPGFX capability versi
 `display-wrk` near zero in that last output is the sign that passthrough is
 working: it means image encoding is not happening.
 
-In the browser console, `__h264.stats()` reports decoder health —
-`avgDecodeLatencyMs` in the low single digits, `framesDropped` and `gcLeaks` at
-zero, `auxViewsDecoded` counting AVC444 auxiliary views.
+In the browser console, the decoder reports its own state:
+
+```js
+__guac_client._h264Decoder.describeState()
+```
+
+`decoder=configured`, `needsKeyFrame=false`, `pending` and `queue` low,
+`submitted`/`decoded`/`painted` advancing together, and `watchdog=0
+syncTimeouts=0`. **`combining=`** is the one to read for AVC444: `false` while
+the server is sending auxiliary views means they are being decoded and thrown
+away — see the gate, the `chroma_off` note, and the overrides below.
+`holds[...]` carries the session's `sync_hold` totals.
+
+For per-stage timings — decode, the copy and its parts, combine, queue, draw,
+paint, and how the copy banded — set `h264CombineLog` and read the five-second
+report. That is the measurement instrument; `describeState()` is the snapshot.
+
+(There was previously an `__h264.stats()` documented here reporting
+`avgDecodeLatencyMs`, `framesDropped`, `gcLeaks` and `auxViewsDecoded`. No part
+of that survives: neither the global, nor the method, nor any of those fields.)
 
 ## When the whole picture looks soft
 
