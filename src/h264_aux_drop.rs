@@ -799,6 +799,148 @@ mod tests {
         assert_eq!(d.orphan_clears, 0);
     }
 
+    /// Runs the real dropper over a real recording and checks that what comes
+    /// out is a stream a client could follow.
+    ///
+    /// Ignored by default because it needs a capture:
+    ///
+    /// ```text
+    /// RUSTGUAC_AUX_DROP_RECORDING=/tmp/xrdp.guac \
+    ///     cargo test aux_drop_over_a_recording -- --ignored --nocapture
+    /// ```
+    ///
+    /// `tests/aux-drop-replay.mjs` proves the *bitstream* survives the drop;
+    /// it decodes pictures and cannot see the instruction framing at all. This
+    /// is the other half, and the half that hangs a client: an `h264` whose
+    /// blobs never arrive leaves the browser holding an open stream forever,
+    /// and a `blob` for a stream that was never announced is dropped on the
+    /// floor. Neither shows up as corruption -- the display simply stops.
+    ///
+    /// Chunked at several sizes because `guacd_to_ws` hands over whatever one
+    /// read produced, cut at the last instruction boundary, so the filter must
+    /// not care where the cuts fall.
+    #[test]
+    #[ignore]
+    fn aux_drop_over_a_recording() {
+        let Ok(path) = std::env::var("RUSTGUAC_AUX_DROP_RECORDING") else {
+            panic!("set RUSTGUAC_AUX_DROP_RECORDING to a .guac recording");
+        };
+        let recording = std::fs::read_to_string(&path).expect("readable recording");
+
+        for chunk_target in [4096usize, 65536, usize::MAX] {
+            let mut dropper = AuxDropper::for_session(Some(true));
+            let mut output = String::new();
+
+            // Cut on instruction boundaries, as guacd_to_ws does.
+            let mut pos = 0usize;
+            while pos < recording.len() {
+                let mut end = pos;
+                while end < recording.len() {
+                    let Some((_, next, term)) = crate::binary_blob::element(&recording, end) else {
+                        end = recording.len();
+                        break;
+                    };
+                    end = next;
+                    if term == b';' && end - pos >= chunk_target.min(recording.len()) {
+                        break;
+                    }
+                }
+                let (out, _) = dropper.process(&recording[pos..end]);
+                output.push_str(&out);
+                assert!(end > pos, "chunker made no progress at {}", pos);
+                pos = end;
+            }
+
+            // Only H.264 streams are checked: a recording carries clipboard,
+            // image and audio streams too, whose blobs this never announces
+            // and must not touch. Indices are recycled across all of them, so
+            // membership is tracked as the walk goes rather than by index
+            // alone.
+            let mut open: HashSet<u32> = HashSet::new();
+            let mut blobs: std::collections::HashMap<u32, u32> = Default::default();
+            let mut empty = 0u32;
+            let mut reopened = 0u32;
+            let mut instructions = 0u32;
+            let mut h264s = 0u32;
+
+            let mut at = 0usize;
+            while at < output.len() {
+                let Some((opcode, mut next, mut term)) = crate::binary_blob::element(&output, at)
+                else {
+                    panic!(
+                        "chunk {}: output stops parsing at byte {} of {} — the \
+                         client's parser would stop here too",
+                        chunk_target,
+                        at,
+                        output.len()
+                    );
+                };
+                let mut args: Vec<&str> = Vec::new();
+                while term == b',' {
+                    let Some((v, a, t)) = crate::binary_blob::element(&output, next) else {
+                        panic!("chunk {}: truncated instruction at {}", chunk_target, at);
+                    };
+                    args.push(v);
+                    next = a;
+                    term = t;
+                }
+                instructions += 1;
+                assert!(next > at, "verification made no progress at {}", at);
+                at = next;
+
+                let index = args.first().and_then(|v| v.parse::<u32>().ok());
+                match (opcode, index) {
+                    ("h264", Some(i)) => {
+                        h264s += 1;
+                        if !open.insert(i) {
+                            reopened += 1;
+                        }
+                        blobs.insert(i, 0);
+                    }
+                    ("blob", Some(i)) if open.contains(&i) => {
+                        *blobs.entry(i).or_default() += 1;
+                    }
+                    ("end", Some(i))
+                        if open.remove(&i) && blobs.get(&i).copied().unwrap_or(0) == 0 =>
+                    {
+                        empty += 1;
+                    }
+                    _ => {}
+                }
+            }
+
+            println!(
+                "chunk {:>10}: {} instructions out, {} h264, {} dropped \
+                 pictures, {} unpaired, {} in flight",
+                chunk_target,
+                instructions,
+                h264s,
+                dropper.dropped_pictures,
+                dropper.unpaired,
+                dropper.dropped_streams.len()
+            );
+
+            assert_eq!(
+                empty, 0,
+                "chunk {}: an h264 stream was announced and carried no blobs — \
+                 the client opens a stream that never receives data",
+                chunk_target
+            );
+            assert_eq!(
+                reopened, 0,
+                "chunk {}: an h264 index was announced twice without closing",
+                chunk_target
+            );
+            assert_eq!(
+                open.len(),
+                0,
+                "chunk {}: {} h264 streams left open — the client waits forever",
+                chunk_target,
+                open.len()
+            );
+        }
+    }
+
     /// The env var is the kill switch, and off means never looking.
     #[test]
     fn the_kill_switch_disables_it() {
