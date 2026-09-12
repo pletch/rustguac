@@ -205,9 +205,13 @@ pub struct AddressBookEntry {
     /// browser after it has been sent and decoded. This one is the bandwidth
     /// setting; that one is the latency setting.
     ///
-    /// Do not set this true on an xrdp target: measured 2026-09-12, its main
-    /// pictures predict from the auxiliary view, and dropping it left 12 of
-    /// 141 access units undecodable.
+    /// Setting it true skips the gate, so the target has to satisfy what the
+    /// gate would otherwise check: the two views on separate reference chains,
+    /// and a spare slot in `max_num_ref_frames` for the pictures a `frame_num`
+    /// gap obliges the decoder to invent. Both hosts measured in September
+    /// 2026 satisfy it -- Windows always did, and the xrdp fork does from
+    /// `235990e9`, which declares the third slot. An xrdp build older than
+    /// that does not, and froze a session when this was forced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub h264_drop_aux: Option<bool>,
     /// Request the framebuffer in the browser's physical pixels rather than its

@@ -161,42 +161,35 @@
 //! `mmco` 6 but never send the `mmco` 4 that raises `MaxLongTermFrameIdx`
 //! above the 0 an IDR leaves behind, while xrdp sends both, in that order.
 //!
-//! # The answer, and why it argues against building this
+//! # What it costs, and what it took to collect
 //!
-//! xrdp measured, 2202 access units: main slices activate **two** list-0
-//! entries. With `max_num_ref_frames` 2 the buffer holds one short-term
-//! picture (the previous main view) and one long-term (the previous auxiliary
-//! view), so the default list is exactly `[previous main, auxiliary]` and
-//! index 1 reaches the chroma. Whether a macroblock picks it is below the
-//! slice header. **Unproven, and not decidable from here.**
+//! Re-measured with the byte counters: the auxiliary view is **13% of the
+//! H.264 payload** on Windows (559 KiB against main's 3443) and **43% on the
+//! xrdp fork** (780 KiB against 1007), the difference being how often each
+//! host sends chroma. Not half, which is what this module and `CLAUDE.md` both
+//! assumed before anyone counted.
 //!
-//! The auxiliary view is **41% of the payload** there (12150 KiB against
-//! main's 16966) — 448 pictures against 1754, so each is ~27 KiB against
-//! ~10 KiB, the `CHROMA_INTERVAL` accumulation this repo already documents.
-//! Against Windows' 13%.
+//! Getting xrdp there took two goes and a fix at each end. It first read
+//! `Unproven` -- main slices took the default reference list and activated two
+//! entries, so the auxiliary picture was reachable at index 1 -- and forcing
+//! the drop corrupted it, which `tests/aux-drop-replay.mjs` then confirmed
+//! against a recording: 12 of 141 main access units undecodable. The fork
+//! answered with `f42cc481`, putting both views on explicitly named long-term
+//! chains.
 //!
-//! So the drop is provably safe exactly where it is worth least, and worth
-//! most exactly where it is unproven. And on xrdp the question is moot:
-//! `GfxAVC444` can simply be cleared, which is strictly better than dropping
-//! downstream — it removes the same bytes *and* the second decode *and*
-//! guacd's copy and queue work, with no bitstream reasoning at all. The
-//! downstream drop is only needed where that lever fails, which is Windows,
-//! and on Windows it buys 13% in exchange for an SPS rewrite to legalise the
-//! `frame_num` gaps, LC=2 handling, and the auxiliary-IDR question above.
+//! That passed the reference test and still froze, because the reference test
+//! was not the only question. See `no_room_for_inferred_frames`: dropping
+//! leaves holes in `frame_num`, the decoder must invent a short-term picture
+//! for each, and xrdp's `max_num_ref_frames` of 2 was entirely long-term.
+//! `235990e9` declares a third slot, and it works on both hosts.
 //!
-//! That is the finding. The probe stays because the reasoning is worth
-//! keeping and re-running costs nothing; the feature it was investigating is
-//! not worth building on this evidence.
+//! Which is worth stating plainly, because an earlier revision of this file
+//! concluded the feature was not worth building: the drop was provably safe
+//! only where it was worth least, and unproven where it was worth most. That
+//! was true of the encoders as they stood, and stopped being true when the one
+//! encoder we control was changed to suit. The reasoning was sound and the
+//! conclusion was perishable.
 //!
-//! # What this is
-//!
-//! A probe, not a feature. It is off unless `RUSTGUAC_H264_NAL_PROBE` is set,
-//! costs nothing when off, parses only the first few hundred bytes of each
-//! access unit when on, and writes to the journal. It answers the question
-//! against a real host and then its answer decides whether anything is built.
-//!
-//! `RUSTGUAC_H264_NAL_PROBE=1` gives the default 40 per-picture detail lines
-//! and then summaries; a number larger than one sets the detail count.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
