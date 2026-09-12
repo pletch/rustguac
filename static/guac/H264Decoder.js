@@ -2591,14 +2591,6 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * backlog and feed the suspension decision with its own output. */
             var startedAt = nowMs();
 
-            /* Charged here rather than where it was measured, so that the
-             * copy chain's ordering decides which picture it belongs to.
-             * Issue order does not: a picture's auxiliary view is issued
-             * while its main view's copy is still in flight, so accumulating
-             * at the call site would hand one picture's cost to the one
-             * before it. */
-            combineCopyMs += copyElapsed;
-
             if (override('h264CombineLog')) {
                 if (!copyWait)
                     copyWait = { n: 0, sum: 0, max: 0 };
@@ -2616,6 +2608,16 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * charged to the picture before it. */
             if (view === 0)
                 flushCombineCost(false);
+
+            /* Charged after that close-out, not before it, or a main view
+             * hands its own copy to the picture in front of it -- and the
+             * very first one is closed out against an empty picture and
+             * discarded. Charged here rather than where it was measured
+             * because the copy chain's ordering is what says which picture a
+             * copy belongs to: issue order does not, since a picture's
+             * auxiliary view is issued while its main view's copy is still in
+             * flight. */
+            combineCopyMs += copyElapsed;
 
             /* Each band's own plane views and rects. Built for every band
              * before any is uploaded, so that a band whose clipped regions
