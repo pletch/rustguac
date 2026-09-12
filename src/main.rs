@@ -39,6 +39,7 @@ use std::sync::Arc;
 use tower_governor::{
     governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
 };
+use tower::{Layer, ServiceExt};
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
@@ -744,10 +745,22 @@ async fn run_server(config: Config, database: Db) {
         let logo = config.theme.as_ref().and_then(|t| t.logo_url.as_deref());
         let title = &config.site_title;
         let mut pages = std::collections::HashMap::new();
+        // One hash per distinct asset, not per reference: every page links
+        // the same stylesheet and client.html alone carries 36 scripts.
+        let mut hashes = std::collections::HashMap::new();
+        let version_assets_enabled = std::env::var_os("RUSTGUAC_NO_ASSET_VERSIONING").is_none();
+        let mut brand = |html: &str| {
+            let html = rewrite_branding(html, title, logo);
+            if version_assets_enabled {
+                version_assets(&html, &static_path, &mut hashes)
+            } else {
+                html
+            }
+        };
         // Embedded client.html
         pages.insert(
             "client.html".to_string(),
-            rewrite_branding(include_str!("../static/client.html"), title, logo),
+            BrandedPage::new(brand(include_str!("../static/client.html"))),
         );
         // Disk-served HTML pages
         for name in &[
@@ -762,8 +775,14 @@ async fn run_server(config: Config, database: Db) {
         ] {
             let path = std::path::Path::new(&static_path).join(name);
             if let Ok(html) = std::fs::read_to_string(&path) {
-                pages.insert(name.to_string(), rewrite_branding(&html, title, logo));
+                pages.insert(name.to_string(), BrandedPage::new(brand(&html)));
             }
+        }
+        let versioned = hashes.values().filter(|h| h.is_some()).count();
+        if version_assets_enabled {
+            tracing::info!("Content-hashed {} static asset URLs", versioned);
+        } else {
+            tracing::info!("Asset versioning disabled (RUSTGUAC_NO_ASSET_VERSIONING)");
         }
         Arc::new(pages)
     };
@@ -1230,7 +1249,24 @@ async fn run_server(config: Config, database: Db) {
         .layer(Extension(theme_data))
         .layer(Extension(trusted_proxies))
         .layer(Extension(branded_pages))
-        .fallback_service(ServeDir::new(&static_path));
+        // Static assets carry Last-Modified and an ETag from ServeDir but no
+        // freshness directive, so Chrome caches them heuristically and never
+        // revalidates -- a rebuild stays invisible until the cache ages out.
+        // asset_cache_control supplies the directive, per request.
+        .fallback_service(
+            axum::middleware::from_fn(asset_cache_control).layer(
+                // ServeDir answers with its own body type; from_fn needs an
+                // axum Response, and the turbofish is what pins down which
+                // request type the mapped service is being taken over.
+                ServiceExt::<axum::http::Request<axum::body::Body>>::map_response(
+                    ServeDir::new(&static_path),
+                    |r| {
+                        use axum::response::IntoResponse;
+                        r.into_response()
+                    },
+                ),
+            ),
+        );
 
     let scheme = if server_tls.is_some() {
         "https"
@@ -1342,32 +1378,222 @@ fn build_guacd_tls(config: &Config) -> Option<tokio_rustls::TlsConnector> {
     Some(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
 }
 
+/// One pre-branded HTML page and the ETag its bytes hash to.
+///
+/// The pages are branded once at startup and cannot change until a restart,
+/// so the tag is computed there too -- serving one is a string compare.
+struct BrandedPage {
+    html: String,
+    etag: String,
+}
+
+impl BrandedPage {
+    fn new(html: String) -> Self {
+        use sha2::{Digest, Sha256};
+        // Quoted, because an ETag is a quoted-string on the wire. A bare hash
+        // tends to be ignored rather than rejected, which would look exactly
+        // like the stale-cache bug this exists to fix.
+        let etag = format!("\"{}\"", hex::encode(Sha256::digest(html.as_bytes())));
+        Self { html, etag }
+    }
+}
+
+type BrandedPages = Arc<std::collections::HashMap<String, BrandedPage>>;
+
+/// Whether an `If-None-Match` value covers `etag`.
+///
+/// The comparison for `If-None-Match` is the weak one, so a tag a proxy has
+/// weakened to `W/"..."` still matches.
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    if_none_match.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*"
+            || candidate == etag
+            || candidate.strip_prefix("W/").map(str::trim) == Some(etag)
+    })
+}
+
+/// Answer with `page`, or 304 if the client already holds this exact version.
+///
+/// `Cache-Control: no-cache` means revalidate, not do-not-store: the browser
+/// keeps the body and asks whether it is still current, so an unchanged page
+/// costs a 304 and a rebuilt one lands on the next load. Without it these
+/// responses carry no freshness information at all and Chrome caches them
+/// heuristically, serving a stale page long after a restart.
+fn page_response(page: &BrandedPage, headers: &axum::http::HeaderMap) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+
+    let cache_headers = [
+        (header::CACHE_CONTROL, "no-cache"),
+        (header::ETAG, page.etag.as_str()),
+    ];
+
+    let known = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| etag_matches(v, &page.etag));
+
+    if known {
+        (StatusCode::NOT_MODIFIED, cache_headers).into_response()
+    } else {
+        (cache_headers, Html(page.html.clone())).into_response()
+    }
+}
+
+/// How long a content-addressed asset may be cached: a year, the longest
+/// span RFC 9111 attaches meaning to, plus `immutable` so that a reload does
+/// not revalidate it either.
+const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
+
+/// Choose a static asset's `Cache-Control` from the request URL.
+///
+/// A `?v=` query means the URL is content-addressed: the hash was written
+/// into the HTML from the bytes on disk at startup, so this exact URL can
+/// never come to mean different bytes and the browser need never ask again.
+/// A bare URL keeps the revalidating default -- an HTML page cached from
+/// before this change still asks for one, as does anything linked by hand.
+async fn asset_cache_control(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let versioned = request
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|param| param.starts_with("v=")));
+    let mut response = next.run(request).await;
+    // Only a response that carries the asset may be kept for a year. A 404
+    // under a versioned URL is a deployment that has gone wrong, and pinning
+    // it in the cache until next year would make it outlive its cause.
+    let status = response.status();
+    let cacheable =
+        status.is_success() || status == axum::http::StatusCode::NOT_MODIFIED;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(if versioned && cacheable {
+            // Set on the 304 as well as the 200 it stands in for: a
+            // revalidation answering without the directive would re-teach the
+            // browser the old, absent freshness every time.
+            IMMUTABLE_CACHE
+        } else {
+            "no-cache"
+        }),
+    );
+    response
+}
+
+/// Append a content hash to the local asset URLs in `html`.
+///
+/// Turns `src="/guac/Client.js"` into `src="/guac/Client.js?v=4c93eac7`, which
+/// lets those responses be cached for a year instead of revalidated on every
+/// page load -- 37 conditional requests that a WAN client pays a round trip
+/// for and that almost always answer 304.
+///
+/// The hash is taken at startup, in the same pass that brands the page, so
+/// the URL and the bytes it names are produced together and cannot disagree.
+/// The corollary is that **editing an asset now needs a restart to be seen**,
+/// where before a reload was enough; `RUSTGUAC_NO_ASSET_VERSIONING` turns
+/// this off for that reason.
+///
+/// An asset that cannot be read is left alone: a missing file is a 404 either
+/// way, and a URL bearing a hash of nothing would be worse than a bare one.
+fn version_assets(
+    html: &str,
+    static_path: &std::path::Path,
+    hashes: &mut std::collections::HashMap<String, Option<String>>,
+) -> String {
+    const ATTRS: [&str; 2] = ["src=\"", "href=\""];
+
+    let mut out = String::with_capacity(html.len() + 1024);
+    let mut rest = html;
+    // Whichever attribute comes first each time, so neither kind is skipped.
+    while let Some((at, attr)) = ATTRS
+        .iter()
+        .filter_map(|attr| rest.find(attr).map(|at| (at, *attr)))
+        .min_by_key(|(at, _)| *at)
+    {
+        let value_at = at + attr.len();
+        let Some(len) = rest[value_at..].find('"') else {
+            break;
+        };
+        let url = &rest[value_at..value_at + len];
+        out.push_str(&rest[..value_at]);
+        out.push_str(url);
+        if let Some(hash) = asset_hash(url, static_path, hashes) {
+            out.push_str("?v=");
+            out.push_str(&hash);
+        }
+        rest = &rest[value_at + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The short content hash for a local asset URL, or None if it is not one we
+/// version.
+fn asset_hash(
+    url: &str,
+    static_path: &std::path::Path,
+    hashes: &mut std::collections::HashMap<String, Option<String>>,
+) -> Option<String> {
+    // Root-relative, unadorned, and one of the two kinds that go stale. An
+    // absolute URL belongs to someone else, and a query or fragment means the
+    // page is already saying something about this URL.
+    if !url.starts_with('/') || url.starts_with("//") || url.contains('?') || url.contains('#') {
+        return None;
+    }
+    if !(url.ends_with(".js") || url.ends_with(".css")) {
+        return None;
+    }
+    let rel = url.trim_start_matches('/');
+    // These paths are ours, but they arrive as text out of an HTML file, so
+    // they are treated as untrusted rather than as ours.
+    if rel
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return None;
+    }
+    if let Some(known) = hashes.get(url) {
+        return known.clone();
+    }
+    let hash = std::fs::read(static_path.join(rel)).ok().map(|bytes| {
+        use sha2::{Digest, Sha256};
+        // Eight hex digits: the tag only has to tell one build of a file from
+        // the next, and the full 64 across 37 references is page weight spent
+        // on nothing.
+        hex::encode(Sha256::digest(&bytes))[..8].to_string()
+    });
+    hashes.insert(url.to_string(), hash.clone());
+    hash
+}
+
 /// Serve a branded HTML page from the pre-processed in-memory map.
 async fn serve_branded_page(
-    Extension(pages): Extension<Arc<std::collections::HashMap<String, String>>>,
+    Extension(pages): Extension<BrandedPages>,
     request: axum::extract::Request,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let path = request.uri().path().trim_start_matches('/');
     let key = if path.is_empty() { "index.html" } else { path };
-    if let Some(html) = pages.get(key) {
-        Html(html.clone()).into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
+    match pages.get(key) {
+        Some(page) => page_response(page, request.headers()),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 /// Serve the client HTML page for SSH sessions.
 /// The session_id is extracted by the JS on the page, not by this handler.
 async fn serve_client_page(
-    Extension(pages): Extension<Arc<std::collections::HashMap<String, String>>>,
+    Extension(pages): Extension<BrandedPages>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if let Some(html) = pages.get("client.html") {
-        Html(html.clone()).into_response()
-    } else {
-        Html(include_str!("../static/client.html")).into_response()
+    match pages.get("client.html") {
+        Some(page) => page_response(page, &headers),
+        // Unreachable: the map always carries the embedded copy.
+        None => Html(include_str!("../static/client.html")).into_response(),
     }
 }
 
@@ -1404,6 +1630,84 @@ fn rewrite_branding(html: &str, site_title: &str, logo_url: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_version_assets_rewrites_local_js_and_css() {
+        // Tests run from the crate root, so this is the real static tree.
+        let static_path = std::path::Path::new("static");
+        let mut hashes = std::collections::HashMap::new();
+        let html = concat!(
+            "<link rel=\"stylesheet\" href=\"/rustguac.css\">",
+            "<script src=\"/guac/Client.js\"></script>",
+        );
+        let out = version_assets(html, static_path, &mut hashes);
+        assert!(out.contains("/rustguac.css?v="), "{out}");
+        assert!(out.contains("/guac/Client.js?v="), "{out}");
+        // The rest of the markup survives untouched.
+        assert!(out.starts_with("<link rel=\"stylesheet\""));
+        assert!(out.ends_with("></script>"));
+    }
+
+    #[test]
+    fn test_version_assets_leaves_everything_else_alone() {
+        let static_path = std::path::Path::new("static");
+        let mut hashes = std::collections::HashMap::new();
+        for html in [
+            // Not ours to version.
+            "<script src=\"https://cdn.example/x.js\"></script>",
+            "<script src=\"//cdn.example/x.js\"></script>",
+            // Already says something about this URL.
+            "<script src=\"/guac/Client.js?debug=1\"></script>",
+            // Not a kind that goes stale behind a stable name.
+            "<img src=\"/logo.svg\">",
+            // No such file: a hash of nothing is worse than none.
+            "<script src=\"/guac/NoSuchFile.js\"></script>",
+            // Traversal, which these paths have no business doing.
+            "<script src=\"/../Cargo.toml.js\"></script>",
+        ] {
+            assert_eq!(version_assets(html, static_path, &mut hashes), html, "{html}");
+        }
+    }
+
+    #[test]
+    fn test_asset_hash_is_content_derived_and_cached() {
+        let static_path = std::path::Path::new("static");
+        let mut hashes = std::collections::HashMap::new();
+        let css = asset_hash("/rustguac.css", static_path, &mut hashes).expect("css hashes");
+        let js = asset_hash("/guac/Client.js", static_path, &mut hashes).expect("js hashes");
+        assert_ne!(css, js);
+        assert_eq!(css.len(), 8);
+        assert!(css.chars().all(|c| c.is_ascii_hexdigit()));
+        // One entry per distinct URL, hit or miss -- a miss is cached too, so
+        // a page full of broken links does not re-stat the disk per reference.
+        assert_eq!(asset_hash("/rustguac.css", static_path, &mut hashes), Some(css));
+        assert!(asset_hash("/guac/NoSuchFile.js", static_path, &mut hashes).is_none());
+        assert_eq!(hashes.len(), 3);
+    }
+
+    #[test]
+    fn test_etag_matches_exact_weak_and_wildcard() {
+        let etag = "\"abc\"";
+        assert!(etag_matches("\"abc\"", etag));
+        assert!(etag_matches("W/\"abc\"", etag));
+        assert!(etag_matches("*", etag));
+        // A list, as a browser holding several cached variants sends.
+        assert!(etag_matches("\"other\", \"abc\"", etag));
+        assert!(!etag_matches("\"other\"", etag));
+        // A rebuilt page: same length, different bytes.
+        assert!(!etag_matches("\"abd\"", etag));
+    }
+
+    #[test]
+    fn test_branded_page_etag_tracks_content() {
+        let a = BrandedPage::new("<html>one</html>".to_string());
+        let b = BrandedPage::new("<html>two</html>".to_string());
+        assert_ne!(a.etag, b.etag);
+        // Quoted, or caches ignore it.
+        assert!(a.etag.starts_with('"') && a.etag.ends_with('"'));
+        assert!(etag_matches(&a.etag, &a.etag));
+        assert!(!etag_matches(&b.etag, &a.etag));
+    }
 
     #[test]
     fn test_rewrite_branding_title() {

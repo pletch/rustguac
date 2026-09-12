@@ -99,6 +99,42 @@ Provider discovery is **lazy with retry** (`OidcState::client()` in `src/oidc.rs
 - **Docker**: `docker build -t rustguac .` — multi-stage, debian:trixie-slim runtime.
 - **Remote test machine**: See project memory for connection details. Binary at `/opt/rustguac/bin/rustguac`, config at `/opt/rustguac/config.toml`.
 
+### HTTP caching
+
+Nothing was said about caching until 2026-09-12, which is the worst of the
+options: with no `ETag` and no `Cache-Control` a browser caches heuristically
+and does not revalidate, so a restart kept serving the old page for hours and
+incognito was the only reliable way to see a change.
+
+**HTML revalidates; assets are content-addressed.** The branded pages are built
+once at startup into an in-memory map, so each is hashed there too and served
+with that `ETag` plus `no-cache` -- the revalidate directive, not do-not-store,
+so an unchanged page costs a 304 rather than 136K of `client.html` or 255K of
+`connections.html`. Tags are content-derived, not boot-derived: a restart that
+changes nothing still answers 304.
+
+The same pass rewrites `src="/guac/Client.js"` to `...?v=<8 hex of the file>`
+(`version_assets`), and `asset_cache_control` gives any URL carrying a `v=`
+query a year and `immutable`. That is worth doing because `client.html` reloads
+on every session launch *and relaunch*, and the WAN leg is browser-to-proxy
+HTTP/2 -- so the 37 revalidations are one round trip rather than 37, but it is
+a round trip paid exactly when the link is worst. Only a 2xx or 304 gets the
+long directive; a 404 under a versioned URL is a deployment that has gone
+wrong, and pinning it until next year would outlive its cause.
+
+**The cost is that editing an asset now needs a restart, where a reload used to
+be enough** -- the URL in the HTML and the bytes it names are produced in the
+same startup pass, so a JS edit is invisible until the hash is recomputed.
+`RUSTGUAC_NO_ASSET_VERSIONING=1` turns versioning off for that reason, leaving
+everything revalidating as before. This supersedes the older note that
+`static/guac/*.js` edits need no rebuild: they still need no *rebuild*, but
+they do now need a restart.
+
+Query-string versioning rather than hashed filenames because there is no build
+step to rename anything, and the startup rewrite already existed for branding.
+The old caution about proxies refusing to cache URLs with queries has not been
+true for many years.
+
 ## Build notes
 
 - guacd is built from `../guacamole-server` (apache/guacamole-server)
