@@ -500,6 +500,25 @@ three sit at levels the others cannot reach:
      the main thread); the share under-reports once a session has already
      been throttled to a crawl. Measured pairs: Windows typing 8-12ms/17-19%,
      xrdp with glxgears 17ms/70%, full-screen video ~42ms/45%.
+   **The flush latch is what caught the first real input case**, and the copy
+   gate did not. Measured 2026-09-12, xrdp at 1920x1080, dragging a VS Code
+   scrollbar: `mean flush 30.0ms over 128 syncs in 10s`, against the derived
+   30ms. Flush is roughly copy plus decode plus display work, so a 30ms flush
+   at 12.8 pictures a second implies ~20-25ms of copy and a ~25-28% share --
+   just under `COMBINE_COPY_TRIP_SHARE`. (Inference from the flush figure, not
+   measured; `h264CombineLog` on the same workload would settle it.)
+
+   That is the first evidence bearing on the 30% share, and it does not say
+   lower it: Windows typing sits at 17-19% and is healthy, so 20% would trip a
+   session that is fine. The two regimes are a few points apart on share alone,
+   which is the argument for layering rather than against the number.
+
+   **It does expose a gap.** The flush latch needs 100 syncs in 10s and got
+   128. A session at eight a second with a 25% share is caught by neither --
+   the copy gate fails on share, the flush latch on its minimum. Same
+   minimum-rate shape as the copy window that used to be discarded for having
+   too few pictures, and not yet fixed here.
+
    * The sync-timeout and slow-flush latches, as the safety net beneath both.
      Their minimums are what decides which fires: the sync-timeout latch has
      none (3 timeouts in 10s), the copy gate needs 30 pictures in 10s, the
