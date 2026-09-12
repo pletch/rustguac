@@ -469,6 +469,58 @@ It would transform desktop work and do nothing for full-screen video, which
 damages every row. For video at this resolution the answer stays lever 1 or the
 4MP gate.
 
+#### Outcome: copy the damaged rows, and gate on what the copy costs
+
+Both views now copy only the rows their region rects touch, rounded outward to
+16. Measured on a Windows host at 2992x1648 (4.93MP), light typing, combining
+forced on:
+
+| | no banding | main only | both views |
+|---|---|---|---|
+| main view copy | 34.6ms | 5.6ms | 7.0ms |
+| auxiliary view copy | 27.3ms | 26.9ms | 7.4ms |
+| main thread in `copyTo()` | ~77% | ~24% | **~16%** |
+
+The pipeline behind it went with it: `decode` from 617ms at its worst and
+28-38ms in steady state to 1.1-3.8ms, `queue` to nil, `draw` from 20-36ms to
+7.4-11.7ms.
+
+**Windows declares real damage on both views**; the xrdp fork declares a full
+frame on both, deliberately (`xrdp_encoder.c`, to keep the two chroma sources
+refreshing from the same instant), so none of this fires there until
+`XRDP_AVC444_DAMAGE_RECTS=1` -- and the fork's own comment notes that only
+16-aligned rects are bit-exact, which is the shape this wants anyway.
+
+**No per-layout band arithmetic was needed.** Rounding outward to 16 is exactly
+what `auxV1LumaBands()` does to reach the v1 layout's 16-row bands, and a
+superset of the v2 layout's one-to-one rows and both layouts' chroma rows at
+`y >> 1`. `tests/h264-copy-band.mjs` lifts that inverse out of `Yuv444.js` and
+checks all three mappings rather than trusting the argument.
+
+**Banding is then exhausted, and the gate had to change.** At 3-5% span the
+copies are 0.15-0.25MP but still cost 7-11ms, so the per-call stall now
+dominates -- fitted at 5-10ms, well above the 2.7ms a two-point fit suggested.
+Narrowing further buys nothing. But that also means cost is no longer a
+function of framebuffer area, which is all `COMBINE_MAX_PIXELS` could see: at
+4.93MP it declined to combine on sessions costing ~9ms a picture.
+
+So the threshold is now a prior only, raised to 4K, with a measured gate
+underneath: `COMBINE_COPY_TRIP_MS` (16ms, one frame at 60Hz) gives up
+combining when the mean synchronous copy per picture over a busy window
+exceeds it. Typing at 4.93MP measures ~9ms and video ~42ms, so neither regime
+is near the line.
+
+**This is not the mistake adaptive suspension made.** That design failed
+because timing GPU execution needs a `gl.finish()` per picture, stalling the
+pipeline the gate exists to protect, so it gated on symptoms instead. None of
+that applies to `copyTo()`'s prologue: it is a wall-clock delta across a
+synchronous call, exact and free, on a path already paying it. The earlier
+reasoning was right about GPU work and this is not GPU work.
+
+The sync-timeout and slow-flush latches stay as the safety net beneath it.
+Note their signal is decoder latency, not display cost -- see above -- which
+is worth revisiting now that the latency has collapsed.
+
 ## Colour range
 
 The samples an RDP host sends are **full range**. [MS-RDPEGFX Color

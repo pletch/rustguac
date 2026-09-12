@@ -94,11 +94,27 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * Default framebuffer area, in pixels, up to which AVC444 views are
      * combined into 4:4:4. See combineMaxPixels().
      *
+     * A fast prior, and no longer the thing that decides. It was 4MP, set
+     * against the shader and the plane uploads; those were later measured at
+     * under 2ms together, while the cost that matters -- copyTo()'s
+     * synchronous prologue -- is not a function of the framebuffer at all
+     * once the copy is narrowed to the damaged rows. A 4.93MP Windows
+     * session doing desktop work copies 3-5% of its planes and spends ~9ms a
+     * picture; the old threshold declined to combine on exactly the sessions
+     * that could afford it.
+     *
+     * So this is now only a ceiling on the worst case a session can open
+     * with, before COMBINE_COPY_TRIP_MS has had a window to measure anything:
+     * 4K, beyond which even a banded copy's per-call floor and the whole-plane
+     * copy of a resync are more than a session should risk unmeasured.
+     * Between that and the measured gate, resolution is no longer the
+     * question -- what the screen is doing is.
+     *
      * @private
      * @constant
      * @type {!number}
      */
-    var COMBINE_MAX_PIXELS = 4000000;
+    var COMBINE_MAX_PIXELS = 8300000;
 
     /**
      * How long a session that gave up combining must stay quiet -- under
@@ -911,6 +927,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         combineTrips++;
         recentSyncTimeouts = [];
         flushWindow = null;
+        copyWindow = null;
+        combineCopyMs = 0;
 
         diagnostic('chroma_suspended', 'gave up 4:4:4 combining: ' + reason
                 + ' -- the client is setting the frame rate. Painting 4:2:0'
@@ -943,6 +961,47 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @constant
      */
     var COMBINE_FLUSH_TRIP_MS = 8;
+
+    /**
+     * Mean synchronous copy time per picture, in ms, above which a busy
+     * window while combining gives the combine up.
+     *
+     * This is the gate the other two are proxies for. VideoFrame.copyTo()'s
+     * synchronous prologue is the cost of combining -- measured at 5-10ms of
+     * fixed per-call stall plus ~6.5ms per megapixel copied -- and everything
+     * downstream of it, the shader and the uploads and the blit, is under 2ms
+     * together. It is also blocking main-thread time, so it is what the user
+     * feels.
+     *
+     * Deliberately *not* the reason adaptive suspension was abandoned before.
+     * That design failed because timing GPU execution needs a gl.finish() per
+     * picture, stalling the pipeline the gate exists to protect. None of that
+     * applies here: this is a wall-clock delta across a synchronous call,
+     * exact and free, on a path that was already paying it.
+     *
+     * 16ms is one frame at 60Hz, and it separates the two regimes cleanly on
+     * the measurements this was set from: at 4.93MP a Windows host banded to
+     * 3-5% damage costs ~9ms a picture, while the same session on
+     * full-screen video copies whole planes at ~42ms. Neither is near the
+     * line, which is what a threshold wants.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_COPY_TRIP_MS = 16;
+
+    /**
+     * Pictures a window must carry before its mean copy time is acted on.
+     * Over COMBINE_FLUSH_WINDOW_MS this is a few a second -- enough to mean
+     * something, and low enough that a mostly idle desktop still keeps full
+     * chroma, which is where it is worth having.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_COPY_MIN_PICTURES = 30;
     var COMBINE_FLUSH_WINDOW_MS = 10000;
     var COMBINE_FLUSH_MIN_SYNCS = 100;
 
@@ -955,11 +1014,60 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var flushWindow = null;
 
     /**
+     * The copy window in progress while combining, or null.
+     *
+     * @private
+     */
+    var copyWindow = null;
+
+    /**
+     * Synchronous copy time accumulated for the picture being combined, in
+     * ms, across both of its views.
+     *
+     * @private
+     */
+    var combineCopyMs = 0;
+
+    /**
      * Counts one sync's flush while combining, and gives combining up at the
      * end of a busy window whose mean flush is over COMBINE_FLUSH_TRIP_MS.
      *
      * @private
      */
+    function noteCombineCopy(copyMs) {
+
+        if (override('h264Chroma444') !== undefined || !combining
+                || combineLatchedOff || !(copyMs > 0)) {
+            copyWindow = null;
+            return;
+        }
+
+        var now = nowMs();
+
+        if (!copyWindow)
+            copyWindow = { start: now, pictures: 0, sumMs: 0 };
+
+        copyWindow.pictures++;
+        copyWindow.sumMs += copyMs;
+
+        if (now - copyWindow.start < COMBINE_FLUSH_WINDOW_MS)
+            return;
+
+        var mean = copyWindow.sumMs / copyWindow.pictures;
+        var pictures = copyWindow.pictures;
+        var span = now - copyWindow.start;
+        copyWindow = null;
+
+        if (pictures >= COMBINE_COPY_MIN_PICTURES
+                && mean > COMBINE_COPY_TRIP_MS)
+            suspendCombining('mean copy ' + mean.toFixed(1) + 'ms a picture'
+                    + ' over ' + pictures + ' in '
+                    + (span / 1000).toFixed(0) + 's, over the '
+                    + COMBINE_COPY_TRIP_MS + 'ms of blocked main thread a'
+                    + ' picture the combine is worth');
+
+    }
+
     function noteCombineFlush(flushMs) {
 
         if (override('h264Chroma444') !== undefined || !combining
@@ -2008,18 +2116,24 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     function flushCombineCost(hadAux) {
 
         var ms = combineWorkMs;
+        var copyMs = combineCopyMs;
         var resynced = combineResynced;
 
         combineWorkMs = 0;
+        combineCopyMs = 0;
         combineResynced = false;
 
         if (ms <= 0)
             return;
 
         /* A picture that had to resync uploaded whole planes, so it says
-         * nothing about the steady state. */
-        if (!resynced)
+         * nothing about the steady state -- and it copied whole planes too,
+         * which would trip the gate on the one picture that is expected to
+         * be expensive. */
+        if (!resynced) {
             recordStat('combine', hadAux, ms);
+            noteCombineCopy(copyMs);
+        }
 
     }
 
@@ -2205,7 +2319,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * the thing to reduce is then the number of copies, not their size.
          * The two lead to different fixes, so measure before building
          * either. */
-        recordStat('copy', view !== 0, nowMs() - copyAt,
+        var copyElapsed = nowMs() - copyAt;
+        recordStat('copy', view !== 0, copyElapsed,
                 planeW * (copyBand ? copyBand.h : planeH));
 
         /* The chain below is this copy's real error handler, but it may not
@@ -2224,6 +2339,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * whatever else is in flight, so including them would measure the
              * backlog and feed the suspension decision with its own output. */
             var startedAt = nowMs();
+
+            /* Charged here rather than where it was measured, so that the
+             * copy chain's ordering decides which picture it belongs to.
+             * Issue order does not: a picture's auxiliary view is issued
+             * while its main view's copy is still in flight, so accumulating
+             * at the call site would hand one picture's cost to the one
+             * before it. */
+            combineCopyMs += copyElapsed;
 
             if (override('h264CombineLog')) {
                 if (!copyWait)
