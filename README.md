@@ -102,27 +102,53 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   are combined is decided per picture in the browser. (An Automatic option
   that dropped AVC444 under Native Resolution was removed: on Windows it lost
   H.264 outright. Entries saved with it are treated as AVC444 + AVC420.)
-- **4:4:4 combining is declined when it would cost frame rate** — the combine
-  is a plane read-back, six texture uploads and a shader pass per picture, all
-  proportional to pixels and all contending with the hardware decoder on the
-  same GPU: `tests/bench` puts it at ~1.37ms per megapixel. So it is skipped
-  above a 4MP framebuffer (`COMBINE_MAX_PIXELS`), and a latch under that gives
-  it up when the decode backlog stays over `MAX_PIPELINE_DEPTH * 3` for two
-  seconds, tries again once the backlog has been clear for 30 seconds, and
-  stops after three trips. It gates on the backlog rather than on the combine's
-  own cost, because timing GPU execution needs a `gl.finish()` per picture,
-  stalling the pipeline the gate exists to protect. Only newly painted regions
-  change chroma resolution, so a transition is gradual rather than a flash. An
-  explicit `h264Chroma444` override disables the latch outright.
-- **What the combine costs, and what trims it** — a main view whose auxiliary
-  view follows is uploaded but never painted (that is what `<paired>` carries,
-  set by guacd from MS-RDPEGFX LC=0, since only the server knows before the
-  second access unit arrives); the renderer draws into an `OffscreenCanvas` and
-  hands over the drawing buffer with `transferToImageBitmap()`; the two views'
-  `copyTo()` calls are in flight at once; and the upload is banded, touching
-  only the rows the damage rects cover. The banding is the one that pays —
-  2.0x at 4K and 1.8x at 1080p on a typing-shaped damage list, nothing at all
-  full-screen, correctly, since there is nothing to crop.
+- **What the combine actually costs** — not the shader, and not the uploads.
+  `VideoFrame.copyTo()`'s *synchronous* half — the driver's texture copy and
+  staging map, before the promise exists — is ~6.5ms per megapixel plus a
+  per-call stall, against under 2ms for the uploads, the shader and the blit
+  together. It hid for a long time because the obvious instrument times the
+  promise, which reads 0.0ms: by then the blocking work is done. The
+  ImageBitmap handoff, the shader, software-decode fallback and GPU bandwidth
+  were each ruled out with a measurement first (see
+  [`docs/rdp-h264.md`](docs/rdp-h264.md)).
+- **So the copy reads only the damaged rows** — both views, rounded outward to
+  16, which is the grid the v1 chroma layout's 16-row tiling needs and a
+  superset of what v2 and the chroma planes need, so one band serves both.
+  Several bands rather than one bounding span, because a clock in one corner
+  and a caret in the other span the whole screen between them; each extra
+  `copyTo()` is a fixed stall, so a gap is only worth splitting when it saves
+  more transfer than the call costs. Until this, the uploads and the shader
+  were banded to the damage while the copy read the whole frame every picture —
+  the widest stage of the pipeline feeding the narrowest. On Windows at
+  2992x1648 with light typing, main-thread time inside `copyTo()` fell from
+  ~77% to 12-17%, and decode with it, from 28-38ms to 1-3ms.
+  It only helps where the server declares real damage rects.
+- **4:4:4 combining is given up when the copy costs too much** — the gate
+  follows the measured cost rather than the resolution. `COMBINE_MAX_PIXELS`
+  (4K) is a prior only, a ceiling on what a session may open with before
+  anything has been measured; the combine is given up when a busy window
+  exceeds **both** `COMBINE_COPY_TRIP_MS` (20ms of synchronous copy per
+  picture) and `COMBINE_COPY_TRIP_SHARE` (30% of wall clock spent copying).
+  Each is wrong alone: per picture over-reports on an idle session, where the
+  per-call cost rises because part of it is waiting for a frame to be ready;
+  the share under-reports once a session is already throttled to a crawl.
+  Measuring is legitimate here where it was not for the GPU work: this is a
+  wall-clock delta across a synchronous call, not execution needing a
+  `gl.finish()` that would stall the pipeline the gate protects. Sync-timeout
+  and slow-flush latches sit beneath it, the latter derived from the copy
+  threshold so it cannot pre-empt the gate that knows why. It retries after 30
+  seconds of quiet, doubling that wait per trip up to eight minutes and easing
+  it back as combining holds up, so nothing is ever given up permanently; only
+  newly painted regions change chroma resolution, so a transition is gradual
+  rather than a flash. An
+  explicit `h264Chroma444` override disables every part of it.
+- **What else trims the combine** — a main view whose auxiliary view follows is
+  uploaded but never painted (that is what `<paired>` carries, set by guacd
+  from MS-RDPEGFX LC=0, since only the server knows before the second access
+  unit arrives); the renderer draws into an `OffscreenCanvas` and hands over
+  the drawing buffer with `transferToImageBitmap()`; the two views' `copyTo()`
+  calls are in flight at once; and the uploads are banded to the damaged rows
+  like the copy.
 - **Frame-acknowledgement back-pressure**
   (`patches/012-rdpgfx-frame-ack-backpressure.patch`) — guacd holds the RDPGFX
   frame acknowledgement by the amount the client's processing lag exceeds its
@@ -133,8 +159,11 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   cycle.
 - **Runtime overrides for the chroma path** — `h264Chroma444` (off falls back
   to 4:2:0), `h264ChromaFilter` (off, or a 0-255 threshold; default 30),
-  `h264CombineMaxPixels` (the 4MP threshold above), `h264FullRange` (force the
-  decoder's range) and `h264CombineLog` (per-stage timings every 5s). Each is
+  `h264CombineMaxPixels` (the 4K prior above), `h264CopyBands` (off copies
+  whole planes), `h264FullRange` (force the decoder's range),
+  `h264BlackProbes` (on re-enables the black-region probing, off by default
+  since its causes were found and fixed — the keyframe probe read back the
+  whole framebuffer) and `h264CombineLog` (per-stage timings every 5s). Each is
   read as a window global, a query param, or a `localStorage` key — but only
   `localStorage` survives a session relaunch, since the client rebuilds its own
   URL, and only `h264Chroma444` and `h264ChromaFilter` are read per picture, so

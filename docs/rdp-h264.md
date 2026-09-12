@@ -158,87 +158,463 @@ drops them unused (`docs/xrdp-dpi-scaling.md`), so a session script setting
 `/Gdk/WindowScalingFactor` or `/Xft/DPI` remains the only thing scaling that
 desktop.
 
-### 4:4:4 combining is declined above 4 megapixels
+### When 4:4:4 combining is declined, and when it is given up
 
-An AVC444 stream above `COMBINE_MAX_PIXELS` is decoded but painted at 4:2:0.
-The combine is a plane read-back, six texture uploads and a shader pass per
-picture, all proportional to pixels and all contending with the hardware video
-decoder on the same GPU. From `tests/bench` it costs about **1.37 ms per
-megapixel**:
+An AVC444 stream that is not combined is still decoded; it is painted at 4:2:0,
+from the main view alone. Three things can cause that, in the order they act.
 
-| framebuffer | combine | share of a 60fps frame |
-|---|---|---|
-| 1080p (2.1 MP) | 2.8 ms | 17% |
-| 1440p (3.7 MP) | 5.1 ms | 30% |
-| native HiDPI (5.5 MP) | 7.5 ms | 45% |
-| 4K (8.3 MP) | 11.4 ms | 68% |
+**A prior on framebuffer area** (`COMBINE_MAX_PIXELS`, 4K). A ceiling on the
+worst case a session may open with before anything has been measured, and no
+longer the thing that decides. It was 4MP until 2026-09-12, set against the
+plane uploads and the shader pass; those were later measured at under 2ms
+together, while the cost that matters is not a function of the framebuffer at
+all once the copy is limited to the damaged rows. A 4.93MP Windows session
+doing desktop work copies 3-5% of its planes and spends ~9ms a picture, which
+the old threshold declined outright.
 
-The 5.5 MP row is not theoretical — it showed up as a frame backlog 8-11 deep
-and repeated sync timeouts, with `h264CombineLog` still reporting the combine
-at under a millisecond because it times submission rather than execution.
+**A gate on the measured copy** (`COMBINE_COPY_TRIP_MS`, 20ms a picture, and
+`COMBINE_COPY_TRIP_SHARE`, 30% of wall clock -- both, or it does not fire). Gives up when the mean *synchronous* copy per picture over a busy 10s
+window exceeds it. `VideoFrame.copyTo()`'s synchronous half is the cost of
+combining -- see the investigation below -- and it is blocking main-thread
+time, so it is both what the user feels and a wall-clock delta that is exact
+and free to measure. Typing at 4.93MP measures ~9ms a picture and full-screen
+video ~42ms; neither is near the line.
 
-**Keyed on framebuffer area rather than the desktop scale**, which was the
-first thing tried and is wrong twice over. The scale only says whether HiDPI
-scaling was applied, so a 4K display at `devicePixelRatio` 1 slips past it and
-combines at the most expensive size there is. And the cost is not a property of
-the host: the same picture costs the same to combine whatever sent it, which is
-why this was taken for an xrdp problem until a Windows session was run at
-native resolution.
+**Two latches beneath both**, on sync-gate timeouts and on slow display
+flushes. Their minimums decide which fires first: the sync-timeout latch has
+none (3 timeouts in 10s), the copy gate needs 30 pictures in its window, the
+flush latch 100 syncs. So a session degraded to a few frames a second -- what
+full-screen video at high resolution does, once every row is damaged and the
+copies go back to whole planes -- is caught by the sync-timeout latch within
+seconds, and by the copy gate at the next window boundary, while the flush
+latch may never reach its minimum.
 
-`?h264Chroma444=on` overrides, `?h264CombineMaxPixels=` moves the line for a
-faster or slower GPU, and the declined case logs once saying why.
+**The area prior is keyed on framebuffer area rather than the desktop scale**,
+which was the first thing tried and is wrong twice over. The scale only says
+whether HiDPI scaling was applied, so a 4K display at `devicePixelRatio` 1
+slips past it. And the cost is not a property of the host: the same picture
+costs the same to combine whatever sent it, which is why this was taken for an
+xrdp problem until a Windows session was run at native resolution.
 
-### And a latch under it, for when the threshold is wrong
+`h264Chroma444` overrides, `h264CombineMaxPixels` moves the prior, and
+the declined case logs once saying why. Setting the override disables every
+gate above, since an override is an instruction rather than a preference.
 
-The threshold is a constant measured on one GPU, so it cannot know the client
-it is running on. Under it sits a latch: if the decode backlog stays over
-`MAX_PIPELINE_DEPTH * 3` for two seconds while combining, the session gives up
-combining for good and reports it:
+### Why the gates are latches rather than controllers
 
-```
-Client diagnostic: gave up 4:4:4 combining: 9 frames pending for 2.1s ...
-  event=chroma_suspended
-```
+They are **one-way** on purpose. An earlier version measured the combine
+against a frame budget whose divisor was the observed interval between
+pictures -- which is what `012`'s frame-ack back-pressure has already throttled
+the server to, and that back-pressure reacts to the lag combining causes. It
+read its own output as its input. A latch has no loop.
 
-It gates on the **backlog**, not on the combine's measured cost, because
-measuring GPU execution needs a `gl.finish()` per picture — stalling the
-pipeline the gate protects — or timer queries that are not reliably available.
-A healthy session sits at or below `MAX_PIPELINE_DEPTH`; a drowning one was
-measured in the field at 8–11 with sync timeouts alongside.
-
-It is **one-way** on purpose. An earlier version measured the combine against a
-frame budget whose divisor was the observed interval between pictures — which
-is what `012`'s frame-ack back-pressure has already throttled the server to,
-and that back-pressure reacts to the lag combining causes. It read its own
-output as its input. A latch has no loop.
-
-A backlog caused by something else — a slow link, a struggling decoder — gives
+A trip caused by something else -- a slow link, a struggling decoder -- gives
 up chroma for nothing. That is the accepted cost: a little colour resolution,
-no frames, and `?h264Chroma444=on` brings it back. Setting that override also
-disables the gate entirely, since an override is an instruction rather than a
-preference.
+no frames, and `h264Chroma444` brings it back -- as `window.__h264Chroma444
+= true` for the current page, or the `h264Chroma444` key in localStorage to
+survive a reconnect. Not as a query parameter: client.html rebuilds
+`/client/{id}?name=...` on every launch and drops anything added by hand, so
+one lasts until the first reconnect. The recording player is the exception,
+since nothing rewrites its URL.
 
-**It resumes once the load passes.** After the backlog has stayed within
-`MAX_PIPELINE_DEPTH` for 30 seconds, combining is tried again
-(`chroma_resumed`), up to three times per session; after the third it stays off
-for good. Tripping during a video and resuming afterwards is the expected
-shape — heavy video is exactly where 4:2:0 chroma costs least and where the
-combine costs most, and reading text afterwards is where the aux stream earns
-its keep.
+**They resume once the load passes.** After the session has stayed *quiet* for
+`COMBINE_RECOVER_MS`, combining is tried again (`chroma_resumed`), up to three
+times per session; after the third it stays off for good. Quiet rather than
+merely clean: 4:2:0 never flushes slowly, so a "clean" test resumed mid-video
+and spent every attempt on the same one. Tripping during a video and resuming
+once it stops is the expected shape -- heavy video is exactly where 4:2:0
+chroma costs least and where the combine costs most, and reading text
+afterwards is where the auxiliary stream earns its keep.
 
 The long recovery window is not about hiding a visible flap; there barely is
 one, since only newly painted regions change chroma resolution. It is about the
-**resync**: the first combine after a gap uploads whole planes rather than
-damaged rows, which is the most expensive kind of combine there is, and
+**resync**: the first combine after a gap copies and uploads whole planes
+rather than damaged rows, which is the most expensive kind there is, and
 delivering that to a client that has only just stopped struggling is how a gate
 makes things worse. Three attempts then draws the line between a desktop that
-had a video playing and a client that simply cannot sustain the combine — sample
-by sample the two look identical, and only time separates them.
+had a video playing and a client that simply cannot sustain the combine --
+sample by sample the two look identical, and only time separates them.
 
-**`h264CombineLog` cannot measure this.** It brackets GPU submission, not
-execution — there is no `gl.finish()` in the render path — and reports the same
-work at under a millisecond. Use `tests/bench`, which forces completion, before
-concluding the combine is cheap.
+**Measuring the combine's GPU work is still the hard part**, and is why the
+latches gate on symptoms. Timing GPU execution needs a `gl.finish()` per
+picture -- stalling the pipeline the gate protects -- or timer queries that are
+not reliably available. `h264CombineLog` now calls `Yuv444Renderer.finish()`
+before stamping, so its `combine` figure is execution rather than submission,
+at the cost of that stall; it is a diagnostic, not something a gate could use.
+None of this applies to `COMBINE_COPY_TRIP_MS`, which times a synchronous call
+on the main thread rather than GPU work.
+
+### Is it the combine, or the handoff? (investigation)
+
+The field numbers do not add up to what `tests/bench` measures. At 1920x1072
+against the xrdp fork, 4:2:0 ran at 54.7 syncs/s with a 0.6ms mean flush and
+4:4:4 at 33-41/s with 16-22ms. Part of that ratio is an accounting artifact --
+the 4:2:0 path snapshots the `VideoFrame` into a 2D canvas inside the decoder's
+output callback, so its pixel copy is already paid before flush begins, while
+the combine path only *submits* GPU work there and the result is first needed
+inside flush. But the sync rate cannot be an artifact: 54.7/s to 33-41/s is
+6-12ms per frame, against a benched combine of ~2.8ms at 2.06MP.
+
+The same slowdown appears on an RTX 3070 and an Intel 770. Those differ by
+roughly 8x in memory bandwidth and the NVIDIA part decodes on a separate
+engine, so agreement between them rules out shader cost, GPU bandwidth, and
+contention between the two hardware decodes and the combine. What survives is
+what is *not* GPU throughput: CPU-side driver staging (which is what
+`texSubImage2D` already is), and synchronous GPU-to-CPU transfers.
+
+That points at a boundary the 4:2:0 path never crosses. The combine's output is
+a GPU-resident `ImageBitmap` produced by the renderer's own WebGL2 context, and
+it is consumed by `drawImage()` into the display layer's 2D context. If the
+driver cannot share that surface, the blit is a readback -- area-proportional,
+vendor-independent, and invisible to every existing instrument. And it would
+not shrink with damage: `render()` scissors the conversion to the damage rects,
+but `transferToImageBitmap()` hands over the **whole drawing buffer** every
+frame. At 1920x1072 that is 8.2MB crossing the boundary to repaint a caret,
+which is also why banding the plane uploads measured 2.0x in the bench and much
+less in the field.
+
+**How it was tested, and why none of it is still here.** A `paint` stage timed
+the `drawImage()` calls in `drawDecoded()` against two denominators -- damaged
+megapixels against buffer megapixels, since which one the cost tracks says
+whether it is the blit or the handoff -- split by which kind of surface
+crossed, with `sync_hold` splitting its flush the same way. The control was an
+override that snapshotted an unpaired main view the way the 4:2:0 path does,
+skipping `render()` for that picture only, so both handoffs could be measured
+on one stream and one session. All of it came out at 0.01ms/MP, answered the
+question once, and was removed with the rest of the scaffolding; it is on
+`feature/combine-handoff-instrumentation` if the question ever reopens.
+
+#### Result: it is not the handoff, and `flush` was never measuring the display
+
+Measured at 1920x1072 against the xrdp fork with `CHROMA_INTERVAL=8`, combining
+forced on, over three 5s windows:
+
+```
+  decode  chroma 35 mean 14.4 max 50.7  |  luma 274 mean 6.1 max 43.4
+  combine chroma 35 mean  0.5 max  0.9  |  luma 239 mean 0.3 max 1.0
+  draw    chroma 35 mean 12.5 max 33.1  |  luma 239 mean 15.1 max 57.5
+  paint   bitmap 274 mean  0.0 max  0.4 0.01ms/MP  |  canvas none
+  read-back wait mean 0.0 max 0.1
+sync_hold: 2090 syncs (34.8/s) held 3 (0%) timeouts 0
+           | flush mean 19.9ms max 89ms
+```
+
+**The handoff is free.** `paint` is 0.0ms mean, 0.4ms max, 0.01ms/MP against
+either denominator. The ImageBitmap crosses into the display's 2D context at
+no measurable cost, so the driver is sharing the surface, not reading it back.
+The bounding-box change that would have followed is not worth making, and the
+vendor-independence that pointed here has a duller explanation: nothing on this
+path is GPU-bound at all.
+
+**The combine is also cheap in situ** -- 0.3-0.5ms with `gl.finish()` forcing
+completion, against the bench's ~1.37ms/MP (~2.8ms at this size). No
+contradiction: the bench measures full-frame damage, and a real desktop's
+damage is small, which is exactly what the banded uploads and the scissored
+conversion were built for. The bench is a worst case, not a typical one.
+
+**And `flush` was measuring the wrong thing.** The stack that produced these
+numbers runs `recordHold` <- `waitForPending` <- `displaySyncComplete` <-
+`Frame.flush` <- `__flush_frames` <- `Task.unblock` <- `__display_h264_ready`
+<- the combine's own promise. The display's flush *completes inside the
+decoder's unblock*: a frame carrying H.264 blocks its display task until the
+picture is available, so `flush mean 19.9ms` is how long the display waited for
+the decoder, not how long the display took to draw.
+
+That matters beyond this investigation. `COMBINE_FLUSH_TRIP_MS` gives up
+combining when the mean flush exceeds 8ms, and what it is reading is decode
+latency rather than display cost.
+
+*(Corrected 2026-09-12. It was written here that the latch therefore trips on
+something it cannot fix, since lever 3 removes the combine and not a single
+decode. That is wrong, and the measurements later in this section disprove it:
+`decode` fell from 28-38ms to 1-4ms once the copies were banded. Combining
+blocks the main thread, which delays the decoder's output callbacks, which
+inflates decode latency, which is what flush measures -- so combining does
+influence the signal and suspending it does reduce it. The chain is real, just
+indirect. What is true is weaker: the flush latch reads the cost at three
+removes where `COMBINE_COPY_TRIP_MS` reads it directly, and it has the
+strictest minimum of the three latches -- 100 syncs in 10s against the copy
+gate's 30 pictures and the sync-timeout latch's none -- so it is the least
+likely of them to fire first. Subsumed and second-hand, not misdirected, and
+worth keeping for the main-thread congestion that combining contributes to
+without the copy time alone showing it.)*
+
+**What is left unexplained is `draw`:** 12.5-19.8ms from the `VideoFrame`
+arriving in `output()` to the paint, of which the combine is 0.5ms, the
+read-back wait 0.0ms and the paint 0.0ms. Roughly 12-18ms is unaccounted for.
+A `queue` stage now splits it -- `onReady` is wrapped to stamp when the
+picture actually became available, so `draw` minus `queue` is the asynchronous
+chain and `queue` is time spent in the display's ordered queue behind frames
+that were not ready yet.
+
+**Next measurement:** the same three stages with `window.__h264Chroma444 =
+false` on the same session and host. `false` is an override like any other, so
+the latch stays out of the way and the comparison is clean. If `decode` and
+`queue` are what grow between the two runs, the cost is the second access unit
+and the pipelining around it, and the client-side combine gate is aimed at the
+wrong thing.
+
+#### It is not `copyTo()` either -- and the decode times say why
+
+The natural next suspect is `VideoFrame.copyTo()`: pulling the planes out of a
+decoded frame is a GPU-to-CPU transfer, and that cost looks unavoidable. The
+run above already measures it. `read-back wait` -- issuing the copy to the
+chain resolving it -- is **mean 0.0ms, max 0.1-0.2ms**. It is not the
+bottleneck, and it is not close to being one.
+
+But a near-free `copyTo()` is itself strange, and taken together with the rest
+of the run it points somewhere specific:
+
+* `copyTo()` costs nothing, which is what happens when the planes are **already
+  in system memory** rather than in GPU memory.
+* `decode` is **6-10ms for a main view and 14-20ms for an auxiliary one** at
+  1920x1072. A hardware decoder does 1080p in single-digit *tenths* of a
+  millisecond of engine time and a few ms of latency; this is an order out.
+* Nothing on the GPU path costs anything: combine 0.5ms, paint 0.0ms.
+* The slowdown is identical on an RTX 3070 and an Intel 770 -- which is
+  expected if the GPU is barely involved.
+
+That is the signature of **software decoding**. `H264Decoder.js` already
+documents the trap: `hardwareAcceleration: 'prefer-hardware'` is a *preference,
+not a requirement*, and a stream whose frames exceed the declared codec level
+falls back to software silently -- which is exactly why `DEFAULT_CODEC` was
+raised to level 5.2, after a 2688x1488 session "decoded in software at roughly
+twenty times the latency, and under AVC444 for two pictures per frame."
+
+If that is what is happening here, every conclusion inverts. AVC444 would not
+be expensive because combining is expensive -- combining is nearly free. It
+would be expensive because it asks a *software* decoder for two access units
+per picture instead of one, and the client-side combine gate cannot remove a
+single one of them.
+
+**The cheapest check is the format the decoder hands back**, now printed in the
+`h264CombineLog` header as `(decoder gives ...)`. A hardware decoder on Windows
+gives **NV12**; **I420** is Chrome's software decoder. `chrome://media-internals`
+confirms it by name, and shows why a fallback was taken.
+
+An `issue` stage was also added, timing `combineFrame()` entry to the copy being
+issued -- `allocationSize()` plus the synchronous half of `copyTo()`, which sat
+in neither `copyWait` nor `combine` and was inside the unexplained window.
+With `decode`, `issue`, `copyWait`, `combine`, `queue` and `paint`, `draw` is
+fully accounted for.
+
+#### Result: it *is* `copyTo()`, in its synchronous half
+
+Measured at 2992x1648 (4.93MP) on a HiDPI laptop against a Windows host,
+hardware decode confirmed (`chrome://media-internals`: `D3D11VideoDecoder`,
+NV12, `kIsPlatformVideoDecoder: true`):
+
+```
+  issue   chroma 28.5  |  luma 34.7
+  alloc   chroma  0.0  |  luma  0.0
+  buf     chroma  0.0  |  luma  0.0
+  copy    chroma 28.5 5.77ms/MP  |  luma 34.6 7.01ms/MP
+  combine chroma  1.5  |  luma  0.9
+  paint   0.01ms/MP
+```
+
+`allocationSize()` and the buffer pool are free. **`copyTo()`'s synchronous
+prologue is the whole of it** -- the D3D11 array-texture copy and staging map,
+blocking, on the main thread. `read-back wait` reads 0.0-0.1ms because it times
+the *promise*, and by the time the promise is awaited the work is already done.
+That is why the transfer looked free for three rounds of this investigation.
+
+Two things follow from the per-megapixel figures. Both views compute to the
+same 4.93MP, so **the AVC444 auxiliary view is a full-size picture**: a paired
+picture reads back 14.8MB, two whole NV12 frames. And at ~101 copies per 5s
+this is **roughly 69% of the main thread**, which is what the rest of the
+pipeline is queueing behind -- `queue` 18-33ms, `draw` 47-62ms, flush 68ms,
+and in a worse window a decode backlog that took `decode` to 617ms before
+draining.
+
+So AVC444 does not cost twice as much because combining is expensive.
+Combining is 0.9-1.6ms. It costs twice as much because it demands a **second
+full-frame GPU-to-CPU readback**, and that readback is the pipeline.
+
+This also vindicates `COMBINE_MAX_PIXELS` while correcting the reasoning behind
+it. The 4MP threshold is right -- this session is 4.93MP and would have
+declined to combine had the measurement not overridden it -- but the cost it
+was set against was the shader and the uploads, which together are under 2ms.
+The real curve is the readback's.
+
+**What is not yet settled** is whether the cost is a transfer or a fixed stall
+per call, because only one framebuffer size has been sampled. 34.6ms for 7.4MB
+is ~214MB/s, which looks like a transfer, but a stable ms/MP at *one* size
+proves nothing about proportionality. Resizing the client and re-reading
+`copy`'s ms/MP settles it: steady means a transfer, rising as the area falls
+means a fixed stall.
+
+If it is a transfer, the fix follows the banding already built everywhere else.
+`copyTo()` accepts a `rect` and is currently handed the whole coded frame every
+picture, while the plane uploads are banded to the damage and the shader is
+scissored to it -- the narrowest stage of the pipeline feeding off the widest.
+Restricting the rect to the damaged rows would cut it in proportion, with the
+v1 auxiliary layout rounding outward to its 16-row bands as `auxV1LumaBands()`
+already does, and a resync still copying everything.
+
+It would transform desktop work and do nothing for full-screen video, which
+damages every row. For video at this resolution the answer stays lever 1 or the
+4MP gate.
+
+#### Outcome: copy the damaged rows, and gate on what the copy costs
+
+Both views now copy only the rows their region rects touch, rounded outward to
+16. Measured on a Windows host at 2992x1648 (4.93MP), light typing, combining
+forced on:
+
+| | no banding | main only | both views |
+|---|---|---|---|
+| main view copy | 34.6ms | 5.6ms | 7.0ms |
+| auxiliary view copy | 27.3ms | 26.9ms | 7.4ms |
+| main thread in `copyTo()` | ~77% | ~24% | **~16%** |
+
+The pipeline behind it went with it: `decode` from 617ms at its worst and
+28-38ms in steady state to 1.1-3.8ms, `queue` to nil, `draw` from 20-36ms to
+7.4-11.7ms.
+
+**Windows declares real damage on both views**; the xrdp fork declares a full
+frame on both, deliberately (`xrdp_encoder.c`, to keep the two chroma sources
+refreshing from the same instant), so none of this fires there until
+`XRDP_AVC444_DAMAGE_RECTS=1` -- and the fork's own comment notes that only
+16-aligned rects are bit-exact, which is the shape this wants anyway.
+
+**No per-layout band arithmetic was needed.** Rounding outward to 16 is exactly
+what `auxV1LumaBands()` does to reach the v1 layout's 16-row bands, and a
+superset of the v2 layout's one-to-one rows and both layouts' chroma rows at
+`y >> 1`. `tests/h264-copy-band.mjs` lifts that inverse out of `Yuv444.js` and
+checks all three mappings rather than trusting the argument.
+
+**Banding is then exhausted, and the gate had to change.** At 3-5% span the
+copies are 0.15-0.25MP but still cost 7-11ms, so the per-call stall now
+dominates -- fitted at 5-10ms, well above the 2.7ms a two-point fit suggested.
+Narrowing further buys nothing. But that also means cost is no longer a
+function of framebuffer area, which is all `COMBINE_MAX_PIXELS` could see: at
+4.93MP it declined to combine on sessions costing ~9ms a picture.
+
+So the threshold is now a prior only, raised to 4K, with a measured gate
+underneath: a busy window gives up combining when it exceeds both
+`COMBINE_COPY_TRIP_MS` (20ms a picture) and `COMBINE_COPY_TRIP_SHARE` (30% of
+wall clock inside `copyTo()`).
+
+Both, because each is wrong alone. Per picture over-reports on an idle
+session: the per-call cost falls as a session gets busier, since part of it is
+waiting for the decoder to have a frame ready, so a near-idle Windows desktop
+measured 33-38ms a picture while spending 4.6% of the main thread -- over any
+threshold worth setting, in the case where 4:4:4 is worth most and costs
+least. The share is wrong in the opposite direction: it under-reports once a
+session has been throttled to a crawl, since few pictures cost little however
+dear each is. Measured pairs, per picture against share: Windows idle
+33-38ms/4.6%, Windows typing 8-12ms/17-19%, xrdp with glxgears 17ms/70%,
+full-screen video ~42ms/45%. 30% is the least evidenced constant here -- no
+capture yet shows a session genuinely suffering between 20% and 60%.
+
+**This is not the mistake adaptive suspension made.** That design failed
+because timing GPU execution needs a `gl.finish()` per picture, stalling the
+pipeline the gate exists to protect, so it gated on symptoms instead. None of
+that applies to `copyTo()`'s prologue: it is a wall-clock delta across a
+synchronous call, exact and free, on a path already paying it. The earlier
+reasoning was right about GPU work and this is not GPU work.
+
+The sync-timeout and slow-flush latches stay as the safety net beneath it.
+Note their signal is decoder latency, not display cost -- see above -- which
+is worth revisiting now that the latency has collapsed.
+
+#### xrdp's damage: what was measured, and what was inferred
+
+Windows declares tight region rects; the xrdp fork declared a single
+full-frame rect for AVC444 by design until 2026-09-12. Once that was fixed,
+the rects arriving still covered 34-93% of rows, with `span` and `damage`
+equal.
+
+**Every one of those measurements was taken with glxgears running**, which
+animates a window continuously. A window that is a third of the screen
+legitimately damages a third of the screen every frame, and it does so
+contiguously -- which is `span` equal to `damage` without anything unusual
+happening. So the figures say what glxgears costs and nothing about what a
+desktop costs. There is at present **no post-fix measurement of light typing
+on xrdp**, and none of the conclusions below should be read as if there were.
+
+What can be said from the code rather than from those numbers is that
+xorgxrdp has a mechanism that would coarsen damage, in
+`module/rdpClientCon.c`, `rdpCapRect()`:
+
+```c
+if (num_rects > MAX_CAPTURE_RECTS)   /* 15, rdpCapture.h */
+{
+    /* the dirty region is too complex, just get a rect that
+       covers the whole region */
+    rect = *rdpRegionExtents(cap_dirty);
+```
+
+Sixteen dirty rects anywhere on screen and the whole region becomes its
+bounding box -- a cursor blink, a scrollbar, a tray clock and some text would
+do it, and the extents then run corner to corner. That is a real hazard for
+the copy banding, which can only narrow to what the server declares. But it
+was **not** demonstrated by the captures above: contiguous animating damage
+and a collapsed region look identical in `span` versus `damage`, so that
+comparison cannot tell them apart.
+
+The measurement that would settle it is light typing on xrdp with
+`h264CombineLog` on, reading the `band` line: a few per cent damage means the
+region survives and banding works there as it does on Windows; tens of per
+cent for a caret and a clock means the collapse is firing and
+`MAX_CAPTURE_RECTS` is worth raising -- or better, collapsing to a bounded
+number of row bands, since every consumer downstream wants rows anyway. Do
+that before changing anything in xorgxrdp.
+
+Independently of which it is, a single bounding span in the client is
+defeated by a clock in one corner and a caret in the other, which is why
+`copyBandsFor()` produces several.
+
+#### The per-call floor, and a threshold that outlived its calibration
+
+Windows, light typing at 4.93MP, both views banded to 3% of their planes, one
+band each (multi-band never fires there -- the rects are tight and
+contiguous):
+
+```
+  copy    chroma 8.1ms 53.71ms/MP  |  luma 8.8ms 59.02ms/MP
+  band    78 main: banded 78 (100%) copied 3% damage 3% in 1.0 bands
+          aux 32 views: banded 32 (100%) copied 3% damage 3% in 1.0 bands
+```
+
+3% of 4.93MP is 0.148MP, which at 6.5ms/MP is under a millisecond of
+transfer. The copies cost 6-18ms. **Banding has reached its limit**: what is
+left is per-call, narrowing further buys nothing, and AVC444 pays it twice per
+paired picture whatever the damage.
+
+**The per-call cost is not fixed -- it falls as the session gets busier.**
+Measured across four windows of one session: 17.5ms at 1.4 pictures a second,
+8.5ms at 5.2, and **6.2ms at 20.6**. So part of it is waiting for the decoder
+to have a frame ready, which shrinks when frames are already queued, rather
+than the transfer or a constant stall. A single window read in isolation will
+mislead about it, which the 2.7ms of the original two-point fit and an
+intermediate reading of 8-12ms both did in opposite directions.
+
+At steady state that is 8.3ms of copy per picture (103 main views at 6.2ms
+plus 33 auxiliary at 6.5ms over 5s), against the 20ms the gate trips at -- so
+better than two times headroom -- and 12-17% of the main thread, from ~77% before
+any of this.
+
+**And it exposed a stale threshold.** That session suspended combining:
+
+```
+gave up 4:4:4 combining: mean flush 11.1ms over 142 syncs in 10s, over the 8ms
+```
+
+Copy was ~12ms a picture, under `COMBINE_COPY_TRIP_MS`, so the gate
+that measures the cost directly correctly held off -- and the flush latch
+overrode it. `COMBINE_FLUSH_TRIP_MS` was 8ms, set in September when combining
+cost 30-60ms a picture and 4:4:4 flushed at 16-22ms against 4:2:0's 0.6ms.
+
+A flush is the display waiting for the decoder, and under combining that wait
+is mostly the copy -- flush is roughly copy + decode + the display's own work.
+So **a flush threshold below the copy threshold fires first every time**, by
+construction, on a cost the copy gate has already judged affordable and
+without being able to say why. It is now derived as
+`COMBINE_COPY_TRIP_MS * 1.5`, so the two cannot drift apart again. What the
+latch is still for is main-thread congestion the copy does not explain, and
+for that it has to sit above the copy gate rather than below it.
 
 ## Colour range
 

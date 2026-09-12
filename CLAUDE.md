@@ -189,9 +189,15 @@ runtime overrides, as window global / query param / localStorage:
 4:2:0 on missing WebGL2, a lost context, or an unreadable pixel format.
 
 Combining costs a plane read-back and a plane upload per view, which is what
-makes AVC444 dearer than AVC420 and why it scales badly with resolution. Four
-things trim it: a main view whose auxiliary view follows is uploaded but never
-painted (the `h264` instruction carries a trailing `<paired>` flag, set by
+makes AVC444 dearer than AVC420. **The read-back is almost all of it, and it
+is not where it was looked for.** `VideoFrame.copyTo()`'s *synchronous* half --
+the D3D11 array-texture copy and staging map, before the promise exists --
+measured 2026-09-12 at ~6.5ms per megapixel plus a 5-10ms per-call stall,
+against under 2ms for the uploads, the shader and the blit together. It used
+to scale with resolution; since both views' copies are limited to the damaged
+rows it scales with damage. Four things trim it: a main view whose auxiliary
+view follows is uploaded but never painted (the `h264` instruction carries a
+trailing `<paired>` flag, set by
 guacd from MS-RDPEGFX LC=0, because only the server knows before the second
 access unit arrives); the renderer draws into an `OffscreenCanvas` and hands
 the drawing buffer over with `transferToImageBitmap()` rather than being read
@@ -208,13 +214,85 @@ frame-equivalent, *cheaper* per unit of change than luma. Chroma pictures
 decoding ~1.74x slower for 3.8x the bytes is sublinear and unremarkable. The
 comparison is only apples to apples once divided by N.
 
-A fifth, and the only one that moved the needle: `texSubImage2D` uploads only
-the rows the damage rects touch, merged and rounded outward (`bandsFor()`, and
-`auxV1LumaBands()` for the v1 layout, which scatters an output row across
-16-row bands). Rows rather than rectangles because plane rows are contiguous
-and the packed chroma layouts address both halves of a row.
+A fifth: `texSubImage2D` uploads only the rows the damage rects touch, merged
+and rounded outward (`bandsFor()`, and `auxV1LumaBands()` for the v1 layout,
+which scatters an output row across 16-row bands). Rows rather than rectangles
+because plane rows are contiguous and the packed chroma layouts address both
+halves of a row.
 
-**Measure before optimising this further** — `tests/bench/README.md`. The four
+And a sixth, which is the one that mattered: **`copyTo()` reads only those
+rows too** (`copyBandsFor()`, rounded outward to 16 -- exactly what
+`auxV1LumaBands()` does to reach the v1 layout's bands, and a superset of the
+v2 layout's one-to-one rows and both layouts' chroma at `y >> 1`, which is why
+one band serves both views). Until then the narrowest stage of the pipeline
+was fed by the widest: the uploads and the shader were limited to the damage
+while the copy read the whole frame every picture. On a Windows host at
+2992x1648 with light typing, main-thread time inside `copyTo()` went from ~77%
+to ~16%, and `decode` from 28-38ms to 1-4ms behind it.
+
+**Several bands, not one span.** A single bounding span is defeated by
+anything scattered -- a clock in one corner and a caret in the other span the
+whole screen between them, and a desktop reliably has both. Each extra
+`copyTo()` is a fixed stall (~3ms), so two regions are worth separating only
+when the gap saves more transfer than the call costs: `minWorthwhileGap()`
+derives that from the width (~309 rows at 2992 wide, asking a gap to save
+twice what it costs), and `COPY_BAND_MAX_BANDS` caps it at four by closing the
+cheapest gaps first.
+
+**It only fires where the server declares real damage**, and the alignment it
+needs differs by chroma layout. FreeRDP's `general_ChromaV1ToYUV444` walks the
+v1 layout's 16-row tiles *relative to the rect* while the packing shader
+anchors them at frame row 0: after a 16k-row offset the full-frame walk stands
+at `uY = 8k` and the rect-relative walk needs `uY_rect + roi->top / 2`, so the
+two coincide exactly when, and only when, the top is a multiple of 16.
+`general_ChromaV2ToYUV444` has no tiling and no counters -- every row is
+computed from the absolute frame row -- so it needs only an even top. Both
+address chroma columns at `roi->left / 2` and `/ 4` and select destination
+phases on `4x+0` / `4x+2`, so both want a 4-aligned left.
+
+The fork declared a single full-frame rect on both views until 2026-09-12, on
+that invariant; it now rounds the damage rects outward to that grid instead
+(vertical 16 for v1, 2 for v2, horizontal 4 for both) and gives the same list
+to both views, which also keeps main's even chroma rows and aux's odd rows
+refreshing from one frame. `XRDP_GFX_AVC444_FULL_RECTS=1` is the kill switch,
+and `~/aa444work/aa444map` quantifies the chroma error if the alignment is ever
+in doubt.
+
+**An auxiliary view's declared rects must cover what it carries, not what the
+frame changed.** Under `CHROMA_INTERVAL=N` accel-assist accumulates damage
+across the skipped frames, so declaring only the current frame's leaves stale
+chroma wherever the screen changed in between -- fresh luma over old chroma,
+which reads as colour ghosting and is masked at high damage, where the client
+uploads whole planes anyway. How much this costs depends on whether the damage
+moves: glxgears animates one region, so its accumulated union is barely larger
+than one frame (`aux copied 37%` against `main copied 34%`), while a pointer
+dragged across a desktop would spread it.
+
+Measured on xrdp with glxgears at 2992x1648 once both were fixed: the auxiliary
+copy fell from 29.3ms to 12.6ms, per-picture copy from 22.4ms to 17.0ms, and
+throughput rose from ~30 to ~41 pictures a second.
+
+**Every post-fix xrdp number here was taken with glxgears running**, including
+the 34-93% damage that made the copies expensive -- an animating window a third
+of the screen wide legitimately damages a third of the screen, contiguously.
+There is no post-fix measurement of light typing on xrdp, so nothing here says
+whether ordinary desktop work trips the gate there or bands as cheaply as it
+does on Windows. That is the measurement to take before tuning anything for
+xrdp, and before touching `MAX_CAPTURE_RECTS` in xorgxrdp -- see
+`docs/rdp-h264.md`.
+
+**`tests/bench` cannot see the dominant cost, by construction.** Its
+`copyTo()` row reads 0.29ms at 1080p against ~14ms in the field, because it
+feeds pre-decoded frames that already live in system memory; a frame from a
+hardware decoder is a D3D11 array texture, and pulling its planes out means a
+texture copy and a staging map the bench never performs. Everything below is a
+true measurement of the wrong thing. Do not conclude from it that the
+read-back is cheap -- that is what hid the real cost for months.
+`h264CombineLog`'s `copy` and `issue` stages measure it live, and split
+`issue` into `allocationSize()` (0.0ms), the buffer pool (0.0ms) and
+`copyTo()` (all of it).
+
+**Measure before optimising the rest** — `tests/bench/README.md`. The four
 downstream changes are worth ~1.1x on their own, not the 2x they look like on
 paper: `texSubImage2D` of the six planes is 60-90% of the whole combine (2.1ms
 of 3.8ms at 1080p, 7.2ms of 17ms at 4K on an Intel UHD 770) and none of them
@@ -234,10 +312,15 @@ What is there now is a **latch, not a controller**, and it gates on the
 symptom rather than the cost. It watched the decode backlog from 2026-09-09
 and **sync gate timeouts from 2026-09-11**:
 
-* **Symptom, because cost cannot be measured cheaply.** Timing GPU execution
-  needs a `gl.finish()` per picture -- stalling the pipeline the gate exists to
-  protect -- or timer queries that are not reliably available. A held sync ack
-  needs neither and is what the user actually feels.
+* **Symptom, because *GPU* cost cannot be measured cheaply.** Timing GPU
+  execution needs a `gl.finish()` per picture -- stalling the pipeline the gate
+  exists to protect -- or timer queries that are not reliably available. A held
+  sync ack needs neither and is what the user actually feels. That reasoning
+  still holds, and it is exactly why it does **not** apply to
+  `COMBINE_COPY_TRIP_MS` (lever 3): `copyTo()`'s prologue is blocking
+  main-thread time, so timing it is a wall-clock delta across a synchronous
+  call -- exact, free, on a path already paying it. The old argument was about
+  GPU work, and the dominant cost turned out not to be GPU work.
 * **Sync timeouts, not the backlog, because the backlog never grows.** `012`'s
   pacing holds each ack until the backlog is within `MAX_PIPELINE_DEPTH`, so
   guacd slows to the client's pace and the queue stays short: a session
@@ -353,21 +436,89 @@ three sit at levels the others cannot reach:
 3. **The client-side combine gate.** Acts in the decoder's output callback,
    after both access units have already been decoded, so it removes the combine
    and nothing else -- never the decode or the bandwidth, which is why it does
-   not replace lever 1. Two parts: a static threshold on framebuffer area
-   (`COMBINE_MAX_PIXELS`), and a latch that gives up combining when sync
-   acks keep timing out. The threshold is a good prior that avoids a bad
-   few seconds at the start of a 4K session; the latch is the safety net under
-   it, and the only part that adapts to the client's actual GPU rather than to
-   a constant measured on one.
+   not replace lever 1. Three parts, in the order they act:
 
-   Neither part measures the combine's cost, deliberately -- see the adaptive
-   suspension note above for why that is harder than it looks and what it cost
-   the first time.
+   * `COMBINE_MAX_PIXELS`, a static threshold on framebuffer area, raised to
+     4K on 2026-09-12. A prior only -- a ceiling on the worst case a session
+     may open with before anything has been measured. It was 4MP, set against
+     the shader and the uploads, which were later measured at under 2ms
+     together; it was declining to combine on sessions costing ~9ms a picture.
+   * `COMBINE_COPY_TRIP_MS` **and** `COMBINE_COPY_TRIP_SHARE` together --
+     20ms of synchronous copy per picture *and* 30% of wall clock spent
+     inside `copyTo()`, over a busy window. This is the pair that decides.
+     Each is wrong alone: per picture over-reports on an idle session, where
+     the per-call cost rises because part of it is waiting for a frame to be
+     ready (a near-idle Windows desktop measured 33-38ms a picture at 4.6% of
+     the main thread); the share under-reports once a session has already
+     been throttled to a crawl. Measured pairs: Windows typing 8-12ms/17-19%,
+     xrdp with glxgears 17ms/70%, full-screen video ~42ms/45%.
+   * The sync-timeout and slow-flush latches, as the safety net beneath both.
+     Their minimums are what decides which fires: the sync-timeout latch has
+     none (3 timeouts in 10s), the copy gate needs 30 pictures in 10s, the
+     flush latch 100 syncs. So a session degraded to a few frames a second --
+     fullscreen video at high resolution, say -- is caught by the
+     sync-timeout latch first and the copy gate at the next window boundary,
+     while the flush latch may never reach its minimum at all.
+
+   The middle one *does* measure the cost, and legitimately -- see the
+   adaptive suspension note above for why that is the opposite of the mistake
+   made in September rather than a repeat of it. The area threshold and the
+   latches still do not, deliberately.
 
    `sync_hold` reports the holds once a minute, split by mode (syncs/s, share
    held, mean hold across all syncs and across held ones, max, timeouts), with
    session totals in `describeState()` -- the numbers the timeout trip was set
-   from, and the ones to re-measure against if it misfires.
+   from, and the ones to re-measure against if it misfires. **It reports only
+   a window containing a sync timeout** unless `h264CombineLog` asks for all of
+   them: it was the last always-on periodic reporter in the file, once a minute
+   for the life of every session, where everything else speaks on a state
+   change.
+
+   **The recovery window doubles each trip** (`COMBINE_RECOVER_MS` 30s, capped
+   at `COMBINE_RECOVER_MAX_MS`, 8 minutes) **and eases by one doubling per
+   `COMBINE_BACKOFF_DECAY_MS` (5 minutes) of combining without a trip**, so
+   30s-60s-120s-240s-480s on the way up and the same steps back down. Without
+   the decay the backoff is monotonic for the life of the session and a video
+   at lunchtime leaves an eight-minute wait in front of an unrelated trip that
+   evening -- the cap's fault again, only softer. One doubling per clean
+   stretch rather than a reset, so a session that trips just often enough to
+   keep clearing the bar still backs off overall. Unlike the cap's forgiveness
+   this is reachable, because nothing is terminal: a backed-off session always
+   resumes eventually and can accrue the clean time, where under the cap
+   combining never restarted so the clock never ran. There is no attempt
+   limit. A cap
+   on attempts was tried first, on the sound reasoning that a client recovering
+   from transient load and one that cannot sustain the combine look identical
+   sample by sample -- but a permanent latch was the wrong instrument for it:
+   it condemned the rest of the session for a workload that had passed, and
+   bounded re-probing no better than backing off. Re-probing costs a
+   whole-plane resync (`suspendCombining` leaves `resyncNeeded` set) plus a
+   copy window spent combining at a price the client cannot afford, since the
+   gate needs that long to trip again -- about a quarter of the session at 30s
+   between attempts, a few per cent at eight minutes. Flapping itself is
+   nearly invisible, since only newly painted regions change chroma
+   resolution; the resync is the cost, not the appearance.
+
+   **Probing is the only signal there is.** A suspended session paints 4:2:0,
+   which never times out and never flushes slowly, so nothing in that state can
+   report that the video has ended -- and `QUIET_SYNCS_PER_SECOND` cannot
+   either at a framebuffer where both modes run below it, which is every
+   session large enough to trip. So it has to be paid occasionally; the backoff
+   is what makes it rare and `COMBINE_PROBE_WINDOW_MS` (2s, 8 pictures) is what
+   makes it short. The first window after a resume uses those instead of the
+   full 10s and 30: the whole of a probe is spent combining at a price the
+   client cannot afford, and ten seconds of that on sustained video is a
+   visible stutter on a timer, far worse to watch than its share of the session
+   suggests. It can be short because the answer is not a close one -- a session
+   that cannot sustain the combine copies whole planes at ~42ms a picture
+   against a 20ms line. What is left is one resync picture per attempt, since
+   resuming leaves `resyncNeeded` set.
+
+   **A copy window is never discarded for having too few pictures**, only held
+   open until it has them. Discarding meant a session below three pictures a
+   second -- an ordinary rate at a large framebuffer, and exactly where the
+   combine hurts -- never reached a verdict and combined indefinitely at
+   whatever it cost.
 
    **The hold cannot see a slow display queue.** `Client.js` acks a sync only
    after `display.flush()` completes, and the decoder's gate runs after that,
@@ -550,21 +701,32 @@ render's 0.82%. The cost of separating them is a desktop scaled 180% inside a
 200% framebuffer drawing its UI ~10% smaller than nominal, which is legible and
 adjustable on the host where a resample is neither.
 
-**4:4:4 combining is declined above 4 megapixels** (`COMBINE_MAX_PIXELS` in
-`H264Decoder.js`, overridable as `h264CombineMaxPixels`). The combine is a
-read-back, six texture uploads and a shader pass per picture, all proportional
-to pixels and all contending with the hardware video decoder on the same GPU:
-`tests/bench` puts it at ~1.37ms per megapixel, so 4MP is about a third of a
-60fps frame. 1080p spends 17% of a frame on it and 1440p 30%; 4K would spend
-68% and a 5.5MP native-resolution session 45%, the latter measured in the field
-as a frame backlog and sync timeouts.
+**4:4:4 combining is declined above 4K** (`COMBINE_MAX_PIXELS` in
+`H264Decoder.js`, overridable as `h264CombineMaxPixels`) **and given up when
+the copy costs too much** (`COMBINE_COPY_TRIP_MS`, 20ms of mean synchronous
+copy per picture, together with `COMBINE_COPY_TRIP_SHARE`, 30% of wall clock
+spent copying -- both, over a busy window).
 
-**Keyed on framebuffer area, deliberately.** The desktop scale was tried first
-and is wrong twice over: it only says whether HiDPI scaling was applied, so a
+The threshold was 4MP until 2026-09-12, on the reasoning that the combine is a
+read-back, six texture uploads and a shader pass, all proportional to pixels.
+The uploads and the shader are proportional to pixels and are also under 2ms
+together; the read-back is `copyTo()`'s synchronous half, and once it is
+limited to the damaged rows it is not a function of the framebuffer at all. A
+4.93MP Windows session doing desktop work copies 3-5% of its planes and spends
+~9ms a picture, which the old threshold declined outright. What it was right
+about was full-screen video, which damages every row and costs ~42ms a
+picture -- and that the measured gate catches within a window, on any
+resolution, without being told.
+
+**The area threshold is keyed on framebuffer area, deliberately.** The desktop
+scale was tried first and is wrong twice over: it only says whether HiDPI scaling was applied, so a
 4K display at `devicePixelRatio` 1 slips past it and combines at 8.3MP; and the
 cost is not a property of the host at all -- the same picture costs the same
 whatever sent it, which is why this was taken for an xrdp problem until a
-Windows session was run at native resolution. `?h264Chroma444=on` overrides,
+Windows session was run at native resolution. `window.__h264Chroma444 = true`
+overrides (or the `h264Chroma444` key in localStorage -- a query parameter is
+read but unreachable on a live session, since client.html rebuilds its own URL
+on every launch and relaunch),
 and the declined case logs once saying why. **Re-checked at every main view while
 combining** (`chroma_declined`): the framebuffer is resized after connecting, and
 a fit that passed through 2240x1648 (3.7MP) as the first auxiliary view arrived

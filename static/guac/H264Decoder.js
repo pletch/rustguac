@@ -94,16 +94,33 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * Default framebuffer area, in pixels, up to which AVC444 views are
      * combined into 4:4:4. See combineMaxPixels().
      *
+     * A fast prior, and no longer the thing that decides. It was 4MP, set
+     * against the shader and the plane uploads; those were later measured at
+     * under 2ms together, while the cost that matters -- copyTo()'s
+     * synchronous prologue -- is not a function of the framebuffer at all
+     * once the copy is narrowed to the damaged rows. A 4.93MP Windows
+     * session doing desktop work copies 3-5% of its planes and spends ~9ms a
+     * picture; the old threshold declined to combine on exactly the sessions
+     * that could afford it.
+     *
+     * So this is now only a ceiling on the worst case a session can open
+     * with, before COMBINE_COPY_TRIP_MS has had a window to measure anything:
+     * 4K, beyond which even a banded copy's per-call floor and the whole-plane
+     * copy of a resync are more than a session should risk unmeasured.
+     * Between that and the measured gate, resolution is no longer the
+     * question -- what the screen is doing is.
+     *
      * @private
      * @constant
      * @type {!number}
      */
-    var COMBINE_MAX_PIXELS = 4000000;
+    var COMBINE_MAX_PIXELS = 8300000;
 
     /**
      * How long a session that gave up combining must stay quiet -- under
-     * QUIET_SYNCS_PER_SECOND, with no sync gate timeout -- before it tries
-     * combining again, in milliseconds.
+     * QUIET_SYNCS_PER_SECOND, with no sync gate timeout -- before its **first**
+     * attempt at combining again, in milliseconds. Each further trip doubles
+     * it; see recoverWindow().
      *
      * Long, because the point is to distinguish "the video ended" from "the
      * video paused between scenes". Resuming is not free: the first combine
@@ -121,19 +138,85 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var COMBINE_RECOVER_MS = 30000;
 
     /**
-     * How many times a session may give up and resume before giving up for
-     * good.
+     * The longest the recovery window may grow to, in milliseconds.
      *
-     * A client recovering from a transient load looks the same, sample by
-     * sample, as one that simply cannot sustain the combine. The difference is
-     * only visible over time, and this is what draws the line: three trips is
-     * a client that keeps failing, not a desktop that had a video playing.
+     * There used to be a cap on the number of attempts instead, on the
+     * reasoning that a client recovering from transient load and one that
+     * simply cannot sustain the combine look identical sample by sample, and
+     * only time separates them. That much is true; a permanent latch was the
+     * wrong instrument for it. It condemned the rest of the session for a
+     * workload that had passed -- a video at lunchtime meant reading text at
+     * 4:2:0 until the next reconnect -- and it bounded the cost of re-probing
+     * no better than backing off does.
+     *
+     * What re-probing costs is a whole-plane resync (suspendCombining leaves
+     * resyncNeeded set, so the first picture back copies and uploads every
+     * row) plus the length of a copy window spent combining at a price the
+     * client cannot afford, since the gate needs that long to measure and trip
+     * again. At 30s between attempts that is around a quarter of the session
+     * degraded, indefinitely. Doubling to eight minutes takes it to a few per
+     * cent while never giving up: when the load passes, the next attempt
+     * sticks.
+     *
+     * Probing is the only signal there is. A suspended session paints 4:2:0,
+     * which never times out and never flushes slowly, so nothing in that state
+     * can report that the video has ended -- and QUIET_SYNCS_PER_SECOND cannot
+     * either at a framebuffer where both modes run below it. So it must be
+     * paid occasionally; backing off is what makes it cheap.
      *
      * @private
      * @constant
      * @type {!number}
      */
-    var COMBINE_MAX_TRIPS = 3;
+    var COMBINE_RECOVER_MAX_MS = 480000;
+
+    /**
+     * How long combining must run without tripping before the backoff eases
+     * by one doubling.
+     *
+     * Without this the backoff is monotonic for the life of the session: a
+     * video at lunchtime leaves an eight-minute wait standing in front of the
+     * evening's first trip, hours later and unrelated. That is the same fault
+     * the attempt cap had, only softer -- a session condemned by a workload
+     * that has passed.
+     *
+     * One doubling per clean stretch rather than a reset, so a session that
+     * trips just often enough to keep clearing the bar still backs off
+     * overall. Five minutes is long enough not to be reached by a recovery
+     * window plus a lull, and short enough that a working afternoon returns to
+     * the base window.
+     *
+     * Reachable in a way the cap's forgiveness was not: nothing here is
+     * terminal, so a backed-off session always resumes eventually and can
+     * accrue the clean time. Under the cap it could not -- combining never
+     * restarted, so the clock never ran.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_BACKOFF_DECAY_MS = 300000;
+
+    /**
+     * When the current uninterrupted stretch of combining began, or 0.
+     *
+     * @private
+     * @type {!number}
+     */
+    var combineCleanSince = 0;
+
+    /**
+     * How long the session must be calm before the next attempt: the base
+     * window doubled once per trip so far, capped.
+     *
+     * @private
+     * @returns {!number}
+     */
+    function recoverWindow() {
+        var doublings = Math.min(Math.max(combineTrips - 1, 0), 16);
+        return Math.min(COMBINE_RECOVER_MS * Math.pow(2, doublings),
+                COMBINE_RECOVER_MAX_MS);
+    }
 
     /**
      * Safety timeout (ms) for the sync gate. If pending decodes do not drain
@@ -784,6 +867,24 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var combineLatchedOff = false;
 
     /**
+     * When combining was last given up, or 0 if it never has.
+     *
+     * The recovery window is measured from here rather than only from the
+     * quiet and timeout clocks, because neither of those starts at the trip.
+     * `lastBusyAt` only moves when a one-second bucket exceeds
+     * QUIET_SYNCS_PER_SECOND, and a session slow enough to trip the copy gate
+     * never gets there -- measured in the field at 0.5-1.7 syncs/s against a
+     * threshold of 10. So `lastBusyAt` sat at its initial 0, `now - 0` passed
+     * the window within 30s of page load, there were no timeouts either, and
+     * the latch resumed on the very next sync while reporting that it had
+     * waited 30s.
+     *
+     * @private
+     * @type {!number}
+     */
+    var combineLatchedOffAt = 0;
+
+    /**
      * When the last sync gate timeout happened, in ms, or 0 if none has. A
      * suspended session resumes only once COMBINE_RECOVER_MS have passed
      * without one.
@@ -800,6 +901,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @type {!number}
      */
     var combineTrips = 0;
+
 
     /**
      * Sync timeouts, in ms, charged to combining within the last
@@ -845,7 +947,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * interval between pictures, which is what 012's back-pressure has already
      * throttled the server to -- so it read its own output as its input and
      * had to be kept from hunting. This gives up once, one way, and resumes
-     * only after COMBINE_RECOVER_MS clear, at most COMBINE_MAX_TRIPS times.
+     * only after a clear window -- doubling each trip, so a client that keeps
+     * failing is probed rarely rather than condemned.
      *
      * **And it gates on the symptom, not the cost.** Measuring the combine
      * means timing GPU execution, which needs a gl.finish() per picture --
@@ -908,41 +1011,165 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     function suspendCombining(reason) {
 
         combineLatchedOff = true;
+        combineLatchedOffAt = nowMs();
         combineTrips++;
         recentSyncTimeouts = [];
         flushWindow = null;
+        copyWindow = null;
+        combineProbing = false;
+        combineCopyMs = 0;
 
         diagnostic('chroma_suspended', 'gave up 4:4:4 combining: ' + reason
                 + ' -- the client is setting the frame rate. Painting 4:2:0'
-                + (combineTrips >= COMBINE_MAX_TRIPS
-                    ? ' for the rest of the session, having given up '
-                        + combineTrips + ' times'
-                    : ' until the session has been quiet (under '
-                        + QUIET_SYNCS_PER_SECOND + ' syncs/s, no timeouts) for '
-                        + (COMBINE_RECOVER_MS / 1000) + 's')
-                + '; ?h264Chroma444=on forces it back on', true);
+                + ' until the session has been quiet (under '
+                + QUIET_SYNCS_PER_SECOND + ' syncs/s, no timeouts) for '
+                + (recoverWindow() / 1000) + 's (trip ' + combineTrips
+                + '; each one doubles the wait, up to '
+                + (COMBINE_RECOVER_MAX_MS / 60000) + ' minutes)'
+                + '; window.__h264Chroma444 = true forces it back on now,'
+                + ' or the h264Chroma444 key in localStorage across'
+                + ' reconnects', true);
 
     }
 
     /**
-     * Mean flush time, in ms, above which a busy window while combining gives
-     * combining up; the window's length; and the syncs it must hold to count.
+     * Mean synchronous copy time per picture, in ms, above which a busy
+     * window while combining gives the combine up.
      *
-     * Measured at 1920x1072 on one client, playing the same video against the
-     * xrdp fork: 4:2:0 ran at 54.7 syncs/s with a mean flush of 0.6ms; 4:4:4
-     * at 33-41/s with 16-22ms, and 14ms even at 1920x896. No sync was held and
-     * none timed out in either mode, so the timeout trip could never see it:
-     * the client kept up, it just set a frame rate 40% lower. 8ms sits more
-     * than ten times above the one and well under the other.
+     * This is the gate the other two are proxies for. VideoFrame.copyTo()'s
+     * synchronous prologue is the cost of combining -- measured at 5-10ms of
+     * fixed per-call stall plus ~6.5ms per megapixel copied -- and everything
+     * downstream of it, the shader and the uploads and the blit, is under 2ms
+     * together. It is also blocking main-thread time, so it is what the user
+     * feels.
      *
-     * The minimum count keeps a static desktop combining. It sends a few
-     * syncs a second, well under 100 in a window, and its full chroma is what
-     * combining is for; only motion is worth giving it up for.
+     * Deliberately *not* the reason adaptive suspension was abandoned before.
+     * That design failed because timing GPU execution needs a gl.finish() per
+     * picture, stalling the pipeline the gate exists to protect. None of that
+     * applies here: this is a wall-clock delta across a synchronous call,
+     * exact and free, on a path that was already paying it.
+     *
+     * 20ms is a little over one frame at 60Hz. Measured per picture at
+     * 4.93MP: Windows typing 8-12ms, xrdp with glxgears 17ms, full-screen
+     * video copying whole planes ~42ms.
+     *
+     * **Necessary but not sufficient** -- COMBINE_COPY_TRIP_SHARE must also
+     * be exceeded. Per picture alone systematically over-reports on an idle
+     * session, because the per-call cost falls as a session gets busier: part
+     * of it is waiting for the decoder to have a frame ready, which shrinks
+     * when frames are already queued. A near-idle Windows desktop measured
+     * 33-38ms a picture while spending 4.6% of the main thread on copies --
+     * over any threshold worth setting, and the case where 4:4:4 is worth
+     * most and costs least.
      *
      * @private
      * @constant
+     * @type {!number}
      */
-    var COMBINE_FLUSH_TRIP_MS = 8;
+    var COMBINE_COPY_TRIP_MS = 20;
+
+    /**
+     * Share of wall clock spent inside copyTo() above which a busy window
+     * while combining gives the combine up, alongside COMBINE_COPY_TRIP_MS.
+     *
+     * The other half of the pair, and wrong on its own in the opposite
+     * direction: it under-reports once a session has already been throttled
+     * to a crawl, since few pictures cost little however dear each one is.
+     * Per picture catches the latency each frame carries; the share catches
+     * the client becoming the bottleneck. Requiring both is what tells a
+     * desktop that is merely quiet from one that is drowning.
+     *
+     * Measured shares: Windows idle 4.6%, Windows typing 17-19%, xrdp with
+     * glxgears 70%. 30% sits in the gap with room either side, but it is the
+     * least evidenced constant here -- no capture yet shows a session
+     * genuinely suffering at a share between 20% and 60%.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_COPY_TRIP_SHARE = 0.30;
+
+    /**
+     * Mean flush time, in ms, above which a busy window while combining gives
+     * the combine up.
+     *
+     * **Derived from COMBINE_COPY_TRIP_MS rather than set, because a flush
+     * threshold below the copy threshold can only ever pre-empt it.** A flush
+     * is the display waiting for the decoder, and under combining that wait
+     * is mostly the copy: flush is roughly copy + decode + the display's own
+     * work. So a session sitting exactly at the copy gate's limit flushes at
+     * something above it by construction, and a lower number here fires
+     * first every time -- on a cost the copy gate has already judged
+     * affordable, and without being able to say why.
+     *
+     * That is not hypothetical. This was 8ms, measured 2026-09-09 against a
+     * session where 4:2:0 flushed at 0.6ms and 4:4:4 at 16-22ms, when
+     * combining cost 30-60ms a picture. Once both views' copies were banded
+     * the same client ran at ~12ms of copy a picture and flushed at 11.1ms --
+     * healthy by every other measure, 14-22 syncs/s, decode 1-3ms, combine
+     * 0.4ms -- and the old threshold condemned it while the copy gate
+     * correctly held off.
+     *
+     * The multiplier is headroom for the decode and the display work that sit
+     * between the two figures. What this latch is still for is main-thread
+     * congestion the copy does not explain, and for that it has to sit above
+     * the copy gate rather than below it.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_FLUSH_TRIP_MS = COMBINE_COPY_TRIP_MS * 1.5;
+
+
+    /**
+     * Pictures a window must carry before its mean copy time is acted on.
+     * Over COMBINE_FLUSH_WINDOW_MS this is a few a second -- enough to mean
+     * something, and low enough that a mostly idle desktop still keeps full
+     * chroma, which is where it is worth having.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_COPY_MIN_PICTURES = 30;
+
+    /**
+     * The window and sample count used for the **first** measurement after
+     * resuming, rather than the full ones above.
+     *
+     * Resuming during a load that has not passed is a probe, and a probe has
+     * to be short, because the whole of it is spent combining at a price the
+     * client cannot afford. At the full window that is ten seconds of reduced
+     * frame rate every time -- which on sustained video is a visible stutter
+     * on a timer, and far worse to watch than its share of the session
+     * suggests.
+     *
+     * It can afford to be short because the answer it needs is not a close
+     * one. A session that cannot sustain the combine copies whole planes,
+     * measured at ~42ms a picture against a 16ms line; the full window exists
+     * to judge the marginal cases that arise while combining is working, not
+     * to decide whether a video is still playing.
+     *
+     * Eight pictures is enough for a mean that is not one outlier, and the
+     * resync that every resume begins with is already excluded upstream --
+     * flushCombineCost() does not report a picture that uploaded whole planes.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COMBINE_PROBE_WINDOW_MS = 2000;
+    var COMBINE_PROBE_MIN_PICTURES = 8;
+
+    /**
+     * Whether the next copy window is the first since resuming.
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var combineProbing = false;
     var COMBINE_FLUSH_WINDOW_MS = 10000;
     var COMBINE_FLUSH_MIN_SYNCS = 100;
 
@@ -955,11 +1182,78 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var flushWindow = null;
 
     /**
+     * The copy window in progress while combining, or null.
+     *
+     * @private
+     */
+    var copyWindow = null;
+
+    /**
+     * Synchronous copy time accumulated for the picture being combined, in
+     * ms, across both of its views.
+     *
+     * @private
+     */
+    var combineCopyMs = 0;
+
+    /**
      * Counts one sync's flush while combining, and gives combining up at the
      * end of a busy window whose mean flush is over COMBINE_FLUSH_TRIP_MS.
      *
      * @private
      */
+    function noteCombineCopy(copyMs) {
+
+        if (override('h264Chroma444') !== undefined || !combining
+                || combineLatchedOff || !(copyMs > 0)) {
+            copyWindow = null;
+            return;
+        }
+
+        var now = nowMs();
+
+        if (!copyWindow)
+            copyWindow = { start: now, pictures: 0, sumMs: 0 };
+
+        copyWindow.pictures++;
+        copyWindow.sumMs += copyMs;
+
+        var probing = combineProbing;
+        var windowMs = probing
+            ? COMBINE_PROBE_WINDOW_MS : COMBINE_FLUSH_WINDOW_MS;
+        var minPictures = probing
+            ? COMBINE_PROBE_MIN_PICTURES : COMBINE_COPY_MIN_PICTURES;
+
+        /* Both conditions, and the window is never thrown away for failing
+         * the count. Discarding it meant a session below the sample rate --
+         * three pictures a second, which at a large framebuffer is an
+         * ordinary rate and exactly where the combine hurts -- never reached
+         * a verdict at all, and combined indefinitely at whatever it cost. */
+        if (now - copyWindow.start < windowMs
+                || copyWindow.pictures < minPictures)
+            return;
+
+        var mean = copyWindow.sumMs / copyWindow.pictures;
+        var copyMsInWindow = copyWindow.sumMs;
+        var pictures = copyWindow.pictures;
+        var span = now - copyWindow.start;
+        copyWindow = null;
+        combineProbing = false;
+
+        var share = span > 0 ? copyMsInWindow / span : 0;
+
+        if (mean > COMBINE_COPY_TRIP_MS && share > COMBINE_COPY_TRIP_SHARE)
+            suspendCombining((probing ? 'probe: mean copy ' : 'mean copy ')
+                    + mean.toFixed(1) + 'ms a picture over ' + pictures
+                    + ' in ' + (span / 1000).toFixed(1) + 's, and '
+                    + (share * 100).toFixed(0) + '% of the main thread spent'
+                    + ' copying -- over both the ' + COMBINE_COPY_TRIP_MS
+                    + 'ms a picture and the '
+                    + (COMBINE_COPY_TRIP_SHARE * 100).toFixed(0)
+                    + '% share the combine is worth');
+
+    }
+
     function noteCombineFlush(flushMs) {
 
         if (override('h264Chroma444') !== undefined || !combining
@@ -1036,25 +1330,54 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     function maybeResumeCombining() {
 
-        if (!combineLatchedOff || combineTrips >= COMBINE_MAX_TRIPS)
-            return;
-
         var now = nowMs();
 
-        /* Not merely timeout-free: 4:2:0 never times out and never flushes
+        /* Combining and holding up: the backoff eases, so the session is not
+         * carrying this morning's video into tonight's first trip. */
+        if (!combineLatchedOff) {
+
+            if (combining && combineTrips > 0 && combineCleanSince
+                    && now - combineCleanSince >= COMBINE_BACKOFF_DECAY_MS) {
+
+                combineTrips--;
+                combineCleanSince = now;
+
+                diagnostic('chroma_backoff_eased', 'combining has held up for '
+                        + (COMBINE_BACKOFF_DECAY_MS / 60000) + ' minutes; the '
+                        + 'wait after the next trip drops to '
+                        + (recoverWindow() / 1000) + 's', true);
+
+            }
+
+            return;
+
+        }
+
+        var window = recoverWindow();
+
+        /* Three clocks, all against the backed-off window. The first is what
+         * guarantees a window exists at all: the other two can both be older
+         * than the trip, and on a session slow enough to trip they always are.
+         *
+         * Not merely timeout-free: 4:2:0 never times out and never flushes
          * slowly, so that alone would resume in the middle of the video that
-         * tripped it, trip again a window later, and spend every trip on one
-         * video. Quiet is what says the motion has passed. */
-        if (now - lastSyncTimeoutAt < COMBINE_RECOVER_MS
-                || now - lastBusyAt < COMBINE_RECOVER_MS)
+         * tripped it. Quiet is what says the motion has passed -- as far as
+         * anything can, from a state that generates no signal. */
+        if (now - combineLatchedOffAt < window
+                || now - lastSyncTimeoutAt < window
+                || now - lastBusyAt < window)
             return;
 
         combineLatchedOff = false;
+        combineProbing = true;
+        combineCleanSince = now;
 
-        diagnostic('chroma_resumed', 'resuming 4:4:4 combining: quiet, with no '
-                + 'sync gate timeout, for ' + (COMBINE_RECOVER_MS / 1000) + 's ('
-                + combineTrips + ' of ' + COMBINE_MAX_TRIPS
-                + ' attempts used)', true);
+        diagnostic('chroma_resumed', 'resuming 4:4:4 combining: '
+                + ((now - combineLatchedOffAt) / 1000).toFixed(0)
+                + 's since giving up, quiet and with no sync gate timeout for '
+                + (window / 1000) + 's (trip ' + combineTrips + '; the next '
+                + 'wait would be ' + (Math.min(window * 2,
+                    COMBINE_RECOVER_MAX_MS) / 1000) + 's)', true);
 
     }
 
@@ -1271,6 +1594,405 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var syncTimeouts = 0;
 
     /**
+     * The picture size of the last main view combined, as [w, h], or null.
+     * A copy narrowed to the damaged rows may only be uploaded into textures
+     * that already exist at the current size, so the first picture at a new
+     * size is copied whole.
+     *
+     * @private
+     */
+    var lastPictureSize = null;
+
+    /**
+     * The plane size of the last auxiliary view combined, as [w, h], or null.
+     * Tracked apart from the picture's: the v1 layout pads the auxiliary
+     * frame to a multiple of 16 rows, so the two are not the same number.
+     *
+     * @private
+     */
+    var lastAuxSize = null;
+
+    /**
+     * Rows are rounded outward to a multiple of this before being copied.
+     *
+     * Two reasons, neither about correctness -- the bands the renderer uploads
+     * are computed from the rects independently and are always inside this.
+     * It keeps the number of distinct copy sizes down, so the buffer pool
+     * keeps hitting (it is keyed by exact length, four deep per size), and it
+     * keeps the origin even, which chroma subsampling requires.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_ALIGN = 16;
+
+    /**
+     * The share of the plane a band may span before the whole frame is copied
+     * instead.
+     *
+     * Not a tuning constant -- it keeps the copy and the upload agreeing.
+     * Yuv444.js's merge() gives up and returns no bands at all once the
+     * damage covers BAND_LIMIT (0.75) of a plane, and a partial copy with no
+     * bands to upload it into has to be thrown away and resynced. Half is
+     * comfortably under that for the chroma planes too, which are half the
+     * height and so reach the limit sooner, and by the time damage spans half
+     * the screen the copy saves little anyway.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_MAX_SPAN = 0.5;
+
+    /**
+     * More regions than this and the renderer uploads whole planes, so a
+     * narrowed copy would have nothing to land in. Mirrors MAX_CLIP_RECTS in
+     * Yuv444.js.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_MAX_RECTS = 32;
+
+    /**
+     * Most separate copies one view may be split into.
+     *
+     * Each is a fixed stall, and the gap rule below only guarantees that each
+     * extra one pays for itself -- it does not bound how many there are. Four
+     * is enough for the shapes that motivate this (an editor and a clock, a
+     * terminal and a status bar) without letting a busy screen spend its
+     * budget on per-call overhead.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_MAX_BANDS = 4;
+
+    /**
+     * The two halves of the copy's measured cost, used to decide when a gap
+     * between damaged regions is worth a second copy rather than being read
+     * through.
+     *
+     * Fitted 2026-09-12 across two framebuffer sizes on one client: at 4.93MP
+     * a main view's copy took 34.6ms and at 1.72MP 13.8ms, which is
+     * 2.7ms + 6.5ms/MP to within 0.1ms at both points. Later windows put the
+     * fixed part nearer 5-10ms, so 3ms is the conservative end -- and
+     * conservative here means fewer, larger copies, which is the safe
+     * direction.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_FIXED_MS = 3;
+    var COPY_BAND_MS_PER_MP = 6.5;
+
+    /**
+     * How many times over a gap must pay for the copy it costs before it is
+     * worth splitting. At 1 the split merely breaks even, which is not worth
+     * the extra call's variance; 2 asks it to save twice what it costs.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_GAP_FACTOR = 2;
+
+    /**
+     * The smallest gap between damaged regions worth skipping with a second
+     * copy rather than reading straight through, in plane rows.
+     *
+     * Derived rather than constant because it depends on the width: skipping
+     * a row saves `planeW` pixels of transfer, so a narrow plane needs a much
+     * bigger gap to pay for the same fixed stall. At 2992 wide it comes to
+     * about 308 rows.
+     *
+     * @private
+     */
+    function minWorthwhileGap(planeW) {
+
+        if (!planeW)
+            return Infinity;
+
+        var rowsPerMs = 1e6 / (COPY_BAND_MS_PER_MP * planeW);
+
+        return Math.max(COPY_BAND_ALIGN,
+                Math.ceil(COPY_BAND_FIXED_MS * rowsPerMs
+                    * COPY_BAND_GAP_FACTOR));
+
+    }
+
+    /**
+     * The rects that fall inside one band, clipped to it, in picture
+     * coordinates.
+     *
+     * Safe for the auxiliary view's layouts as well as the main view's,
+     * because the band's edges are multiples of 16 in picture rows and
+     * `auxV1LumaBands()` rounds to the same grid -- so a rect clipped to a
+     * band maps to plane rows inside that band. Pinned in
+     * tests/h264-copy-band.mjs.
+     *
+     * @private
+     */
+    function clipRectsToBand(rects, band) {
+
+        var out = [];
+        var y0 = band.y0;
+        var y1 = band.y0 + band.h;
+
+        for (var i = 0; i < rects.length; i++) {
+
+            var top = Math.max(y0, rects[i].y | 0);
+            var bottom = Math.min(y1,
+                    (rects[i].y | 0) + (rects[i].height | 0));
+
+            if (bottom > top)
+                out.push({ x: rects[i].x, y: top,
+                           width: rects[i].width, height: bottom - top });
+
+        }
+
+        return out;
+
+    }
+
+    /**
+     * How the copy band came out, over the reporting window, or null.
+     *
+     * The band is a single bounding span, so scattered damage costs exactly
+     * what solid damage does: two thin rects a thousand rows apart span a
+     * thousand rows. Whether that is worth fixing with multiple copies --
+     * each costs ~2.7ms of fixed stall, so a second one pays only if it skips
+     * more than ~139 rows -- depends entirely on what real damage looks like,
+     * which nothing so far measures.
+     *
+     * `damage` is the rows actually touched, merged; `span` is the rows the
+     * band therefore has to copy. The two being far apart on the declined
+     * copies is the whole case for multi-band, and their being close is the
+     * case for leaving it alone.
+     *
+     * @private
+     */
+    var bandStats = null;
+
+    /**
+     * Records one main view's band outcome. Only under h264CombineLog: the
+     * merged damage total below is cheap but not free, and nothing acts on
+     * these.
+     *
+     * @private
+     */
+    function noteBand(outcome, spanRows, rects, planeH, isAux, nbands) {
+
+        if (!override('h264CombineLog'))
+            return;
+
+        if (!bandStats)
+            bandStats = { banded: 0, spanSum: 0, damageSum: 0,
+                          whole: 0, tooMany: 0, tooWide: 0,
+                          wideSpanSum: 0, wideDamageSum: 0,
+                          aux: 0, auxBanded: 0, auxSpanSum: 0,
+                          auxDamageSum: 0, bandsSum: 0, auxBandsSum: 0,
+                          auxWhole: 0, auxTooMany: 0, auxTooWide: 0,
+                          auxWideSpanSum: 0, auxWideDamageSum: 0 };
+
+        /* Merged, so overlapping rects are not counted twice. */
+        var damage = 0;
+        if (rects && rects.length) {
+            var iv = [];
+            for (var i = 0; i < rects.length; i++)
+                iv.push([rects[i].y | 0,
+                        (rects[i].y | 0) + (rects[i].height | 0)]);
+            iv.sort(function(a, b) { return a[0] - b[0]; });
+            var lo = iv[0][0];
+            var hi = iv[0][1];
+            for (var j = 1; j < iv.length; j++) {
+                if (iv[j][0] <= hi)
+                    hi = Math.max(hi, iv[j][1]);
+                else {
+                    damage += hi - lo;
+                    lo = iv[j][0];
+                    hi = iv[j][1];
+                }
+            }
+            damage += hi - lo;
+        }
+
+        if (isAux) {
+
+            bandStats.aux++;
+
+            if (outcome === 'banded') {
+                bandStats.auxBanded++;
+                bandStats.auxSpanSum += spanRows / planeH;
+                bandStats.auxDamageSum += damage / planeH;
+                bandStats.auxBandsSum += nbands || 1;
+            }
+            else if (outcome === 'whole')
+                bandStats.auxWhole++;
+            else if (outcome === 'tooMany')
+                bandStats.auxTooMany++;
+            else {
+                /* The one that matters on a server accumulating chroma
+                 * across frames: an auxiliary view carries the union of the
+                 * damage since the last one, so its declared regions are
+                 * inherently larger than a main view's and reach the span
+                 * limit sooner. Reported so that is distinguishable from a
+                 * server declaring nothing at all. */
+                bandStats.auxTooWide++;
+                bandStats.auxWideSpanSum += spanRows / planeH;
+                bandStats.auxWideDamageSum += damage / planeH;
+            }
+
+            return;
+
+        }
+
+        if (outcome === 'banded') {
+            bandStats.banded++;
+            bandStats.spanSum += spanRows / planeH;
+            bandStats.damageSum += damage / planeH;
+            bandStats.bandsSum += nbands || 1;
+        }
+        else if (outcome === 'whole')
+            bandStats.whole++;
+        else if (outcome === 'tooMany')
+            bandStats.tooMany++;
+        else {
+            bandStats.tooWide++;
+            bandStats.wideSpanSum += spanRows / planeH;
+            bandStats.wideDamageSum += damage / planeH;
+        }
+
+    }
+
+    /**
+     * The rows a view's regions touch, as a list of {y0, h} bands in plane
+     * rows, or null to copy the whole frame.
+     *
+     * This is the one stage of the pipeline that was still reading
+     * everything. The plane uploads are banded to the damage and the shader
+     * is scissored to it, but copyTo() was handed the whole coded frame every
+     * picture -- and copyTo()'s synchronous half is ~92% area-proportional at
+     * roughly 6.5ms per megapixel, which made it about 70% of the main thread
+     * at 4.93MP. Reading only the damaged rows cuts it in proportion.
+     *
+     * **Several bands rather than one**, because a single bounding span is
+     * defeated by anything scattered: a clock in one corner and a caret in
+     * the other span the whole screen between them, and a desktop reliably
+     * has both. Each extra band costs a fixed stall, so two regions are only
+     * worth separating when the gap between them saves more transfer than the
+     * call costs -- see minWorthwhileGap().
+     *
+     * @private
+     */
+    function copyBandsFor(rects, planeH, planeW, isAux) {
+
+        if (override('h264CopyBands') === false)
+            return null;
+
+        if (!rects || !rects.length) {
+            noteBand('whole', planeH, rects, planeH, isAux);
+            return null;
+        }
+
+        if (rects.length > COPY_BAND_MAX_RECTS) {
+            noteBand('tooMany', planeH, rects, planeH, isAux);
+            return null;
+        }
+
+        /* Each rect's rows, rounded outward to the alignment before anything
+         * is merged, so every band edge is on the grid the auxiliary view's
+         * v1 layout needs. */
+        var spans = [];
+
+        for (var i = 0; i < rects.length; i++) {
+
+            var top = rects[i].y | 0;
+            var bottom = top + (rects[i].height | 0);
+
+            if (bottom <= top)
+                continue;
+
+            top = Math.max(0,
+                    Math.floor(top / COPY_BAND_ALIGN) * COPY_BAND_ALIGN);
+            bottom = Math.min(planeH,
+                    Math.ceil(bottom / COPY_BAND_ALIGN) * COPY_BAND_ALIGN);
+
+            if (bottom > top)
+                spans.push([top, bottom]);
+
+        }
+
+        if (!spans.length) {
+            noteBand('whole', planeH, rects, planeH, isAux);
+            return null;
+        }
+
+        spans.sort(function(a, b) { return a[0] - b[0]; });
+
+        /* Merged where they overlap, touch, or sit closer than a gap worth
+         * skipping. */
+        var minGap = minWorthwhileGap(planeW);
+        var bands = [{ y0: spans[0][0], y1: spans[0][1] }];
+
+        for (var j = 1; j < spans.length; j++) {
+
+            var last = bands[bands.length - 1];
+
+            if (spans[j][0] - last.y1 < minGap)
+                last.y1 = Math.max(last.y1, spans[j][1]);
+            else
+                bands.push({ y0: spans[j][0], y1: spans[j][1] });
+
+        }
+
+        /* Bounded by closing the cheapest gaps first, so what survives is the
+         * splits that save most. */
+        while (bands.length > COPY_BAND_MAX_BANDS) {
+
+            var at = 1;
+            var smallest = Infinity;
+
+            for (var k = 1; k < bands.length; k++) {
+                var gap = bands[k].y0 - bands[k - 1].y1;
+                if (gap < smallest) {
+                    smallest = gap;
+                    at = k;
+                }
+            }
+
+            bands[at - 1].y1 = Math.max(bands[at - 1].y1, bands[at].y1);
+            bands.splice(at, 1);
+
+        }
+
+        var rows = 0;
+        for (var m = 0; m < bands.length; m++)
+            rows += bands[m].y1 - bands[m].y0;
+
+        /* Little enough saved that the whole-plane copy is the simpler and
+         * the safer path -- and past merge()'s BAND_LIMIT the renderer would
+         * decline to band the upload, leaving a partial copy with nowhere to
+         * land. */
+        if (rows >= planeH * COPY_BAND_MAX_SPAN) {
+            noteBand('tooWide', rows, rects, planeH, isAux);
+            return null;
+        }
+
+        var out = [];
+        for (var n = 0; n < bands.length; n++)
+            out.push({ y0: bands[n].y0, h: bands[n].y1 - bands[n].y0 });
+
+        noteBand('banded', rows, rects, planeH, isAux, out.length);
+        return out;
+
+    }
+
+    /**
      * Records one sample against a named stage, split by whether the picture
      * carried an auxiliary view, and reports every few seconds. Cheap enough
      * to leave in the path: one comparison when off.
@@ -1287,12 +2009,28 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *            time spent in the display's ordered task queue rather than
      *            doing work.
      *
+     *   paint    the blit from the snapshot into the display's layer. Split
+     *            by which kind of surface crossed that boundary rather than
+     *            by chroma: the 4:2:0 path hands over a 2D canvas, the
+     *            combine path a GPU-resident ImageBitmap produced by a
+     *            different (WebGL2) context. If that second handoff is a
+     *            readback rather than a texture share it is area-proportional
+     *            and vendor-independent, which is the shape the field numbers
+     *            have -- so this is reported per megapixel as well as per
+     *            picture, since a readback's cost tracks pixels and a texture
+     *            share's does not.
+     *
      * @private
-     * @param {!string} stage - 'decode', 'combine' or 'draw'.
-     * @param {!boolean} hadAux - Whether the picture carried an auxiliary view.
+     * @param {!string} stage - 'decode', 'combine', 'draw' or 'paint'.
+     * @param {!(boolean|string)} variant - Whether the picture carried an
+     *                                      auxiliary view, or an explicit
+     *                                      bucket name for stages not split
+     *                                      that way.
      * @param {!number} ms - The sample.
+     * @param {number} [pixels] - Pixels this sample covered, where the stage
+     *                            has a meaningful area. Reported as ms/MP.
      */
-    function recordStat(stage, hadAux, ms) {
+    function recordStat(stage, variant, ms, pixels) {
 
         if (!override('h264CombineLog'))
             return;
@@ -1302,11 +2040,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (!stats)
             stats = { since: now };
 
-        var key = stage + (hadAux ? ':chroma' : ':luma');
-        var bucket = stats[key] || (stats[key] = { n: 0, sum: 0, max: 0 });
+        var key = stage + ':' + (typeof variant === 'string' ? variant
+                : (variant ? 'chroma' : 'luma'));
+        var bucket = stats[key]
+                || (stats[key] = { n: 0, sum: 0, max: 0, px: 0 });
 
         bucket.n++;
         bucket.sum += ms;
+        bucket.px += pixels || 0;
         if (ms > bucket.max)
             bucket.max = ms;
 
@@ -1317,17 +2058,66 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             if (!b || !b.n)
                 return 'none';
             return b.n + ' mean ' + (b.sum / b.n).toFixed(1)
-                    + ' max ' + b.max.toFixed(1);
+                    + ' max ' + b.max.toFixed(1)
+                    + (b.px ? ' ' + (b.sum / (b.px / 1e6)).toFixed(2)
+                        + 'ms/MP' : '');
         }
 
         var lines = ['[rustguac] H.264 over '
                 + ((now - stats.since) / 1000).toFixed(1) + 's, ms:'];
 
-        ['decode', 'combine', 'draw'].forEach(function(name) {
+        ['decode', 'issue', 'alloc', 'buf', 'copy', 'combine', 'draw',
+                'queue'].forEach(function(name) {
             lines.push('  ' + (name + '     ').slice(0, 8)
                     + 'chroma ' + one(stats[name + ':chroma'])
                     + '  |  luma ' + one(stats[name + ':luma']));
         });
+
+
+        if (bandStats) {
+
+            var b = bandStats;
+            var tried = b.banded + b.whole + b.tooMany + b.tooWide;
+            var pct = function(x) { return (100 * x).toFixed(0) + '%'; };
+
+            lines.push('  band    ' + tried + ' main views: banded ' + b.banded
+                    + (tried ? ' (' + pct(b.banded / tried) + ')' : '')
+                    + (b.banded ? ' copied ' + pct(b.spanSum / b.banded)
+                        + ' damage ' + pct(b.damageSum / b.banded)
+                        + ' in ' + (b.bandsSum / b.banded).toFixed(1)
+                        + ' bands' : '')
+                    + '  |  declined ' + (b.whole + b.tooMany + b.tooWide)
+                    + ': ' + b.whole + ' no-rects, ' + b.tooMany + ' >'
+                    + COPY_BAND_MAX_RECTS + ' rects, ' + b.tooWide + ' wide'
+                    + (b.tooWide ? ' (span ' + pct(b.wideSpanSum / b.tooWide)
+                        + ' damage ' + pct(b.wideDamageSum / b.tooWide) + ')'
+                        : ''));
+
+            if (b.aux)
+                lines.push('          aux ' + b.aux + ' views: banded '
+                        + b.auxBanded + ' (' + pct(b.auxBanded / b.aux) + ')'
+                        + (b.auxBanded
+                            ? ' copied ' + pct(b.auxSpanSum / b.auxBanded)
+                                + ' damage ' + pct(b.auxDamageSum / b.auxBanded)
+                                + ' in '
+                                + (b.auxBandsSum / b.auxBanded).toFixed(1)
+                                + ' bands'
+                            : '')
+                        + (b.auxBanded < b.aux
+                            ? '  |  declined ' + (b.aux - b.auxBanded) + ': '
+                                + b.auxWhole + ' no-rects, ' + b.auxTooMany
+                                + ' >' + COPY_BAND_MAX_RECTS + ' rects, '
+                                + b.auxTooWide + ' wide'
+                                + (b.auxTooWide
+                                    ? ' (copied '
+                                        + pct(b.auxWideSpanSum / b.auxTooWide)
+                                        + ' damage '
+                                        + pct(b.auxWideDamageSum / b.auxTooWide)
+                                        + ')'
+                                    : '')
+                            : ''));
+
+        }
 
         var tail = [];
         if (copyWait && copyWait.n)
@@ -1344,6 +2134,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         stats = null;
         copyWait = null;
+        bandStats = null;
         watchdogFires = 0;
         syncTimeouts = 0;
 
@@ -1540,6 +2331,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (name in storedOverrides)
             return storedOverrides[name];
 
+        /* The query string is read, but on a live session it cannot be
+         * reached: client.html builds `/client/{id}?name=...` itself on every
+         * launch and relaunch and drops anything added by hand, so a pasted
+         * parameter lasts until the first reconnect and no longer. It is the
+         * usable form only on the recording player, whose URL nothing
+         * rewrites. localStorage is what survives a live session; a window
+         * global takes effect immediately but does not outlive the page.
+         * Operator-facing messages in this file should say so rather than
+         * naming a query parameter. */
         var value = null;
 
         try {
@@ -1569,9 +2369,10 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
     /**
      * Whether 4:4:4 combining is switched on. Overridable at runtime as
-     * window.__h264Chroma444 = false, as ?h264Chroma444=off on the client's
-     * URL, or as the h264Chroma444 key in localStorage, to compare against the
-     * 4:2:0 path.
+     * window.__h264Chroma444 = false for the current page, or as the
+     * h264Chroma444 key in localStorage to survive a reconnect, to compare
+     * against the 4:2:0 path. A query parameter is read but cannot be reached
+     * on a live session -- see override().
      *
      * @private
      * @returns {!boolean}
@@ -1624,7 +2425,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     + display.getWidth() + 'x' + display.getHeight() + ' is '
                     + (pixels / 1e6).toFixed(1) + 'MP, over the '
                     + (limit / 1e6).toFixed(1) + 'MP the combine is worth its '
-                    + 'GPU cost at; ?h264Chroma444=on overrides');
+                    + 'GPU cost at; window.__h264Chroma444 = true '
+                    + 'overrides, or the h264Chroma444 key in localStorage');
         }
 
         return combine;
@@ -1719,18 +2521,24 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     function flushCombineCost(hadAux) {
 
         var ms = combineWorkMs;
+        var copyMs = combineCopyMs;
         var resynced = combineResynced;
 
         combineWorkMs = 0;
+        combineCopyMs = 0;
         combineResynced = false;
 
         if (ms <= 0)
             return;
 
         /* A picture that had to resync uploaded whole planes, so it says
-         * nothing about the steady state. */
-        if (!resynced)
+         * nothing about the steady state -- and it copied whole planes too,
+         * which would trip the gate on the one picture that is expected to
+         * be expensive. */
+        if (!resynced) {
             recordStat('combine', hadAux, ms);
+            noteCombineCopy(copyMs);
+        }
 
     }
 
@@ -1769,6 +2577,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     function combineFrame(frame, frameState) {
 
+        /* Neither `copyWait` nor `combine` covers what happens between here
+         * and the copy being issued -- allocationSize(), which can force a
+         * GPU-backed frame to be mapped, and the synchronous half of
+         * copyTo(). That window sits inside `draw` and was part of the
+         * 12-18ms it could not account for. */
+        var enteredAt = nowMs();
+
         var renderer = yuv444;
         var view = frameState.view;
         var rect = frame.codedRect || null;
@@ -1791,14 +2606,65 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * pads the auxiliary view to a multiple of 16 rows and addresses that
          * padding, so cropping to the visible rect would drop rows the combine
          * reads. */
-        var options = rect
-            ? { rect: { x: 0, y: 0, width: rect.width, height: rect.height } }
-            : {};
-
         var planeW = rect ? rect.width : frame.codedWidth;
         var planeH = rect ? rect.height : frame.codedHeight;
         var pictureW = frame.displayWidth;
         var pictureH = frame.displayHeight;
+
+        /* Narrowed to the damaged rows where that is safe: a main view, with
+         * regions, whose textures already exist at this size (a resync has to
+         * carry every row, and so does the first picture after a resize). */
+        var sameSize = (view === 0)
+            ? (!!lastPictureSize && lastPictureSize[0] === pictureW
+                && lastPictureSize[1] === pictureH)
+            : (!!lastAuxSize && lastAuxSize[0] === planeW
+                && lastAuxSize[1] === planeH);
+
+        /* Both views, and the same band arithmetic for each.
+         *
+         * An auxiliary view's plane rows are not its picture rows, but the
+         * rounding already reconciles them: the band is rounded outward to
+         * 16, which is exactly what auxV1LumaBands() does to reach the v1
+         * layout's 16-row bands, and a superset of the v2 layout's
+         * one-to-one rows and of both layouts' chroma rows at y >> 1.
+         * Checked against that inverse in tests/h264-copy-band.mjs rather
+         * than argued from here.
+         *
+         * Worth the care because the auxiliary view is the larger half of
+         * what is left: on a Windows host it is one picture in two or three,
+         * against xrdp's one in nine under CHROMA_INTERVAL=8. */
+        var bands = (!resyncNeeded && sameSize)
+                ? copyBandsFor(frameState.rects, planeH, planeW, view !== 0)
+                : null;
+
+        if (view === 0)
+            lastPictureSize = [pictureW, pictureH];
+        else
+            lastAuxSize = [planeW, planeH];
+
+        /* One copy per band, all into a single pooled buffer laid out
+         * end to end. Each carries its own plane layout, so a band is an
+         * independent little upload with its own source origin. */
+        var segments = [];
+        var si;
+
+        if (bands) {
+            for (si = 0; si < bands.length; si++)
+                segments.push({
+                    band: bands[si],
+                    options: { rect: { x: 0, y: bands[si].y0,
+                                       width: planeW, height: bands[si].h } }
+                });
+        }
+        else {
+            segments.push({
+                band: null,
+                options: rect
+                    ? { rect: { x: 0, y: 0, width: rect.width,
+                                height: rect.height } }
+                    : {}
+            });
+        }
 
         var buffer = null;
         var size = 0;
@@ -1809,8 +2675,25 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 throw new Error('decoded frame is ' + (format || 'an unknown'
                         + ' format') + ', which carries no YUV planes');
 
-            size = frame.allocationSize(options);
+            /* Timed apart, because `issue` measures all three and only one
+             * of them can be fixed. allocationSize() may force a GPU-backed
+             * frame to be mapped; acquireBuffer() zero-fills several
+             * megabytes on a pool miss; copyTo()'s synchronous prologue does
+             * the D3D11 array-texture copy and staging map. */
+            var allocAt = nowMs();
+
+            for (si = 0; si < segments.length; si++) {
+                segments[si].offset = size;
+                segments[si].size =
+                        frame.allocationSize(segments[si].options);
+                size += segments[si].size;
+            }
+
+            var bufAt = nowMs();
+            recordStat('alloc', view !== 0, bufAt - allocAt);
+
             buffer = acquireBuffer(size);
+            recordStat('buf', view !== 0, nowMs() - bufAt);
 
         } catch (e) {
 
@@ -1833,12 +2716,43 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         /* Issued here rather than inside the chain, so that the two views of
          * a picture are in flight at once; only what follows is ordered. */
-        var copy;
-        try {
-            copy = frame.copyTo(buffer, options);
-        } catch (e) {
-            copy = Promise.reject(e);
+        var copyAt = nowMs();
+        var copies = [];
+        var copiedRows = 0;
+
+        for (si = 0; si < segments.length; si++) {
+
+            var seg = segments[si];
+
+            seg.data = new Uint8Array(buffer.buffer,
+                    buffer.byteOffset + seg.offset, seg.size);
+
+            try {
+                copies.push(frame.copyTo(seg.data, seg.options));
+            } catch (e) {
+                copies.push(Promise.reject(e));
+            }
+
+            copiedRows += seg.band ? seg.band.h : planeH;
+
         }
+
+        var copy = Promise.all(copies);
+
+        /* The synchronous half of copyTo(). `read-back wait` times the
+         * promise, which is why the transfer looked free: by the time the
+         * promise is awaited the blocking work is already done.
+         *
+         * Charged per plane megapixel, because that is what says whether
+         * copying less would help. A cost proportional to area is a transfer,
+         * and restricting the rect to the damaged rows would cut it in
+         * proportion. A cost that barely moves between a full-size main view
+         * and a smaller auxiliary one is a fixed pipeline stall per call, and
+         * the thing to reduce is then the number of copies, not their size.
+         * The two lead to different fixes, so measure before building
+         * either. */
+        var copyElapsed = nowMs() - copyAt;
+        recordStat('copy', view !== 0, copyElapsed, planeW * copiedRows);
 
         /* The chain below is this copy's real error handler, but it may not
          * attach for some time, and a rejection with nothing attached yet is
@@ -1846,10 +2760,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         copy.catch(function() { /* handled by the chain */ });
 
         var copyIssuedAt = nowMs();
+        recordStat('issue', view !== 0, copyIssuedAt - enteredAt);
 
         copyChain = copyChain.then(function() {
             return copy;
-        }).then(function(layout) {
+        }).then(function(layouts) {
 
             /* Times the work, not the wait. The awaits above queue behind
              * whatever else is in flight, so including them would measure the
@@ -1874,18 +2789,63 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             if (view === 0)
                 flushCombineCost(false);
 
-            /* NV12 has two planes rather than three; a null V plane is how
-             * the renderer is told the chroma is interleaved into U. */
-            var y = new Uint8Array(buffer.buffer,
-                    buffer.byteOffset + layout[0].offset);
-            var u = new Uint8Array(buffer.buffer,
-                    buffer.byteOffset + layout[1].offset);
-            var v = interleaved ? null : new Uint8Array(buffer.buffer,
-                    buffer.byteOffset + layout[2].offset);
+            /* Charged after that close-out, not before it, or a main view
+             * hands its own copy to the picture in front of it -- and the
+             * very first one is closed out against an empty picture and
+             * discarded. Charged here rather than where it was measured
+             * because the copy chain's ordering is what says which picture a
+             * copy belongs to: issue order does not, since a picture's
+             * auxiliary view is issued while its main view's copy is still in
+             * flight. */
+            combineCopyMs += copyElapsed;
 
-            var strides = interleaved
-                ? [layout[0].stride, layout[1].stride]
-                : [layout[0].stride, layout[1].stride, layout[2].stride];
+            /* Each band's own plane views and rects. Built for every band
+             * before any is uploaded, so that a band whose clipped regions
+             * turn out unusable stops the picture rather than leaving the
+             * textures half written -- the same all-or-nothing the renderer
+             * enforces per plane.
+             *
+             * NV12 has two planes rather than three; a null V plane is how
+             * the renderer is told the chroma is interleaved into U. */
+            var uploads = [];
+            var ui;
+
+            for (ui = 0; ui < segments.length; ui++) {
+
+                var useg = segments[ui];
+                var ulay = layouts[ui];
+
+                var urects = resyncNeeded ? null
+                    : (useg.band
+                        ? clipRectsToBand(frameState.rects, useg.band)
+                        : frameState.rects);
+
+                /* Every band is built from at least one rect, so an empty
+                 * list here means the clip and the band disagree. Copying the
+                 * whole plane next time is the cheap way to be sure. */
+                if (useg.band && (!urects || !urects.length)) {
+                    resyncNeeded = true;
+                    lastPictureSize = null;
+                    lastAuxSize = null;
+                    return;
+                }
+
+                uploads.push({
+                    y: new Uint8Array(useg.data.buffer,
+                            useg.data.byteOffset + ulay[0].offset),
+                    u: new Uint8Array(useg.data.buffer,
+                            useg.data.byteOffset + ulay[1].offset),
+                    v: interleaved ? null
+                        : new Uint8Array(useg.data.buffer,
+                                useg.data.byteOffset + ulay[2].offset),
+                    strides: interleaved
+                        ? [ulay[0].stride, ulay[1].stride]
+                        : [ulay[0].stride, ulay[1].stride, ulay[2].stride],
+                    rects: urects,
+                    y0: useg.band ? useg.band.y0 : undefined
+                });
+
+            }
 
             if (view === 0) {
 
@@ -1919,8 +2879,21 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 if (resyncNeeded)
                     combineResynced = true;
 
-                renderer.uploadLuma(y, u, v, strides, pictureW, pictureH,
-                        resyncNeeded ? null : frameState.rects);
+                /* A refusal means nothing was uploaded -- the check happens
+                 * before the first plane is written -- so the textures still
+                 * match the screen and the next picture can carry every row
+                 * rather than this one repairing a half-written state. The
+                 * check is a property of the picture rather than of a band,
+                 * so it refuses the first band or none of them. */
+                for (ui = 0; ui < uploads.length; ui++)
+                    if (!renderer.uploadLuma(uploads[ui].y, uploads[ui].u,
+                            uploads[ui].v, uploads[ui].strides,
+                            pictureW, pictureH, uploads[ui].rects,
+                            uploads[ui].y0)) {
+                        resyncNeeded = true;
+                        lastPictureSize = null;
+                        return;
+                    }
 
             }
             else {
@@ -1928,8 +2901,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 if (resyncNeeded)
                     combineResynced = true;
 
-                renderer.uploadAux(y, u, v, strides, planeW, planeH, view,
-                        resyncNeeded ? null : frameState.rects);
+                for (ui = 0; ui < uploads.length; ui++)
+                    if (!renderer.uploadAux(uploads[ui].y, uploads[ui].u,
+                            uploads[ui].v, uploads[ui].strides,
+                            planeW, planeH, view, uploads[ui].rects,
+                            uploads[ui].y0)) {
+                        resyncNeeded = true;
+                        lastAuxSize = null;
+                        return;
+                    }
 
             }
 
@@ -2558,6 +3538,27 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 watchdog: null
             };
 
+            /* Wrapped after construction, so the wrapper can stamp into the
+             * frameState it belongs to. Every path that finishes a frame --
+             * combine, snapshot, watchdog, decode failure -- goes through
+             * onReady, so one wrapper here covers all of them where patching
+             * each call site would miss one.
+             *
+             * This is what splits `draw` in two. The display's flush completes
+             * *inside* the unblock this calls (Display.js __display_h264_ready
+             * -> Task.unblock -> __flush_frames, synchronously), so a frame
+             * that is slow to become available is indistinguishable, from
+             * sync_hold's side, from a display that is slow to draw. `queue`
+             * is the half that is genuinely the display's: the picture was
+             * ready and waited anyway, behind frames ahead of it that were
+             * not. */
+            if (onReady)
+                frameState.onReady = function __h264_ready() {
+                    if (!frameState.readyAt)
+                        frameState.readyAt = nowMs();
+                    onReady();
+                };
+
             frameState.submittedAt = nowMs();
             frameState.keyFrame = !!isKeyFrame;
             pendingDecodes++;
@@ -2670,10 +3671,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             return;
         }
 
-        /* Ready to painted: time in the display's ordered queue, not work. */
+        /* Decoded to painted: the asynchronous chain that turns a VideoFrame
+         * into a snapshot, plus the wait below. */
         if (frameState.decodedAt)
             recordStat('draw', frameState.view !== 0,
                     nowMs() - frameState.decodedAt);
+
+        /* Ready to painted: time in the display's ordered queue, not work.
+         * `draw` minus this is the chain; this is the queue. */
+        if (frameState.readyAt)
+            recordStat('queue', frameState.view !== 0,
+                    nowMs() - frameState.readyAt);
 
         try {
 
@@ -2742,12 +3750,34 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @private
      */
     function newHoldStats() {
+        function flushBucket() {
+            return { flushes: 0, flushSumMs: 0, flushMaxMs: 0, flushSlow: 0 };
+        }
         function mode() {
-            return { syncs: 0, held: 0, sumMs: 0, maxMs: 0, timeouts: 0,
-                     flushes: 0, flushSumMs: 0, flushMaxMs: 0, flushSlow: 0 };
+            var m = flushBucket();
+            m.syncs = 0;
+            m.held = 0;
+            m.sumMs = 0;
+            m.maxMs = 0;
+            m.timeouts = 0;
+            return m;
         }
         return { '420': mode(), '444': mode() };
     }
+
+    /**
+     * Adds one flush sample to a bucket.
+     *
+     * @private
+     */
+    function addFlush(bucket, flushMs) {
+        bucket.flushes++;
+        bucket.flushSumMs += flushMs;
+        bucket.flushMaxMs = Math.max(bucket.flushMaxMs, flushMs);
+        if (flushMs >= FLUSH_SLOW_MS)
+            bucket.flushSlow++;
+    }
+
 
     /**
      * A display flush at least this long, in milliseconds, is counted as slow.
@@ -2786,13 +3816,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             noteCombineFlush(flushMs);
 
         [holdTotal[mode], holdWindow[mode]].forEach(function(stats) {
-            if (typeof flushMs === 'number') {
-                stats.flushes++;
-                stats.flushSumMs += flushMs;
-                stats.flushMaxMs = Math.max(stats.flushMaxMs, flushMs);
-                if (flushMs >= FLUSH_SLOW_MS)
-                    stats.flushSlow++;
-            }
+            if (typeof flushMs === 'number')
+                addFlush(stats, flushMs);
             stats.syncs++;
             if (ms > 0) {
                 stats.held++;
@@ -2812,6 +3837,23 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var elapsed = now - holdWindowStart;
         if (elapsed < HOLD_REPORT_INTERVAL_MS)
             return;
+
+        /* Quiet unless it has something to say. This was the last always-on
+         * periodic reporter -- once a minute, with a console.warn stack trace,
+         * for the life of every session -- where everything else in this file
+         * speaks on a state change. A window with no sync timeout in it is a
+         * window where the gate is working, and there is nothing to read.
+         *
+         * A timeout still reports without any flag set, because that is the
+         * shape a fault takes here and the journal has to carry it; asking for
+         * h264CombineLog gets every window regardless. */
+        var noteworthy = holdWindow['420'].timeouts + holdWindow['444'].timeouts;
+
+        if (!noteworthy && !override('h264CombineLog')) {
+            holdWindow = newHoldStats();
+            holdWindowStart = now;
+            return;
+        }
 
         diagnostic('sync_hold', 'last ' + (elapsed / 1000).toFixed(0) + 's at '
                 + (display ? display.getWidth() + 'x' + display.getHeight()
@@ -2853,6 +3895,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         });
         return parts.length ? parts.join('; ') : 'no syncs';
     }
+
 
     /**
      * Waits for pending decodes to drain, then invokes the callback. Used to
