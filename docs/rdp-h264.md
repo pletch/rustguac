@@ -530,6 +530,41 @@ The sync-timeout and slow-flush latches stay as the safety net beneath it.
 Note their signal is decoder latency, not display cost -- see above -- which
 is worth revisiting now that the latency has collapsed.
 
+#### xrdp collapses its damage region, and what that took
+
+Windows declares tight region rects; the xrdp fork declared a single
+full-frame rect for AVC444 by design, and once that was fixed the rects
+arriving were still coarse -- 60-93% of rows, with `span` and `damage` equal,
+which rules out a scatter artifact and says the region itself was one box.
+
+The cause is upstream of xrdp, in xorgxrdp
+(`module/rdpClientCon.c`, `rdpCapRect()`):
+
+```c
+if (num_rects > MAX_CAPTURE_RECTS)   /* 15, rdpCapture.h */
+{
+    /* the dirty region is too complex, just get a rect that
+       covers the whole region */
+    rect = *rdpRegionExtents(cap_dirty);
+```
+
+**Sixteen dirty rects anywhere on screen and the whole region becomes its
+bounding box.** A cursor blink, a scrollbar, a tray clock and some text is
+enough, and the extents then run corner to corner. It also explains why the
+measurements looked like large contiguous damage rather than scattered damage:
+after the collapse, that is exactly what it is.
+
+Two things have to change for banding to reach xrdp, and neither is
+sufficient alone:
+
+* **xorgxrdp should not collapse to extents.** Raising `MAX_CAPTURE_RECTS`
+  is the cheap version, though the cap presumably reflects a per-rect capture
+  cost worth measuring first. Collapsing to a bounded number of *row bands*
+  would be better: every consumer downstream wants rows anyway.
+* **The client needs several bands, which it now has.** Even with perfect
+  rects, a single bounding span is defeated by a clock in the corner. See
+  `copyBandsFor()`.
+
 ## Colour range
 
 The samples an RDP host sends are **full range**. [MS-RDPEGFX Color

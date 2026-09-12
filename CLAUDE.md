@@ -221,7 +221,7 @@ because plane rows are contiguous and the packed chroma layouts address both
 halves of a row.
 
 And a sixth, which is the one that mattered: **`copyTo()` reads only those
-rows too** (`copyBandFor()`, rounded outward to 16 -- exactly what
+rows too** (`copyBandsFor()`, rounded outward to 16 -- exactly what
 `auxV1LumaBands()` does to reach the v1 layout's bands, and a superset of the
 v2 layout's one-to-one rows and both layouts' chroma at `y >> 1`, which is why
 one band serves both views). Until then the narrowest stage of the pipeline
@@ -229,6 +229,15 @@ was fed by the widest: the uploads and the shader were limited to the damage
 while the copy read the whole frame every picture. On a Windows host at
 2992x1648 with light typing, main-thread time inside `copyTo()` went from ~77%
 to ~16%, and `decode` from 28-38ms to 1-4ms behind it.
+
+**Several bands, not one span.** A single bounding span is defeated by
+anything scattered -- a clock in one corner and a caret in the other span the
+whole screen between them, and a desktop reliably has both. Each extra
+`copyTo()` is a fixed stall (~3ms), so two regions are worth separating only
+when the gap saves more transfer than the call costs: `minWorthwhileGap()`
+derives that from the width (~309 rows at 2992 wide, asking a gap to save
+twice what it costs), and `COPY_BAND_MAX_BANDS` caps it at four by closing the
+cheapest gaps first.
 
 **It only fires where the server declares real damage.** Windows does, on both
 views. The xrdp fork declares a single full-frame rect on both, deliberately

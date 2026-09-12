@@ -1451,6 +1451,109 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var COPY_BAND_MAX_RECTS = 32;
 
     /**
+     * Most separate copies one view may be split into.
+     *
+     * Each is a fixed stall, and the gap rule below only guarantees that each
+     * extra one pays for itself -- it does not bound how many there are. Four
+     * is enough for the shapes that motivate this (an editor and a clock, a
+     * terminal and a status bar) without letting a busy screen spend its
+     * budget on per-call overhead.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_MAX_BANDS = 4;
+
+    /**
+     * The two halves of the copy's measured cost, used to decide when a gap
+     * between damaged regions is worth a second copy rather than being read
+     * through.
+     *
+     * Fitted 2026-09-12 across two framebuffer sizes on one client: at 4.93MP
+     * a main view's copy took 34.6ms and at 1.72MP 13.8ms, which is
+     * 2.7ms + 6.5ms/MP to within 0.1ms at both points. Later windows put the
+     * fixed part nearer 5-10ms, so 3ms is the conservative end -- and
+     * conservative here means fewer, larger copies, which is the safe
+     * direction.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_FIXED_MS = 3;
+    var COPY_BAND_MS_PER_MP = 6.5;
+
+    /**
+     * How many times over a gap must pay for the copy it costs before it is
+     * worth splitting. At 1 the split merely breaks even, which is not worth
+     * the extra call's variance; 2 asks it to save twice what it costs.
+     *
+     * @private
+     * @constant
+     * @type {!number}
+     */
+    var COPY_BAND_GAP_FACTOR = 2;
+
+    /**
+     * The smallest gap between damaged regions worth skipping with a second
+     * copy rather than reading straight through, in plane rows.
+     *
+     * Derived rather than constant because it depends on the width: skipping
+     * a row saves `planeW` pixels of transfer, so a narrow plane needs a much
+     * bigger gap to pay for the same fixed stall. At 2992 wide it comes to
+     * about 308 rows.
+     *
+     * @private
+     */
+    function minWorthwhileGap(planeW) {
+
+        if (!planeW)
+            return Infinity;
+
+        var rowsPerMs = 1e6 / (COPY_BAND_MS_PER_MP * planeW);
+
+        return Math.max(COPY_BAND_ALIGN,
+                Math.ceil(COPY_BAND_FIXED_MS * rowsPerMs
+                    * COPY_BAND_GAP_FACTOR));
+
+    }
+
+    /**
+     * The rects that fall inside one band, clipped to it, in picture
+     * coordinates.
+     *
+     * Safe for the auxiliary view's layouts as well as the main view's,
+     * because the band's edges are multiples of 16 in picture rows and
+     * `auxV1LumaBands()` rounds to the same grid -- so a rect clipped to a
+     * band maps to plane rows inside that band. Pinned in
+     * tests/h264-copy-band.mjs.
+     *
+     * @private
+     */
+    function clipRectsToBand(rects, band) {
+
+        var out = [];
+        var y0 = band.y0;
+        var y1 = band.y0 + band.h;
+
+        for (var i = 0; i < rects.length; i++) {
+
+            var top = Math.max(y0, rects[i].y | 0);
+            var bottom = Math.min(y1,
+                    (rects[i].y | 0) + (rects[i].height | 0));
+
+            if (bottom > top)
+                out.push({ x: rects[i].x, y: top,
+                           width: rects[i].width, height: bottom - top });
+
+        }
+
+        return out;
+
+    }
+
+    /**
      * How the copy band came out, over the reporting window, or null.
      *
      * The band is a single bounding span, so scattered damage costs exactly
@@ -1476,7 +1579,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *
      * @private
      */
-    function noteBand(outcome, spanRows, rects, planeH, isAux) {
+    function noteBand(outcome, spanRows, rects, planeH, isAux, nbands) {
 
         if (!override('h264CombineLog'))
             return;
@@ -1486,7 +1589,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                           whole: 0, tooMany: 0, tooWide: 0,
                           wideSpanSum: 0, wideDamageSum: 0,
                           aux: 0, auxBanded: 0, auxSpanSum: 0,
-                          auxDamageSum: 0 };
+                          auxDamageSum: 0, bandsSum: 0, auxBandsSum: 0 };
 
         /* Merged, so overlapping rects are not counted twice. */
         var damage = 0;
@@ -1516,6 +1619,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 bandStats.auxBanded++;
                 bandStats.auxSpanSum += spanRows / planeH;
                 bandStats.auxDamageSum += damage / planeH;
+                bandStats.auxBandsSum += nbands || 1;
             }
             return;
         }
@@ -1524,6 +1628,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             bandStats.banded++;
             bandStats.spanSum += spanRows / planeH;
             bandStats.damageSum += damage / planeH;
+            bandStats.bandsSum += nbands || 1;
         }
         else if (outcome === 'whole')
             bandStats.whole++;
@@ -1538,23 +1643,26 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
-     * The rows of a main view that its regions touch, as {y0, h} in plane
+     * The rows a view's regions touch, as a list of {y0, h} bands in plane
      * rows, or null to copy the whole frame.
      *
-     * This is the one stage of the pipeline that was still reading everything.
-     * The plane uploads are banded to the damage and the shader is scissored
-     * to it, but copyTo() was handed the whole coded frame every picture --
-     * and copyTo()'s synchronous half is ~92% area-proportional at roughly
-     * 6.5ms per megapixel, which made it about 70% of the main thread at
-     * 4.93MP. Reading only the damaged rows cuts it in proportion.
+     * This is the one stage of the pipeline that was still reading
+     * everything. The plane uploads are banded to the damage and the shader
+     * is scissored to it, but copyTo() was handed the whole coded frame every
+     * picture -- and copyTo()'s synchronous half is ~92% area-proportional at
+     * roughly 6.5ms per megapixel, which made it about 70% of the main thread
+     * at 4.93MP. Reading only the damaged rows cuts it in proportion.
      *
-     * Main views only. An auxiliary view's plane rows are not its picture
-     * rows -- the v1 layout scatters an output row across 16-row bands -- and
-     * at CHROMA_INTERVAL=8 it is one copy in nine, so the risk buys little.
+     * **Several bands rather than one**, because a single bounding span is
+     * defeated by anything scattered: a clock in one corner and a caret in
+     * the other span the whole screen between them, and a desktop reliably
+     * has both. Each extra band costs a fixed stall, so two regions are only
+     * worth separating when the gap between them saves more transfer than the
+     * call costs -- see minWorthwhileGap().
      *
      * @private
      */
-    function copyBandFor(rects, planeH, isAux) {
+    function copyBandsFor(rects, planeH, planeW, isAux) {
 
         if (override('h264CopyBands') === false)
             return null;
@@ -1569,37 +1677,91 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             return null;
         }
 
-        var y0 = Infinity;
-        var y1 = -Infinity;
+        /* Each rect's rows, rounded outward to the alignment before anything
+         * is merged, so every band edge is on the grid the auxiliary view's
+         * v1 layout needs. */
+        var spans = [];
 
         for (var i = 0; i < rects.length; i++) {
+
             var top = rects[i].y | 0;
             var bottom = top + (rects[i].height | 0);
-            if (top < y0)
-                y0 = top;
-            if (bottom > y1)
-                y1 = bottom;
+
+            if (bottom <= top)
+                continue;
+
+            top = Math.max(0,
+                    Math.floor(top / COPY_BAND_ALIGN) * COPY_BAND_ALIGN);
+            bottom = Math.min(planeH,
+                    Math.ceil(bottom / COPY_BAND_ALIGN) * COPY_BAND_ALIGN);
+
+            if (bottom > top)
+                spans.push([top, bottom]);
+
         }
 
-        if (!isFinite(y0) || y1 <= y0) {
+        if (!spans.length) {
             noteBand('whole', planeH, rects, planeH, isAux);
             return null;
         }
 
-        y0 = Math.max(0, Math.floor(y0 / COPY_BAND_ALIGN) * COPY_BAND_ALIGN);
-        y1 = Math.min(planeH,
-                Math.ceil(y1 / COPY_BAND_ALIGN) * COPY_BAND_ALIGN);
+        spans.sort(function(a, b) { return a[0] - b[0]; });
 
-        /* Nothing saved, or so much of the plane that the renderer would
-         * decline to band the upload -- see COPY_BAND_MAX_SPAN. Either way
-         * the whole-plane copy is the simpler and the safer path. */
-        if (y1 <= y0 || (y1 - y0) >= planeH * COPY_BAND_MAX_SPAN) {
-            noteBand('tooWide', y1 - y0, rects, planeH, isAux);
+        /* Merged where they overlap, touch, or sit closer than a gap worth
+         * skipping. */
+        var minGap = minWorthwhileGap(planeW);
+        var bands = [{ y0: spans[0][0], y1: spans[0][1] }];
+
+        for (var j = 1; j < spans.length; j++) {
+
+            var last = bands[bands.length - 1];
+
+            if (spans[j][0] - last.y1 < minGap)
+                last.y1 = Math.max(last.y1, spans[j][1]);
+            else
+                bands.push({ y0: spans[j][0], y1: spans[j][1] });
+
+        }
+
+        /* Bounded by closing the cheapest gaps first, so what survives is the
+         * splits that save most. */
+        while (bands.length > COPY_BAND_MAX_BANDS) {
+
+            var at = 1;
+            var smallest = Infinity;
+
+            for (var k = 1; k < bands.length; k++) {
+                var gap = bands[k].y0 - bands[k - 1].y1;
+                if (gap < smallest) {
+                    smallest = gap;
+                    at = k;
+                }
+            }
+
+            bands[at - 1].y1 = Math.max(bands[at - 1].y1, bands[at].y1);
+            bands.splice(at, 1);
+
+        }
+
+        var rows = 0;
+        for (var m = 0; m < bands.length; m++)
+            rows += bands[m].y1 - bands[m].y0;
+
+        /* Little enough saved that the whole-plane copy is the simpler and
+         * the safer path -- and past merge()'s BAND_LIMIT the renderer would
+         * decline to band the upload, leaving a partial copy with nowhere to
+         * land. */
+        if (rows >= planeH * COPY_BAND_MAX_SPAN) {
+            noteBand('tooWide', rows, rects, planeH, isAux);
             return null;
         }
 
-        noteBand('banded', y1 - y0, rects, planeH, isAux);
-        return { y0: y0, h: y1 - y0 };
+        var out = [];
+        for (var n = 0; n < bands.length; n++)
+            out.push({ y0: bands[n].y0, h: bands[n].y1 - bands[n].y0 });
+
+        noteBand('banded', rows, rects, planeH, isAux, out.length);
+        return out;
 
     }
 
@@ -1706,8 +1868,10 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
             lines.push('  band    ' + tried + ' main views: banded ' + b.banded
                     + (tried ? ' (' + pct(b.banded / tried) + ')' : '')
-                    + (b.banded ? ' span ' + pct(b.spanSum / b.banded)
-                        + ' damage ' + pct(b.damageSum / b.banded) : '')
+                    + (b.banded ? ' copied ' + pct(b.spanSum / b.banded)
+                        + ' damage ' + pct(b.damageSum / b.banded)
+                        + ' in ' + (b.bandsSum / b.banded).toFixed(1)
+                        + ' bands' : '')
                     + '  |  declined ' + (b.whole + b.tooMany + b.tooWide)
                     + ': ' + b.whole + ' no-rects, ' + b.tooMany + ' >'
                     + COPY_BAND_MAX_RECTS + ' rects, ' + b.tooWide + ' wide'
@@ -1719,8 +1883,11 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 lines.push('          aux ' + b.aux + ' views: banded '
                         + b.auxBanded + ' (' + pct(b.auxBanded / b.aux) + ')'
                         + (b.auxBanded
-                            ? ' span ' + pct(b.auxSpanSum / b.auxBanded)
+                            ? ' copied ' + pct(b.auxSpanSum / b.auxBanded)
                                 + ' damage ' + pct(b.auxDamageSum / b.auxBanded)
+                                + ' in '
+                                + (b.auxBandsSum / b.auxBanded).toFixed(1)
+                                + ' bands'
                             : ''));
 
         }
@@ -2239,21 +2406,38 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * Worth the care because the auxiliary view is the larger half of
          * what is left: on a Windows host it is one picture in two or three,
          * against xrdp's one in nine under CHROMA_INTERVAL=8. */
-        var copyBand = (!resyncNeeded && sameSize)
-                ? copyBandFor(frameState.rects, planeH, view !== 0) : null;
+        var bands = (!resyncNeeded && sameSize)
+                ? copyBandsFor(frameState.rects, planeH, planeW, view !== 0)
+                : null;
 
         if (view === 0)
             lastPictureSize = [pictureW, pictureH];
         else
             lastAuxSize = [planeW, planeH];
 
-        var options = copyBand
-            ? { rect: { x: 0, y: copyBand.y0,
-                        width: planeW, height: copyBand.h } }
-            : (rect
-                ? { rect: { x: 0, y: 0, width: rect.width,
-                            height: rect.height } }
-                : {});
+        /* One copy per band, all into a single pooled buffer laid out
+         * end to end. Each carries its own plane layout, so a band is an
+         * independent little upload with its own source origin. */
+        var segments = [];
+        var si;
+
+        if (bands) {
+            for (si = 0; si < bands.length; si++)
+                segments.push({
+                    band: bands[si],
+                    options: { rect: { x: 0, y: bands[si].y0,
+                                       width: planeW, height: bands[si].h } }
+                });
+        }
+        else {
+            segments.push({
+                band: null,
+                options: rect
+                    ? { rect: { x: 0, y: 0, width: rect.width,
+                                height: rect.height } }
+                    : {}
+            });
+        }
 
         var buffer = null;
         var size = 0;
@@ -2270,7 +2454,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * megabytes on a pool miss; copyTo()'s synchronous prologue does
              * the D3D11 array-texture copy and staging map. */
             var allocAt = nowMs();
-            size = frame.allocationSize(options);
+
+            for (si = 0; si < segments.length; si++) {
+                segments[si].offset = size;
+                segments[si].size =
+                        frame.allocationSize(segments[si].options);
+                size += segments[si].size;
+            }
 
             var bufAt = nowMs();
             recordStat('alloc', view !== 0, bufAt - allocAt);
@@ -2299,13 +2489,28 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         /* Issued here rather than inside the chain, so that the two views of
          * a picture are in flight at once; only what follows is ordered. */
-        var copy;
         var copyAt = nowMs();
-        try {
-            copy = frame.copyTo(buffer, options);
-        } catch (e) {
-            copy = Promise.reject(e);
+        var copies = [];
+        var copiedRows = 0;
+
+        for (si = 0; si < segments.length; si++) {
+
+            var seg = segments[si];
+
+            seg.data = new Uint8Array(buffer.buffer,
+                    buffer.byteOffset + seg.offset, seg.size);
+
+            try {
+                copies.push(frame.copyTo(seg.data, seg.options));
+            } catch (e) {
+                copies.push(Promise.reject(e));
+            }
+
+            copiedRows += seg.band ? seg.band.h : planeH;
+
         }
+
+        var copy = Promise.all(copies);
 
         /* The synchronous half of copyTo(). `read-back wait` times the
          * promise, which is why the transfer looked free: by the time the
@@ -2320,8 +2525,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * The two lead to different fixes, so measure before building
          * either. */
         var copyElapsed = nowMs() - copyAt;
-        recordStat('copy', view !== 0, copyElapsed,
-                planeW * (copyBand ? copyBand.h : planeH));
+        recordStat('copy', view !== 0, copyElapsed, planeW * copiedRows);
 
         /* The chain below is this copy's real error handler, but it may not
          * attach for some time, and a rejection with nothing attached yet is
@@ -2333,7 +2537,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         copyChain = copyChain.then(function() {
             return copy;
-        }).then(function(layout) {
+        }).then(function(layouts) {
 
             /* Times the work, not the wait. The awaits above queue behind
              * whatever else is in flight, so including them would measure the
@@ -2366,18 +2570,53 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             if (view === 0)
                 flushCombineCost(false);
 
-            /* NV12 has two planes rather than three; a null V plane is how
+            /* Each band's own plane views and rects. Built for every band
+             * before any is uploaded, so that a band whose clipped regions
+             * turn out unusable stops the picture rather than leaving the
+             * textures half written -- the same all-or-nothing the renderer
+             * enforces per plane.
+             *
+             * NV12 has two planes rather than three; a null V plane is how
              * the renderer is told the chroma is interleaved into U. */
-            var y = new Uint8Array(buffer.buffer,
-                    buffer.byteOffset + layout[0].offset);
-            var u = new Uint8Array(buffer.buffer,
-                    buffer.byteOffset + layout[1].offset);
-            var v = interleaved ? null : new Uint8Array(buffer.buffer,
-                    buffer.byteOffset + layout[2].offset);
+            var uploads = [];
+            var ui;
 
-            var strides = interleaved
-                ? [layout[0].stride, layout[1].stride]
-                : [layout[0].stride, layout[1].stride, layout[2].stride];
+            for (ui = 0; ui < segments.length; ui++) {
+
+                var useg = segments[ui];
+                var ulay = layouts[ui];
+
+                var urects = resyncNeeded ? null
+                    : (useg.band
+                        ? clipRectsToBand(frameState.rects, useg.band)
+                        : frameState.rects);
+
+                /* Every band is built from at least one rect, so an empty
+                 * list here means the clip and the band disagree. Copying the
+                 * whole plane next time is the cheap way to be sure. */
+                if (useg.band && (!urects || !urects.length)) {
+                    resyncNeeded = true;
+                    lastPictureSize = null;
+                    lastAuxSize = null;
+                    return;
+                }
+
+                uploads.push({
+                    y: new Uint8Array(useg.data.buffer,
+                            useg.data.byteOffset + ulay[0].offset),
+                    u: new Uint8Array(useg.data.buffer,
+                            useg.data.byteOffset + ulay[1].offset),
+                    v: interleaved ? null
+                        : new Uint8Array(useg.data.buffer,
+                                useg.data.byteOffset + ulay[2].offset),
+                    strides: interleaved
+                        ? [ulay[0].stride, ulay[1].stride]
+                        : [ulay[0].stride, ulay[1].stride, ulay[2].stride],
+                    rects: urects,
+                    y0: useg.band ? useg.band.y0 : undefined
+                });
+
+            }
 
             if (view === 0) {
 
@@ -2414,14 +2653,18 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 /* A refusal means nothing was uploaded -- the check happens
                  * before the first plane is written -- so the textures still
                  * match the screen and the next picture can carry every row
-                 * rather than this one repairing a half-written state. */
-                if (!renderer.uploadLuma(y, u, v, strides, pictureW, pictureH,
-                        resyncNeeded ? null : frameState.rects,
-                        copyBand ? copyBand.y0 : undefined)) {
-                    resyncNeeded = true;
-                    lastPictureSize = null;
-                    return;
-                }
+                 * rather than this one repairing a half-written state. The
+                 * check is a property of the picture rather than of a band,
+                 * so it refuses the first band or none of them. */
+                for (ui = 0; ui < uploads.length; ui++)
+                    if (!renderer.uploadLuma(uploads[ui].y, uploads[ui].u,
+                            uploads[ui].v, uploads[ui].strides,
+                            pictureW, pictureH, uploads[ui].rects,
+                            uploads[ui].y0)) {
+                        resyncNeeded = true;
+                        lastPictureSize = null;
+                        return;
+                    }
 
             }
             else {
@@ -2429,13 +2672,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 if (resyncNeeded)
                     combineResynced = true;
 
-                if (!renderer.uploadAux(y, u, v, strides, planeW, planeH,
-                        view, resyncNeeded ? null : frameState.rects,
-                        copyBand ? copyBand.y0 : undefined)) {
-                    resyncNeeded = true;
-                    lastAuxSize = null;
-                    return;
-                }
+                for (ui = 0; ui < uploads.length; ui++)
+                    if (!renderer.uploadAux(uploads[ui].y, uploads[ui].u,
+                            uploads[ui].v, uploads[ui].strides,
+                            planeW, planeH, view, uploads[ui].rects,
+                            uploads[ui].y0)) {
+                        resyncNeeded = true;
+                        lastAuxSize = null;
+                        return;
+                    }
 
             }
 
