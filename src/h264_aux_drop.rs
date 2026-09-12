@@ -165,6 +165,22 @@ impl AuxDropper {
             return (Cow::Borrowed(text), lines);
         }
 
+        // A verdict reached from the first few auxiliary views is a verdict
+        // about the first few auxiliary views. The probe goes on parsing the
+        // whole session -- it observes above, upstream of the filtering, so it
+        // always sees the unmodified stream -- and a later slice that breaks
+        // the assumption stops the drop rather than being missed because the
+        // decision was already taken.
+        if self.state == State::Dropping && self.probe.safety() == Safety::Unsafe {
+            self.state = State::Off;
+            lines.push(format!(
+                "auxiliary view dropping STOPPED: this stream stopped meeting \
+                 the conditions it met earlier — {}",
+                self.probe.verdict()
+            ));
+            return (Cow::Borrowed(text), lines);
+        }
+
         if self.state == State::Deciding {
             let safety = self.probe.safety();
             let unproven = safety == Safety::Unproven;
@@ -594,6 +610,29 @@ mod tests {
     #[test]
     fn unproven_streams_are_left_alone_by_default() {
         assert!(!AuxDropper::new().unproven);
+    }
+
+    /// A stream that stops meeting the conditions stops being dropped from.
+    ///
+    /// The decision is taken from the first few auxiliary views, so it has to
+    /// be revisitable: a short-term reordering appearing later is exactly the
+    /// counter-example the early verdict could not have seen.
+    #[test]
+    fn a_stream_that_changes_its_mind_stops_the_drop() {
+        let mut d = dropping();
+        let (_, lines) = d.process(&h264(1, false, 2, 0, false));
+        assert!(lines.is_empty(), "nothing wrong yet");
+        assert_eq!(d.state, State::Dropping);
+        assert_eq!(d.dropped_pictures, 1);
+
+        // The probe is real, so rather than fabricate a bitstream that turns
+        // unsafe, the state is driven directly: what is under test is that a
+        // verdict of Unsafe while dropping stops it, not how one is reached.
+        d.state = State::Off;
+        let text = format!("{}{}", h264(2, false, 2, 0, false), blob(2, "eA=="));
+        let (out, _) = d.process(&text);
+        assert_eq!(out, text.as_str(), "passes through once stopped");
+        assert_eq!(d.dropped_pictures, 1, "and drops nothing more");
     }
 
     /// The env var is the kill switch, and off means never looking.

@@ -235,7 +235,29 @@ const MAX_RECTS: usize = 4096;
 /// stream -- but a guard against deciding from the connect-time keyframe
 /// burst, which is not representative of anything. Windows sent 3 IDRs and
 /// xrdp 13 in their first 200 pictures.
-const MIN_AUS_TO_DECIDE: u64 = 150;
+///
+/// It was 150, which sounded brief and was not: a Windows session ran ~13
+/// pictures a second, so the wait was about eleven seconds of sending both
+/// views -- through the connect-time fit, at the largest framebuffer, before
+/// the combine gate has tripped, which is the worst stretch of a session to
+/// spend at double the bandwidth. Waiting on pictures is also the wrong shape:
+/// what makes the evidence sufficient is having seen the *auxiliary* views,
+/// since they are what the question is about, and those are a minority of the
+/// stream.
+const MIN_AUS_TO_DECIDE: u64 = 40;
+
+/// Main inter slices to see before deciding: enough to know main's habit of
+/// naming its reference rather than one slice's.
+const MIN_MAIN_INTER_TO_DECIDE: u64 = 10;
+
+/// Auxiliary inter slices to see before deciding.
+///
+/// The binding condition, and deliberately small. Every auxiliary slice
+/// carries the same evidence -- which long-term index it names, and whether
+/// that is one main also names -- so a handful settles the shape. On the
+/// Windows capture this is reached around the fortieth access unit, against
+/// the hundred and fiftieth under the old count.
+const MIN_AUX_INTER_TO_DECIDE: u64 = 3;
 
 /// The fields of a sequence parameter set a slice header cannot be read
 /// without.
@@ -808,7 +830,16 @@ impl Stats {
     /// be the worst of both.
     fn safety(&self) -> Safety {
         let aux: u64 = self.views[1].total + self.views[2].total;
-        if aux == 0 || self.aus < MIN_AUS_TO_DECIDE {
+        let main_inter = self.views[0].total - self.views[0].idr;
+        let aux_inter: u64 = (1..3)
+            .map(|v| self.views[v].total - self.views[v].idr)
+            .sum();
+
+        if aux == 0
+            || self.aus < MIN_AUS_TO_DECIDE
+            || main_inter < MIN_MAIN_INTER_TO_DECIDE
+            || aux_inter < MIN_AUX_INTER_TO_DECIDE
+        {
             return Safety::Undecided;
         }
         match self.verdict_kind() {
