@@ -2232,6 +2232,38 @@ mod tests {
     }
 
     #[test]
+    fn test_h264_drop_aux_round_trips_and_is_absent_by_default() {
+        // The fourth choice: the server offers AVC444 and rustguac removes the
+        // auxiliary view from the wire. Distinct from h264_combine, which
+        // lets it cross the wire and discards it in the browser -- the two can
+        // be set independently and mean different things.
+        let json = r#"{"type":"rdp","hostname":"test","avc444":true,"h264_drop_aux":true}"#;
+        let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.h264_drop_aux, Some(true));
+        assert_eq!(entry.h264_combine, None, "independent of combining");
+        assert!(serde_json::to_string(&entry)
+            .unwrap()
+            .contains("\"h264_drop_aux\":true"));
+
+        // Some(false) is a refusal and has to survive as one: skipping it
+        // would read back as "decide per stream", which is a different thing.
+        let json = r#"{"type":"rdp","hostname":"test","h264_drop_aux":false}"#;
+        let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.h264_drop_aux, Some(false));
+        assert!(serde_json::to_string(&entry)
+            .unwrap()
+            .contains("\"h264_drop_aux\":false"));
+
+        // Unset means the per-stream gate decides, and must not be written.
+        let json = r#"{"type":"rdp","hostname":"test","enable_h264":true}"#;
+        let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.h264_drop_aux, None);
+        assert!(!serde_json::to_string(&entry)
+            .unwrap()
+            .contains("h264_drop_aux"));
+    }
+
+    #[test]
     fn test_h264_combine_is_separate_from_avc444() {
         // The third choice: the server still offers AVC444, the browser never
         // combines its two views. Both fields travel, and both are absent by
