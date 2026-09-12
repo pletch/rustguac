@@ -578,12 +578,22 @@ contiguous):
 ```
 
 3% of 4.93MP is 0.148MP, which at 6.5ms/MP is under a millisecond of
-transfer. The copies cost 8-12ms. **The per-call floor on this client is
-~8-12ms, not the 2.7ms the two-point fit suggested**, so banding has reached
-its limit: narrowing further buys nothing, and AVC444 costs at least two of
-those floors per paired picture whatever the damage. That is the number to
-design against, and it is a property of the client rather than of the host or
-the resolution.
+transfer. The copies cost 6-18ms. **Banding has reached its limit**: what is
+left is per-call, narrowing further buys nothing, and AVC444 pays it twice per
+paired picture whatever the damage.
+
+**The per-call cost is not fixed -- it falls as the session gets busier.**
+Measured across four windows of one session: 17.5ms at 1.4 pictures a second,
+8.5ms at 5.2, and **6.2ms at 20.6**. So part of it is waiting for the decoder
+to have a frame ready, which shrinks when frames are already queued, rather
+than the transfer or a constant stall. A single window read in isolation will
+mislead about it, which the 2.7ms of the original two-point fit and an
+intermediate reading of 8-12ms both did in opposite directions.
+
+At steady state that is 8.3ms of copy per picture (103 main views at 6.2ms
+plus 33 auxiliary at 6.5ms over 5s), against the 16ms the gate trips at -- so
+roughly two times headroom -- and 12-17% of the main thread, from ~77% before
+any of this.
 
 **And it exposed a stale threshold.** That session suspended combining:
 
