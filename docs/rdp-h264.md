@@ -344,13 +344,23 @@ picture is available, so `flush mean 19.9ms` is how long the display waited for
 the decoder, not how long the display took to draw.
 
 That matters beyond this investigation. `COMBINE_FLUSH_TRIP_MS` gives up
-combining when the mean flush exceeds 8ms -- but the signal it reads is
-dominated by decode latency, and suspending the combine does not remove a
-single decode (lever 3 removes the combine and nothing else). The latch is
-tripping on something it cannot fix. Whether that is still a useful proxy is an
-open question, not a settled bug: AVC444 does mean two access units per
-picture, so combining correlates with the decode load even though it does not
-cause it.
+combining when the mean flush exceeds 8ms, and what it is reading is decode
+latency rather than display cost.
+
+*(Corrected 2026-09-12. It was written here that the latch therefore trips on
+something it cannot fix, since lever 3 removes the combine and not a single
+decode. That is wrong, and the measurements later in this section disprove it:
+`decode` fell from 28-38ms to 1-4ms once the copies were banded. Combining
+blocks the main thread, which delays the decoder's output callbacks, which
+inflates decode latency, which is what flush measures -- so combining does
+influence the signal and suspending it does reduce it. The chain is real, just
+indirect. What is true is weaker: the flush latch reads the cost at three
+removes where `COMBINE_COPY_TRIP_MS` reads it directly, and it has the
+strictest minimum of the three latches -- 100 syncs in 10s against the copy
+gate's 30 pictures and the sync-timeout latch's none -- so it is the least
+likely of them to fire first. Subsumed and second-hand, not misdirected, and
+worth keeping for the main-thread congestion that combining contributes to
+without the copy time alone showing it.)*
 
 **What is left unexplained is `draw`:** 12.5-19.8ms from the `VideoFrame`
 arriving in `output()` to the paint, of which the combine is 0.5ms, the

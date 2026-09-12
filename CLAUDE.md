@@ -408,6 +408,12 @@ three sit at levels the others cannot reach:
      is the one that decides. Typing at 4.93MP measures ~9ms a picture and
      full-screen video ~42ms, so neither regime is near the line.
    * The sync-timeout and slow-flush latches, as the safety net beneath both.
+     Their minimums are what decides which fires: the sync-timeout latch has
+     none (3 timeouts in 10s), the copy gate needs 30 pictures in 10s, the
+     flush latch 100 syncs. So a session degraded to a few frames a second --
+     fullscreen video at high resolution, say -- is caught by the
+     sync-timeout latch first and the copy gate at the next window boundary,
+     while the flush latch may never reach its minimum at all.
 
    The middle one *does* measure the cost, and legitimately -- see the
    adaptive suspension note above for why that is the opposite of the mistake
