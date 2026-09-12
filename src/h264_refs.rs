@@ -82,6 +82,33 @@
 //! A downstream drop has to lose the whole command for those, not merely its
 //! auxiliary half, which is why the unpaired auxiliary view is counted here.
 //!
+//! # What the first Windows capture said
+//!
+//! Measured 2026-09-12, 200 access units: 139 main and 61 auxiliary views, all
+//! of them reference pictures — and the two views run on **separate long-term
+//! reference chains**. Every inter picture ends with `mmco` 6, marking itself
+//! as a long-term reference, and every reordering is
+//! `modification_of_pic_nums_idc` 2, naming a long-term picture: main names 0,
+//! the auxiliary views name 1. No relative short-term reordering anywhere.
+//!
+//! Which is the ordinary way to multiplex two independent reference chains
+//! into one H.264 sequence, and it means **no surviving slice predicts from a
+//! dropped picture**. It also explains v1.8.0: dropping `bitstream[1]` left
+//! main's references intact, so the pictures decoded, and the only fault was
+//! the LC=2 command being painted.
+//!
+//! The distinction the first verdict here missed is that idc 0 and 1 carry
+//! `abs_diff_pic_num_minus1`, a *relative* step through short-term PicNums
+//! that shifts when a picture is removed, while idc 2 carries an absolute
+//! `long_term_pic_num` that does not. Reading any reordering as dangerous is
+//! what made a droppable stream look undroppable.
+//!
+//! What is left is `frame_num`, which advances across the auxiliary views and
+//! would leave holes: `gaps_in_frame_num_value_allowed_flag` is 0, so the
+//! result is not a conforming stream even though it decoded in v1.8.0. That
+//! flag is one bit in the SPS, and `crate::h264_rewrite` already edits that
+//! structure.
+//!
 //! # What this is
 //!
 //! A probe, not a feature. It is off unless `RUSTGUAC_H264_NAL_PROBE` is set,
@@ -159,8 +186,11 @@ struct Slice {
     /// `(modification_of_pic_nums_idc, its argument)`, in order, for list 0.
     /// Empty when the slice took the default ordering.
     list_mods: Vec<(u32, u32)>,
-    /// `memory_management_control_operation` values, in order.
-    mmco: Vec<u32>,
+    /// `(memory_management_control_operation, its principal argument)`, in
+    /// order. For op 6 — mark the current picture long-term — the argument is
+    /// the `long_term_frame_idx` assigned, which is what a later slice names
+    /// with a `modification_of_pic_nums_idc` of 2.
+    mmco: Vec<(u32, u32)>,
     long_term_reference: bool,
 }
 
@@ -190,6 +220,8 @@ struct Pending {
     /// The trailing `<paired>` flag: an auxiliary view for this same picture
     /// follows immediately (MS-RDPEGFX LC=0).
     paired: bool,
+    /// Payload bytes seen for this access unit, across all of its blobs.
+    bytes: usize,
     buf: Vec<u8>,
     /// Set once the slice header has been read, so the remaining blobs of a
     /// large picture are ignored rather than buffered.
@@ -202,6 +234,7 @@ struct ViewStats {
     total: u64,
     reference: u64,
     idr: u64,
+    bytes: u64,
     slice_types: BTreeMap<&'static str, u64>,
 }
 
@@ -219,6 +252,11 @@ struct Stats {
     aux_offsets: BTreeMap<u32, u64>,
     main_with_list_mod: u64,
     aux_with_list_mod: u64,
+    /// Reference list modifications and marking operations, kept per view:
+    /// what makes the two views separable is that each names its own
+    /// long-term picture and never the other's.
+    list_mods_by_view: [BTreeMap<(u32, u32), u64>; 3],
+    mmco_by_view: [BTreeMap<(u32, u32), u64>; 3],
     /// Auxiliary views arriving with no paired main view ahead of them — an
     /// MS-RDPEGFX LC=2 command, whose only bitstream is chroma.
     ///
@@ -233,6 +271,7 @@ struct Stats {
     parse_failures: u64,
     gaps_allowed: Option<bool>,
     max_num_ref_frames: Option<u32>,
+    pic_order_cnt_type: Option<u32>,
 }
 
 /// Reads the reference structure of a passthrough stream, once enabled.
@@ -344,6 +383,7 @@ impl NalProbe {
                 view,
                 keyframe,
                 paired,
+                bytes: 0,
                 buf: Vec::new(),
                 done: false,
             },
@@ -364,6 +404,14 @@ impl NalProbe {
             let Some(pending) = self.pending.get_mut(&index) else {
                 return;
             };
+
+            // Bytes are counted for every blob, including those of an access
+            // unit whose header has already been read: the size of each view
+            // is the bandwidth question, and it is the reason for all of this.
+            // Counted from the base64 length rather than by decoding, so a
+            // picture costs one decode however many blobs it takes.
+            pending.bytes += payload.len() / 4 * 3;
+
             if pending.done {
                 return;
             }
@@ -398,7 +446,12 @@ impl NalProbe {
         if self.pending.get(&index).is_some_and(|p| !p.done) {
             self.analyse(index, lines);
         }
-        self.pending.remove(&index);
+        // Credited here rather than in analyse: the access unit's size is not
+        // known until its last blob has arrived, which is usually after its
+        // header has been read.
+        if let Some(pending) = self.pending.remove(&index) {
+            self.stats.views[pending.view as usize].bytes += pending.bytes as u64;
+        }
     }
 
     /// Reads the parameter sets and first slice header out of what has been
@@ -421,6 +474,7 @@ impl NalProbe {
                     if let Some((id, sps)) = parse_sps(payload) {
                         self.stats.gaps_allowed = Some(sps.gaps_allowed);
                         self.stats.max_num_ref_frames = Some(sps.max_num_ref_frames);
+                        self.stats.pic_order_cnt_type = Some(sps.pic_order_cnt_type);
                         self.sps.insert(id, sps);
                     }
                 }
@@ -497,9 +551,15 @@ impl NalProbe {
 
         for &op in &slice.list_mods {
             *self.stats.list_mods.entry(op).or_default() += 1;
+            *self.stats.list_mods_by_view[view as usize]
+                .entry(op)
+                .or_default() += 1;
         }
         for &op in &slice.mmco {
-            *self.stats.mmco.entry(op).or_default() += 1;
+            *self.stats.mmco.entry(op.0).or_default() += 1;
+            *self.stats.mmco_by_view[view as usize]
+                .entry(op)
+                .or_default() += 1;
         }
 
         if n <= self.detail_aus {
@@ -519,7 +579,7 @@ impl NalProbe {
                 slice
                     .mmco
                     .iter()
-                    .map(|op| op.to_string())
+                    .map(|(op, arg)| format!("{}:{}", op, arg))
                     .collect::<Vec<_>>()
                     .join(" ")
             };
@@ -577,14 +637,18 @@ impl Stats {
                 .map(|(name, count)| format!("{} x{}", name, count))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let total_bytes: u64 = self.views.iter().map(|v| v.bytes).sum();
             lines.push(format!(
-                "  {:<6} {} pictures: {} reference, {} non-reference, {} IDR  [{}]",
+                "  {:<6} {} pictures: {} reference, {} non-reference, {} IDR  \
+                 [{}]  {} KiB ({}% of payload)",
                 view_name(view as u8),
                 stats.total,
                 stats.reference,
                 stats.total - stats.reference,
                 stats.idr,
-                types
+                types,
+                stats.bytes / 1024,
+                (stats.bytes * 100).checked_div(total_bytes).unwrap_or(0),
             ));
         }
 
@@ -597,33 +661,63 @@ impl Stats {
             histogram(&self.aux_offsets)
         ));
         lines.push(format!(
-            "  ref_pic_list_modification: {} main, {} aux; ops {}",
-            self.main_with_list_mod,
-            self.aux_with_list_mod,
-            if self.list_mods.is_empty() {
-                "none".to_string()
-            } else {
-                self.list_mods
-                    .iter()
-                    .map(|((idc, value), count)| format!("idc{}:{} x{}", idc, value, count))
+            "  ref_pic_list_modification: {} main, {} aux",
+            self.main_with_list_mod, self.aux_with_list_mod
+        ));
+        // Split by view, because what matters is not that the lists are
+        // reordered but whether the two views ever name the same picture.
+        // idc 0 and 1 are a relative step through short-term PicNums; idc 2 is
+        // an absolute long-term index, and only the first kind moves when
+        // something is dropped.
+        for (view, ops) in self.list_mods_by_view.iter().enumerate() {
+            if ops.is_empty() {
+                continue;
+            }
+            lines.push(format!(
+                "    {:<6} list ops: {}",
+                view_name(view as u8),
+                ops.iter()
+                    .map(|((idc, value), count)| format!(
+                        "{}{} x{}",
+                        if *idc == 2 {
+                            "long_term_pic_num "
+                        } else {
+                            "abs_diff_pic_num "
+                        },
+                        value,
+                        count
+                    ))
                     .collect::<Vec<_>>()
                     .join(", ")
-            }
-        ));
+            ));
+        }
         lines.push(format!(
             "  aux views with no paired main view (LC=2, chroma only): {}",
             self.aux_unpaired
         ));
+        for (view, ops) in self.mmco_by_view.iter().enumerate() {
+            if ops.is_empty() {
+                continue;
+            }
+            lines.push(format!(
+                "    {:<6} marking:  {}",
+                view_name(view as u8),
+                ops.iter()
+                    .map(|((op, arg), count)| format!("mmco {}:{} x{}", op, arg, count))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         lines.push(format!(
-            "  memory_management_control_operation: {}",
-            histogram(&self.mmco)
-        ));
-        lines.push(format!(
-            "  SPS: gaps_in_frame_num_value_allowed_flag={} max_num_ref_frames={}",
+            "  SPS: gaps_in_frame_num_value_allowed_flag={} max_num_ref_frames={} \
+             pic_order_cnt_type={}",
             self.gaps_allowed
                 .map(|v| u8::from(v).to_string())
                 .unwrap_or_else(|| "?".into()),
             self.max_num_ref_frames
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".into()),
+            self.pic_order_cnt_type
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "?".into()),
         ));
@@ -666,38 +760,109 @@ impl Stats {
                 .into();
         }
 
-        let mut reasons = vec![format!(
-            "{} of {} auxiliary views are reference pictures",
-            aux_reference, aux
-        )];
-        if !main_advances_by_one {
-            reasons.push(
-                "they consume frame_num slots, so dropping them opens \
-                          gaps in the sequence"
-                    .into(),
-            );
-        }
-        if self.main_with_list_mod > 0 {
-            reasons.push(format!(
-                "{} main slices reorder their reference list by PicNum, which \
-                 counts backwards through the auxiliary pictures",
-                self.main_with_list_mod
-            ));
-        }
-        if self.gaps_allowed == Some(false) && !main_advances_by_one {
-            reasons.push(
-                "and gaps_in_frame_num_value_allowed_flag is 0, so a \
-                          decoder is not required to tolerate the result"
-                    .into(),
+        // The auxiliary views are reference pictures, so the question becomes
+        // whether anything that survives actually refers to one.
+        //
+        // `modification_of_pic_nums_idc` decides it, and its three values are
+        // not alike. 0 and 1 carry `abs_diff_pic_num_minus1`, a *relative* step
+        // through short-term PicNums: those shift when a picture is removed, so
+        // a main slice reaching back past an auxiliary picture by a count would
+        // land somewhere else once it was gone. 2 carries `long_term_pic_num`,
+        // an absolute index the encoder assigned with `mmco` 6 — unaffected by
+        // anything dropped, and the ordinary way to multiplex two independent
+        // reference chains into one sequence.
+        let short_term: u64 = self.list_mods_by_view[0]
+            .iter()
+            .filter(|((idc, _), _)| *idc < 2)
+            .map(|(_, count)| count)
+            .sum();
+
+        let main_long_term: std::collections::BTreeSet<u32> = self.list_mods_by_view[0]
+            .keys()
+            .filter(|(idc, _)| *idc == 2)
+            .map(|(_, value)| *value)
+            .collect();
+        let aux_long_term: std::collections::BTreeSet<u32> = self.list_mods_by_view[1]
+            .keys()
+            .chain(self.list_mods_by_view[2].keys())
+            .filter(|(idc, _)| *idc == 2)
+            .map(|(_, value)| *value)
+            .collect();
+        let chains_are_separate = !main_long_term.is_empty()
+            && main_long_term.is_disjoint(&aux_long_term)
+            && short_term == 0;
+
+        if !chains_are_separate {
+            let mut reasons = vec![format!(
+                "{} of {} auxiliary views are reference pictures",
+                aux_reference, aux
+            )];
+            if short_term > 0 {
+                reasons.push(format!(
+                    "{} main slices reorder by a relative short-term PicNum \
+                     (idc 0/1), which counts backwards through the auxiliary \
+                     pictures and would address something else once they were \
+                     gone",
+                    short_term
+                ));
+            }
+            if !main_long_term.is_disjoint(&aux_long_term) {
+                reasons.push(format!(
+                    "both views name the same long-term pictures ({:?}), so \
+                     main is predicting from chroma",
+                    main_long_term
+                        .intersection(&aux_long_term)
+                        .collect::<Vec<_>>()
+                ));
+            }
+            if main_long_term.is_empty() && short_term == 0 {
+                reasons.push(
+                    "main slices take the default reference list, whose \
+                     ordering puts the most recently decoded picture — the \
+                     auxiliary view — first"
+                        .into(),
+                );
+            }
+            return format!(
+                "NOT DROPPABLE as-is — {}. Shedding the auxiliary view \
+                 downstream would need the surviving slice headers rewritten, \
+                 not merely filtered",
+                reasons.join("; ")
             );
         }
 
+        // Separate chains. The only thing left is frame_num continuity, since
+        // dropping a reference picture leaves a hole where one was expected.
+        let gaps = if main_advances_by_one {
+            None
+        } else if self.gaps_allowed == Some(true) {
+            Some(
+                "frame_num gaps would open where the auxiliary views were, and \
+                 gaps_in_frame_num_value_allowed_flag is 1, so a decoder is \
+                 required to tolerate them"
+                    .to_string(),
+            )
+        } else {
+            Some(
+                "frame_num gaps would open where the auxiliary views were, and \
+                 gaps_in_frame_num_value_allowed_flag is 0 — so the result is \
+                 not a conforming stream, though the flag is one bit in the SPS \
+                 and h264_rewrite already edits that structure"
+                    .to_string(),
+            )
+        };
+
         format!(
-            "NOT DROPPABLE as-is — {}. Shedding the auxiliary view downstream \
-             would need the surviving slice headers rewritten (frame_num, and \
-             the reference list modifications that address the dropped \
-             pictures), not merely filtered",
-            reasons.join("; ")
+            "DROPPABLE, with one caveat — the two views run on separate \
+             long-term reference chains: main names long-term {:?} and the \
+             auxiliary views name {:?}, assigned by mmco 6, with no relative \
+             short-term reordering anywhere. So nothing surviving predicts \
+             from a dropped picture. {}",
+            main_long_term,
+            aux_long_term,
+            gaps.unwrap_or_else(|| "frame_num stays continuous, so there is no \
+                 caveat at all"
+                .into())
         )
     }
 }
@@ -976,19 +1141,20 @@ fn parse_slice(
                 if op == 0 {
                     break;
                 }
+                let mut arg = 0;
                 if op == 1 || op == 3 {
-                    r.ue()?; // difference_of_pic_nums_minus1
+                    arg = r.ue()?; // difference_of_pic_nums_minus1
                 }
                 if op == 2 {
-                    r.ue()?; // long_term_pic_num
+                    arg = r.ue()?; // long_term_pic_num
                 }
                 if op == 3 || op == 6 {
-                    r.ue()?; // long_term_frame_idx
+                    arg = r.ue()?; // long_term_frame_idx
                 }
                 if op == 4 {
-                    r.ue()?; // max_long_term_frame_idx_plus1
+                    arg = r.ue()?; // max_long_term_frame_idx_plus1
                 }
-                mmco.push(op);
+                mmco.push((op, arg));
                 if mmco.len() > 32 {
                     return None;
                 }
@@ -1317,6 +1483,85 @@ mod tests {
 
         assert!(lines[0].contains("chroma-only"), "{}", lines[0]);
         assert_eq!(probe.stats.aux_unpaired, 2);
+    }
+
+    /// Builds the statistics a Windows AVC444 capture produces, so the
+    /// verdict can be exercised without a host.
+    fn windows_shaped_stats() -> Stats {
+        let mut stats = Stats {
+            gaps_allowed: Some(false),
+            ..Default::default()
+        };
+        stats.views[0].total = 139;
+        stats.views[0].reference = 139;
+        stats.views[2].total = 61;
+        stats.views[2].reference = 61;
+        // Main names long-term picture 0, the auxiliary views name 1, each
+        // assigned by mmco 6. Measured 2026-09-12 against a Windows host.
+        stats.list_mods_by_view[0].insert((2, 0), 136);
+        stats.list_mods_by_view[2].insert((2, 1), 58);
+        stats.mmco_by_view[0].insert((6, 0), 136);
+        stats.mmco_by_view[2].insert((6, 1), 58);
+        stats.main_deltas.insert(1, 79);
+        stats.main_deltas.insert(2, 53);
+        stats
+    }
+
+    /// Reference pictures alone do not make an auxiliary view undroppable:
+    /// what matters is whether anything surviving names one.
+    ///
+    /// This is the case the first verdict got wrong. It read any reordering as
+    /// dangerous, when `modification_of_pic_nums_idc` 2 is an absolute
+    /// long-term index rather than a relative walk through short-term PicNums,
+    /// and two disjoint long-term indices are how an encoder keeps two views
+    /// on separate reference chains inside one sequence.
+    #[test]
+    fn separate_long_term_chains_are_droppable() {
+        let verdict = windows_shaped_stats().verdict();
+        assert!(verdict.starts_with("DROPPABLE"), "{}", verdict);
+        assert!(verdict.contains("frame_num gaps"), "{}", verdict);
+        assert!(
+            verdict.contains("gaps_in_frame_num_value_allowed_flag is 0"),
+            "{}",
+            verdict
+        );
+    }
+
+    /// A relative short-term reordering is the dangerous kind, because the
+    /// PicNums it counts through shift when a picture is removed.
+    #[test]
+    fn relative_short_term_reordering_is_not_droppable() {
+        let mut stats = windows_shaped_stats();
+        stats.list_mods_by_view[0].insert((0, 1), 136);
+
+        let verdict = stats.verdict();
+        assert!(verdict.starts_with("NOT DROPPABLE"), "{}", verdict);
+        assert!(verdict.contains("short-term PicNum"), "{}", verdict);
+    }
+
+    /// Both views naming the same long-term picture means main is predicting
+    /// from chroma, which no amount of header rewriting makes droppable.
+    #[test]
+    fn a_shared_long_term_picture_is_not_droppable() {
+        let mut stats = windows_shaped_stats();
+        stats.list_mods_by_view[2].insert((2, 0), 58);
+
+        let verdict = stats.verdict();
+        assert!(verdict.starts_with("NOT DROPPABLE"), "{}", verdict);
+        assert!(verdict.contains("predicting from chroma"), "{}", verdict);
+    }
+
+    /// Main slices taking the default list order are the trap the long-term
+    /// scheme avoids: the default puts the most recently decoded reference
+    /// first, which in an interleaved stream is the auxiliary view.
+    #[test]
+    fn the_default_reference_list_is_not_droppable() {
+        let mut stats = windows_shaped_stats();
+        stats.list_mods_by_view[0].clear();
+
+        let verdict = stats.verdict();
+        assert!(verdict.starts_with("NOT DROPPABLE"), "{}", verdict);
+        assert!(verdict.contains("default reference list"), "{}", verdict);
     }
 
     /// The probe is off unless asked for, and that is what keeps it free.
