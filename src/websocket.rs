@@ -550,10 +550,12 @@ async fn guacd_to_ws(
     // it, which is every host but Windows. See crate::h264_rewrite.
     let mut sps_rewriter = crate::h264_rewrite::SpsRewriter::new();
 
-    // Off unless RUSTGUAC_H264_NAL_PROBE asks for it, and None rather than
-    // disabled when off, so the instruction scan is never entered. See
-    // crate::h264_refs for what it is for.
-    let mut nal_probe = crate::h264_refs::NalProbe::new();
+    // Removes the AVC444 auxiliary view from streams that prove they can
+    // spare it, which is most of the bandwidth argument for AVC420 without
+    // giving up H.264 on a Windows host. Decides per stream and leaves alone
+    // anything it cannot prove; RUSTGUAC_H264_AUX_DROP=0 turns it off. The
+    // NAL probe lives inside it, so one pass serves both.
+    let mut aux_dropper = crate::h264_aux_drop::AuxDropper::new();
 
     loop {
         let n = guacd.read(&mut buf).await?;
@@ -631,14 +633,15 @@ async fn guacd_to_ws(
             tracing::info!(session_id = %session_id, "H.264 colour: {}", line);
         }
 
-        // The reference structure of an AVC444 stream, when asked for. Reads
-        // the wire form for the same reason the colour line does: the question
-        // it answers is what the host sent.
-        if let Some(probe) = nal_probe.as_mut() {
-            for line in probe.observe(&text) {
-                tracing::info!(session_id = %session_id, "H.264 NAL probe: {}", line);
-            }
+        // The auxiliary view, dropped where the stream has proved that nothing
+        // surviving predicts from it. After the recording tee above, so a
+        // recording keeps the full 4:4:4 stream; before the SPS rewrite below,
+        // which needs to know whether to permit frame_num gaps.
+        let (text, aux_lines) = aux_dropper.process(&text);
+        for line in aux_lines {
+            tracing::info!(session_id = %session_id, "H.264: {}", line);
         }
+        sps_rewriter.set_allow_frame_num_gaps(aux_dropper.wants_frame_num_gaps());
 
         // Splice a colour description into the SPS where the host left one
         // out. After the telemetry above, so `H.264 colour:` reports what the
@@ -657,7 +660,9 @@ async fn guacd_to_ws(
                 }
                 rewritten
             }
-            None => text,
+            // Cow, because the dropper borrows a chunk it did not have to
+            // change -- which is most of them.
+            None => text.into_owned(),
         };
 
         // Recording and telemetry above both saw the text form; only what
@@ -682,6 +687,11 @@ async fn guacd_to_ws(
             }
             None => sink.send(Message::Text(text.into())).await?,
         }
+    }
+
+    // What the drop actually saved, once per session, and only when it ran.
+    if let Some(summary) = aux_dropper.summary() {
+        tracing::info!(session_id = %session_id, "H.264: {}", summary);
     }
 
     Ok(())

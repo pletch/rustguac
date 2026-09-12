@@ -199,7 +199,34 @@ pub(crate) fn unescape(nal: &[u8]) -> Vec<u8> {
 /// Parses the colour signalling out of one SPS NAL payload (without its header
 /// byte). Returns None if the SPS is malformed or truncated.
 pub fn parse_sps(payload: &[u8]) -> Option<ColourSignal> {
-    parse_rbsp(&unescape(payload)).map(|(signal, _)| signal)
+    parse_rbsp(&unescape(payload)).map(|parsed| parsed.signal)
+}
+
+/// Rewrites an SPS payload with `gaps_in_frame_num_value_allowed_flag` set, or
+/// `None` if it is already set or the SPS cannot be read.
+///
+/// Needed by `crate::h264_aux_drop`. Dropping an auxiliary view removes a
+/// reference picture, and every `frame_num` it consumed becomes a hole in the
+/// sequence. With this flag clear a decoder is entitled to treat that as a
+/// broken stream; with it set, the standard requires it to infer the missing
+/// pictures (8.2.5.2) and carry on. The encoders seen here all clear it,
+/// because none of them intends anything to be dropped.
+///
+/// Unlike the colour splice this changes no lengths — one bit, in place — but
+/// it still goes back through `escape()`, because flipping a bit can create a
+/// `00 00 00` or `00 00 01` sequence that must be escaped to stay parseable.
+pub fn allow_frame_num_gaps(payload: &[u8]) -> Option<Vec<u8>> {
+    let mut rbsp = unescape(payload);
+    let parsed = parse_rbsp(&rbsp)?;
+
+    let byte = parsed.gaps_bit / 8;
+    let mask = 0x80u8 >> (parsed.gaps_bit % 8);
+    if rbsp.get(byte)? & mask != 0 {
+        return None;
+    }
+
+    rbsp[byte] |= mask;
+    Some(escape(&rbsp))
 }
 
 /// Where colour signalling can be spliced into an SPS, and what is missing.
@@ -299,7 +326,15 @@ pub(crate) fn read_sps_prefix(r: &mut BitReader) -> Option<SpsPrefix> {
     })
 }
 
-fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
+/// What one SPS says, and the two places it can be edited.
+struct Parsed {
+    signal: ColourSignal,
+    splice: SpliceSite,
+    /// Bit offset of `gaps_in_frame_num_value_allowed_flag` within the RBSP.
+    gaps_bit: usize,
+}
+
+fn parse_rbsp(rbsp: &[u8]) -> Option<Parsed> {
     let mut r = BitReader::new(rbsp);
 
     read_sps_prefix(&mut r)?;
@@ -324,6 +359,7 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
     }
 
     r.ue()?; // max_num_ref_frames
+    let gaps_bit = r.pos;
     r.bit()?; // gaps_in_frame_num_value_allowed_flag
     r.ue()?; // pic_width_in_mbs_minus1
     r.ue()?; // pic_height_in_map_units_minus1
@@ -340,8 +376,8 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
 
     if r.bit()? == 0 {
         // vui_parameters_present_flag = 0
-        return Some((
-            ColourSignal {
+        return Some(Parsed {
+            signal: ColourSignal {
                 vui_present: false,
                 video_signal_type_present: false,
                 full_range: false,
@@ -349,8 +385,9 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
                 transfer: None,
                 matrix: None,
             },
-            SpliceSite::Nowhere,
-        ));
+            splice: SpliceSite::Nowhere,
+            gaps_bit,
+        });
     }
 
     if r.bit()? == 1 {
@@ -368,8 +405,8 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
     if r.bit()? == 0 {
         // video_signal_type_present_flag = 0 -- the whole block is missing,
         // which is what stock xrdp's x264 defaults produce.
-        return Some((
-            ColourSignal {
+        return Some(Parsed {
+            signal: ColourSignal {
                 vui_present: true,
                 video_signal_type_present: false,
                 full_range: false,
@@ -377,8 +414,9 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
                 transfer: None,
                 matrix: None,
             },
-            SpliceSite::SignalType(signal_type_flag_bit),
-        ));
+            splice: SpliceSite::SignalType(signal_type_flag_bit),
+            gaps_bit,
+        });
     }
 
     r.bits(3)?; // video_format
@@ -395,8 +433,8 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
         (None, None, None)
     };
 
-    Some((
-        ColourSignal {
+    Some(Parsed {
+        signal: ColourSignal {
             vui_present: true,
             video_signal_type_present: true,
             full_range,
@@ -404,12 +442,13 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
             transfer,
             matrix,
         },
-        if primaries.is_some() {
+        splice: if primaries.is_some() {
             SpliceSite::Nowhere
         } else {
             SpliceSite::Description(description_flag_bit)
         },
-    ))
+        gaps_bit,
+    })
 }
 
 /// Writes bits big-endian, for splicing an SPS back together.
@@ -497,7 +536,7 @@ fn escape(rbsp: &[u8]) -> Vec<u8> {
 /// is the value the decoder was already assuming.
 pub fn complete_colour_signalling(payload: &[u8]) -> Option<Vec<u8>> {
     let rbsp = unescape(payload);
-    let (_, site) = parse_rbsp(&rbsp)?;
+    let site = parse_rbsp(&rbsp)?.splice;
 
     let mut w = BitWriter::new(rbsp.len() + 8);
     let mut r = BitReader::new(&rbsp);
@@ -823,6 +862,127 @@ mod tests {
 
     /// Truncation must end the parse, not spin or panic. Every prefix of a
     /// real SPS is tried, since a short read can cut anywhere.
+    /// The gaps flag is set, and nothing else in the SPS moves.
+    ///
+    /// Checked against ffmpeg's own reading rather than by parsing it back
+    /// here: a bit offset that is wrong in the same way in both the writer and
+    /// the reader agrees with itself perfectly.
+    #[test]
+    fn setting_the_gaps_flag_matches_ffmpegs_reading() {
+        use std::process::Command;
+
+        let run = |args: &[&str]| -> Option<String> {
+            let out = Command::new("ffmpeg").args(args).output().ok()?;
+            Some(String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+
+        if run(&["-version"]).is_none() {
+            eprintln!("SKIP: needs ffmpeg");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("rustguac-gaps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let clip = dir.join("in.264");
+
+        assert!(Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=128x96:rate=10:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-f",
+                "h264",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg")
+            .success());
+
+        let annexb = std::fs::read(&clip).expect("clip");
+        let range = find_sps_range(&annexb).expect("an SPS");
+
+        // x264 clears it, which is what makes this worth doing at all.
+        let trace = |path: &std::path::Path| -> String {
+            run(&[
+                "-v",
+                "trace",
+                "-i",
+                &path.to_string_lossy(),
+                "-c",
+                "copy",
+                "-bsf:v",
+                "trace_headers",
+                "-f",
+                "null",
+                "-",
+            ])
+            .unwrap_or_default()
+        };
+        assert!(
+            trace(&clip)
+                .contains("gaps_in_frame_num_allowed_flag                              0 = 0"),
+            "the fixture should start with the flag clear"
+        );
+
+        let rewritten = allow_frame_num_gaps(&annexb[range.clone()]).expect("a flag to set");
+        assert_eq!(
+            rewritten.len(),
+            range.len(),
+            "one bit in place should not change the payload length"
+        );
+
+        let mut patched = annexb.clone();
+        patched.splice(range.clone(), rewritten);
+        let out = dir.join("out.264");
+        std::fs::write(&out, &patched).expect("write");
+
+        let after = trace(&out);
+        assert!(
+            after.contains("gaps_in_frame_num_allowed_flag                              1 = 1"),
+            "ffmpeg should read the flag as set:\n{}",
+            after
+        );
+
+        // Everything else must survive, or the picture does not. Compared
+        // past the "[trace_headers @ 0x...]" prefix, whose address differs
+        // between runs.
+        let field_line = |trace: &str, field: &str| -> Option<String> {
+            trace
+                .lines()
+                .find(|l| l.contains(field))
+                .and_then(|l| l.split_once("] "))
+                .map(|(_, rest)| rest.to_owned())
+        };
+        let before_trace = trace(&clip);
+        for field in [
+            "log2_max_frame_num_minus4",
+            "pic_width_in_mbs_minus1",
+            "pic_height_in_map_units_minus1",
+        ] {
+            assert_eq!(
+                field_line(&before_trace, field),
+                field_line(&after, field),
+                "{} moved",
+                field
+            );
+        }
+
+        // A second pass has nothing to do.
+        assert!(allow_frame_num_gaps(&patched[range]).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn truncation_is_not_fatal() {
         for len in 0..FULL_RANGE_COMPLETE.len() {

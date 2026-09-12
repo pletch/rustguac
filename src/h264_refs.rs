@@ -229,6 +229,14 @@ const MAX_PENDING_STREAMS: usize = 256;
 /// beyond which the instruction is taken as malformed rather than walked.
 const MAX_RECTS: usize = 4096;
 
+/// Access units to see before the assessment is allowed to conclude anything.
+///
+/// Not a statistical threshold -- one counter-example is enough to condemn a
+/// stream -- but a guard against deciding from the connect-time keyframe
+/// burst, which is not representative of anything. Windows sent 3 IDRs and
+/// xrdp 13 in their first 200 pictures.
+const MIN_AUS_TO_DECIDE: u64 = 150;
+
 /// The fields of a sequence parameter set a slice header cannot be read
 /// without.
 #[derive(Clone, Copy)]
@@ -395,23 +403,6 @@ pub struct NalProbe {
 }
 
 impl NalProbe {
-    /// A probe, or `None` when `RUSTGUAC_H264_NAL_PROBE` is unset or off.
-    ///
-    /// Returning `None` rather than a disabled probe is what keeps the cost at
-    /// zero: the caller holds an `Option` and never enters the instruction
-    /// scan, which is the same shape `FrameStats` uses for its own watch.
-    pub fn new() -> Option<Self> {
-        let raw = std::env::var("RUSTGUAC_H264_NAL_PROBE").ok()?;
-        let value = raw.trim();
-        let detail_aus = match value {
-            "" | "0" | "off" | "false" | "no" => return None,
-            "1" | "on" | "true" | "yes" => DEFAULT_DETAIL_AUS,
-            other => other.parse::<u64>().ok()?,
-        };
-
-        Some(Self::with_detail(detail_aus))
-    }
-
     fn with_detail(detail_aus: u64) -> Self {
         Self {
             detail_aus,
@@ -424,6 +415,31 @@ impl NalProbe {
             last_idr_view: None,
             next_summary: FIRST_SUMMARY_AUS,
         }
+    }
+
+    /// A probe that reports nothing unless asked, for `crate::h264_aux_drop`
+    /// to gate on. Detail lines are enabled when the probe's own environment
+    /// variable is set, so one probe serves both purposes rather than two
+    /// parsing the same stream.
+    pub fn for_gating() -> Self {
+        Self::with_detail(match std::env::var("RUSTGUAC_H264_NAL_PROBE") {
+            Ok(v) => match v.trim() {
+                "1" | "on" | "true" | "yes" => DEFAULT_DETAIL_AUS,
+                other => other.parse::<u64>().unwrap_or(0),
+            },
+            Err(_) => 0,
+        })
+    }
+
+    /// Whether this stream's auxiliary views can be dropped, as far as has
+    /// been seen.
+    pub fn safety(&self) -> Safety {
+        self.stats.safety()
+    }
+
+    /// The prose behind `safety`, for logging the decision once.
+    pub fn verdict(&self) -> String {
+        self.stats.verdict()
     }
 
     /// Reads one chunk of the guacd → browser stream, returning the lines to
@@ -751,7 +767,45 @@ fn view_name(view: u8) -> &'static str {
     }
 }
 
+/// Which way a verdict went, without its prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerdictKind {
+    NoAux,
+    Droppable,
+    NotAcrossAuxIdr,
+    Unproven,
+    NotDroppable,
+    Contradictory,
+}
+
+/// Whether this stream's auxiliary views can be dropped on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Safety {
+    /// Not enough seen yet, or no auxiliary view has arrived.
+    Undecided,
+    /// Nothing surviving a drop predicts from a dropped picture.
+    Safe,
+    /// Something does, or might, and cannot be shown otherwise.
+    Unsafe,
+}
+
 impl Stats {
+    /// The structured form of `verdict`, for the dropper to gate on.
+    ///
+    /// Deliberately the same conditions, and `verdicts_and_safety_agree`
+    /// pins that: a gate that drifted from the explanation beside it would
+    /// be the worst of both.
+    fn safety(&self) -> Safety {
+        let aux: u64 = self.views[1].total + self.views[2].total;
+        if aux == 0 || self.aus < MIN_AUS_TO_DECIDE {
+            return Safety::Undecided;
+        }
+        match self.verdict_kind() {
+            VerdictKind::Droppable => Safety::Safe,
+            _ => Safety::Unsafe,
+        }
+    }
+
     /// The whole point of the exercise: what has been seen, and what it means
     /// for dropping the auxiliary view.
     fn summary(&self) -> Vec<String> {
@@ -884,12 +938,27 @@ impl Stats {
     /// Reads the three questions in the order that short-circuits: a
     /// non-reference auxiliary view settles it on its own, because a picture
     /// that is never stored can never be referred to.
+    /// The verdict as a kind alone, for gating.
+    fn verdict_kind(&self) -> VerdictKind {
+        self.verdict_full().0
+    }
+
+    /// The verdict as prose, for the journal.
     fn verdict(&self) -> String {
+        self.verdict_full().1
+    }
+
+    /// One decision, two renderings. Split so that the gate the dropper reads
+    /// and the sentence a human reads can never disagree.
+    fn verdict_full(&self) -> (VerdictKind, String) {
         let aux: u64 = self.views[1].total + self.views[2].total;
         if aux == 0 {
-            return "no auxiliary views seen — this is an AVC420 stream, or the \
-                    host has not sent chroma yet"
-                .into();
+            return (
+                VerdictKind::NoAux,
+                "no auxiliary views seen — this is an AVC420 stream, or the \
+                 host has not sent chroma yet"
+                    .into(),
+            );
         }
 
         let aux_reference = self.views[1].reference + self.views[2].reference;
@@ -899,20 +968,26 @@ impl Stats {
 
         if aux_reference == 0 {
             if !main_advances_by_one {
-                return format!(
-                    "CONTRADICTORY — every auxiliary view is non-reference, yet \
+                return (
+                    VerdictKind::Contradictory,
+                    format!(
+                        "CONTRADICTORY — every auxiliary view is non-reference, yet \
                      frame_num advances by more than one between main views \
                      ({}). One of the two readings is wrong; suspect this \
                      parser before the stream",
-                    histogram(&self.main_deltas)
+                        histogram(&self.main_deltas)
+                    ),
                 );
             }
-            return "DROPPABLE — every auxiliary view is a non-reference picture \
+            return (
+                VerdictKind::Droppable,
+                "DROPPABLE — every auxiliary view is a non-reference picture \
                     and consumes no frame_num, so no surviving slice can refer \
                     to one. Dropping the view!=0 instructions and clearing the \
                     trailing <paired> flag on their main views would leave a \
                     valid 4:2:0 stream"
-                .into();
+                    .into(),
+            );
         }
 
         // The auxiliary views are reference pictures, so the question becomes
@@ -998,8 +1073,10 @@ impl Stats {
                         aux_long_term_marked, aux_inter
                     ));
                 } else if main_active_entries > 1 {
-                    return format!(
-                        "UNPROVEN — every auxiliary picture marks itself \
+                    return (
+                        VerdictKind::Unproven,
+                        format!(
+                            "UNPROVEN — every auxiliary picture marks itself \
                          long-term (mmco 6), which moves it behind every \
                          short-term picture in the default reference list main \
                          slices use, so index 0 is the previous main view. But \
@@ -1009,34 +1086,43 @@ impl Stats {
                          slice header and cannot be read here: decide it by \
                          lowering the encoder's reference count, or by \
                          dropping and watching for drift",
-                        main_active_entries
+                            main_active_entries
+                        ),
                     );
                 } else {
-                    return format!(
-                        "DROPPABLE, with one caveat — no slice reorders its \
+                    return (
+                        VerdictKind::Droppable,
+                        format!(
+                            "DROPPABLE, with one caveat — no slice reorders its \
                          reference list, but every auxiliary picture marks \
                          itself long-term (mmco 6), which places it after every \
                          short-term picture in the default list. Main slices \
                          activate one list-0 entry, which is therefore always \
                          the previous main view, so nothing surviving predicts \
                          from an auxiliary picture. {}",
-                        self.frame_num_caveat(main_advances_by_one)
+                            self.frame_num_caveat(main_advances_by_one)
+                        ),
                     );
                 }
             }
-            return format!(
-                "NOT DROPPABLE as-is — {}. Shedding the auxiliary view \
+            return (
+                VerdictKind::NotDroppable,
+                format!(
+                    "NOT DROPPABLE as-is — {}. Shedding the auxiliary view \
                  downstream would need the surviving slice headers rewritten, \
                  not merely filtered",
-                reasons.join("; ")
+                    reasons.join("; ")
+                ),
             );
         }
 
         // Separate chains. The only thing left is frame_num continuity, since
         // dropping a reference picture leaves a hole where one was expected.
         if self.main_refs_across_aux_idr > 0 {
-            return format!(
-                "DROPPABLE IN STEADY STATE, NOT ACROSS AN AUXILIARY IDR — the \
+            return (
+                VerdictKind::NotAcrossAuxIdr,
+                format!(
+                    "DROPPABLE IN STEADY STATE, NOT ACROSS AN AUXILIARY IDR — the \
                  two views run on separate long-term reference chains (main \
                  names {:?}, auxiliary {:?}), but {} main slices name a \
                  long-term picture while the most recent IDR was an auxiliary \
@@ -1044,22 +1130,26 @@ impl Stats {
                  long-term index 0, so at those points long-term 0 is the \
                  auxiliary picture. Dropping it removes a buffer reset the \
                  surviving stream is written against. {}",
-                main_long_term,
-                aux_long_term,
-                self.main_refs_across_aux_idr,
-                self.frame_num_caveat(main_advances_by_one)
+                    main_long_term,
+                    aux_long_term,
+                    self.main_refs_across_aux_idr,
+                    self.frame_num_caveat(main_advances_by_one)
+                ),
             );
         }
 
-        format!(
-            "DROPPABLE, with one caveat — the two views run on separate \
+        (
+            VerdictKind::Droppable,
+            format!(
+                "DROPPABLE, with one caveat — the two views run on separate \
              long-term reference chains: main names long-term {:?} and the \
              auxiliary views name {:?}, assigned by mmco 6, with no relative \
              short-term reordering anywhere. So nothing surviving predicts \
              from a dropped picture. {}",
-            main_long_term,
-            aux_long_term,
-            self.frame_num_caveat(main_advances_by_one)
+                main_long_term,
+                aux_long_term,
+                self.frame_num_caveat(main_advances_by_one)
+            ),
         )
     }
 
@@ -1860,15 +1950,74 @@ mod tests {
         assert!(verdict.contains("claims long-term index 0"), "{}", verdict);
     }
 
-    /// The probe is off unless asked for, and that is what keeps it free.
+    /// The gate and the sentence beside it come from one decision.
+    ///
+    /// They are read by different audiences -- one decides whether to drop
+    /// bytes, the other explains it in the journal -- and a disagreement
+    /// between them would be invisible until someone compared a log line with
+    /// what the session actually did.
     #[test]
-    fn disabled_without_the_env_var() {
-        // Not std::env::set_var: tests share a process, and a probe built here
-        // would leak into any other test reading the environment.
+    fn verdicts_and_safety_agree() {
+        let cases: [(Stats, Safety); 5] = [
+            (windows_shaped_stats(), Safety::Safe),
+            (xrdp_shaped_stats(), Safety::Safe),
+            (
+                {
+                    let mut s = xrdp_shaped_stats();
+                    s.num_ref_idx_by_view[0].insert(2, 138);
+                    s
+                },
+                Safety::Unsafe,
+            ),
+            (
+                {
+                    let mut s = windows_shaped_stats();
+                    s.main_refs_across_aux_idr = 2;
+                    s
+                },
+                Safety::Unsafe,
+            ),
+            (
+                {
+                    let mut s = windows_shaped_stats();
+                    s.list_mods_by_view[0].insert((0, 1), 136);
+                    s
+                },
+                Safety::Unsafe,
+            ),
+        ];
+
+        for (mut stats, expected) in cases {
+            stats.aus = MIN_AUS_TO_DECIDE;
+            let verdict = stats.verdict();
+            assert_eq!(stats.safety(), expected, "for: {}", verdict);
+            assert_eq!(
+                verdict.starts_with("DROPPABLE") && !verdict.starts_with("DROPPABLE IN STEADY"),
+                expected == Safety::Safe,
+                "the prose and the gate disagree: {}",
+                verdict
+            );
+        }
+    }
+
+    /// Nothing is decided from the connect-time keyframe burst.
+    #[test]
+    fn a_short_capture_decides_nothing() {
+        let mut stats = windows_shaped_stats();
+        stats.aus = MIN_AUS_TO_DECIDE - 1;
+        assert_eq!(stats.safety(), Safety::Undecided);
+    }
+
+    /// The probe always runs now, because the dropper gates on it — but it
+    /// says nothing unless asked, which is what keeps it free.
+    #[test]
+    fn silent_without_the_env_var() {
+        // Not std::env::set_var: tests share a process, and a variable set
+        // here would leak into any other test reading the environment.
         assert!(matches!(
             std::env::var("RUSTGUAC_H264_NAL_PROBE").ok().as_deref(),
             None | Some("") | Some("0")
         ));
-        assert!(NalProbe::new().is_none());
+        assert_eq!(NalProbe::for_gating().detail_aus, 0);
     }
 }
