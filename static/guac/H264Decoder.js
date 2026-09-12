@@ -1344,7 +1344,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var lines = ['[rustguac] H.264 over '
                 + ((now - stats.since) / 1000).toFixed(1) + 's, ms:'];
 
-        ['decode', 'combine', 'draw'].forEach(function(name) {
+        ['decode', 'combine', 'draw', 'queue'].forEach(function(name) {
             lines.push('  ' + (name + '     ').slice(0, 8)
                     + 'chroma ' + one(stats[name + ':chroma'])
                     + '  |  luma ' + one(stats[name + ':luma']));
@@ -2625,6 +2625,27 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 watchdog: null
             };
 
+            /* Wrapped after construction, so the wrapper can stamp into the
+             * frameState it belongs to. Every path that finishes a frame --
+             * combine, snapshot, watchdog, decode failure -- goes through
+             * onReady, so one wrapper here covers all of them where patching
+             * each call site would miss one.
+             *
+             * This is what splits `draw` in two. The display's flush completes
+             * *inside* the unblock this calls (Display.js __display_h264_ready
+             * -> Task.unblock -> __flush_frames, synchronously), so a frame
+             * that is slow to become available is indistinguishable, from
+             * sync_hold's side, from a display that is slow to draw. `queue`
+             * is the half that is genuinely the display's: the picture was
+             * ready and waited anyway, behind frames ahead of it that were
+             * not. */
+            if (onReady)
+                frameState.onReady = function __h264_ready() {
+                    if (!frameState.readyAt)
+                        frameState.readyAt = nowMs();
+                    onReady();
+                };
+
             frameState.submittedAt = nowMs();
             frameState.keyFrame = !!isKeyFrame;
             pendingDecodes++;
@@ -2737,10 +2758,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             return;
         }
 
-        /* Ready to painted: time in the display's ordered queue, not work. */
+        /* Decoded to painted: the asynchronous chain that turns a VideoFrame
+         * into a snapshot, plus the wait below. */
         if (frameState.decodedAt)
             recordStat('draw', frameState.view !== 0,
                     nowMs() - frameState.decodedAt);
+
+        /* Ready to painted: time in the display's ordered queue, not work.
+         * `draw` minus this is the chain; this is the queue. */
+        if (frameState.readyAt)
+            recordStat('queue', frameState.view !== 0,
+                    nowMs() - frameState.readyAt);
 
         try {
 

@@ -307,6 +307,66 @@ to flip them mid-session without a reload, or in `localStorage` to have them
 survive one. Not as a query parameter: the client relaunches its own URL, so a
 hand-added parameter is gone at the next reconnect.
 
+#### Result: it is not the handoff, and `flush` was never measuring the display
+
+Measured at 1920x1072 against the xrdp fork with `CHROMA_INTERVAL=8`, combining
+forced on, over three 5s windows:
+
+```
+  decode  chroma 35 mean 14.4 max 50.7  |  luma 274 mean 6.1 max 43.4
+  combine chroma 35 mean  0.5 max  0.9  |  luma 239 mean 0.3 max 1.0
+  draw    chroma 35 mean 12.5 max 33.1  |  luma 239 mean 15.1 max 57.5
+  paint   bitmap 274 mean  0.0 max  0.4 0.01ms/MP  |  canvas none
+  read-back wait mean 0.0 max 0.1
+sync_hold: 2090 syncs (34.8/s) held 3 (0%) timeouts 0
+           | flush mean 19.9ms max 89ms | by paint: bitmap 2088 mean 19.9ms
+```
+
+**The handoff is free.** `paint` is 0.0ms mean, 0.4ms max, 0.01ms/MP against
+either denominator. The ImageBitmap crosses into the display's 2D context at
+no measurable cost, so the driver is sharing the surface, not reading it back.
+The bounding-box change that would have followed is not worth making, and the
+vendor-independence that pointed here has a duller explanation: nothing on this
+path is GPU-bound at all.
+
+**The combine is also cheap in situ** -- 0.3-0.5ms with `gl.finish()` forcing
+completion, against the bench's ~1.37ms/MP (~2.8ms at this size). No
+contradiction: the bench measures full-frame damage, and a real desktop's
+damage is small, which is exactly what the banded uploads and the scissored
+conversion were built for. The bench is a worst case, not a typical one.
+
+**And `flush` was measuring the wrong thing.** The stack that produced these
+numbers runs `recordHold` <- `waitForPending` <- `displaySyncComplete` <-
+`Frame.flush` <- `__flush_frames` <- `Task.unblock` <- `__display_h264_ready`
+<- the combine's own promise. The display's flush *completes inside the
+decoder's unblock*: a frame carrying H.264 blocks its display task until the
+picture is available, so `flush mean 19.9ms` is how long the display waited for
+the decoder, not how long the display took to draw.
+
+That matters beyond this investigation. `COMBINE_FLUSH_TRIP_MS` gives up
+combining when the mean flush exceeds 8ms -- but the signal it reads is
+dominated by decode latency, and suspending the combine does not remove a
+single decode (lever 3 removes the combine and nothing else). The latch is
+tripping on something it cannot fix. Whether that is still a useful proxy is an
+open question, not a settled bug: AVC444 does mean two access units per
+picture, so combining correlates with the decode load even though it does not
+cause it.
+
+**What is left unexplained is `draw`:** 12.5-19.8ms from the `VideoFrame`
+arriving in `output()` to the paint, of which the combine is 0.5ms, the
+read-back wait 0.0ms and the paint 0.0ms. Roughly 12-18ms is unaccounted for.
+A `queue` stage now splits it -- `onReady` is wrapped to stamp when the
+picture actually became available, so `draw` minus `queue` is the asynchronous
+chain and `queue` is time spent in the display's ordered queue behind frames
+that were not ready yet.
+
+**Next measurement:** the same three stages with `window.__h264Chroma444 =
+false` on the same session and host. `false` is an override like any other, so
+the latch stays out of the way and the comparison is clean. If `decode` and
+`queue` are what grow between the two runs, the cost is the second access unit
+and the pipelining around it, and the client-side combine gate is aimed at the
+wrong thing.
+
 ## Colour range
 
 The samples an RDP host sends are **full range**. [MS-RDPEGFX Color
