@@ -1271,6 +1271,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var syncTimeouts = 0;
 
     /**
+     * The pixel format of the last frame the decoder produced, or null before
+     * the first one. See combineFrame().
+     *
+     * @private
+     * @type {string}
+     */
+    var lastFrameFormat = null;
+
+    /**
      * Records one sample against a named stage, split by whether the picture
      * carried an auxiliary view, and reports every few seconds. Cheap enough
      * to leave in the path: one comparison when off.
@@ -1342,9 +1351,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         }
 
         var lines = ['[rustguac] H.264 over '
-                + ((now - stats.since) / 1000).toFixed(1) + 's, ms:'];
+                + ((now - stats.since) / 1000).toFixed(1) + 's, ms'
+                + (lastFrameFormat ? ' (decoder gives ' + lastFrameFormat
+                    + ')' : '') + ':'];
 
-        ['decode', 'combine', 'draw', 'queue'].forEach(function(name) {
+        ['decode', 'issue', 'combine', 'draw', 'queue'].forEach(
+                function(name) {
             lines.push('  ' + (name + '     ').slice(0, 8)
                     + 'chroma ' + one(stats[name + ':chroma'])
                     + '  |  luma ' + one(stats[name + ':luma']));
@@ -1802,6 +1814,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     function combineFrame(frame, frameState) {
 
+        /* Neither `copyWait` nor `combine` covers what happens between here
+         * and the copy being issued -- allocationSize(), which can force a
+         * GPU-backed frame to be mapped, and the synchronous half of
+         * copyTo(). That window sits inside `draw` and was part of the
+         * 12-18ms it could not account for. */
+        var enteredAt = nowMs();
+
         var renderer = yuv444;
         var view = frameState.view;
         var rect = frame.codedRect || null;
@@ -1817,6 +1836,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * one interleaved plane or two, which the renderer can address either
          * way, so taking what the decoder gives costs nothing. */
         var format = frame.format || '';
+
+        /* Reported beside the timings, because it is the cheapest available
+         * evidence of which decoder is running. A hardware decoder on Windows
+         * hands back NV12; I420 is what Chrome's software decoder produces.
+         * hardwareAcceleration is a preference, not a requirement -- see
+         * DEFAULT_CODEC -- so a session can silently be decoding in software
+         * at many times the latency, which shows up as a slow `decode`, a
+         * near-free copyTo() (the planes are already in system memory), and
+         * nothing wrong anywhere else. */
+        lastFrameFormat = format || 'unknown';
+
         var interleaved = (format.indexOf('NV12') === 0);
         var planar = (format.indexOf('I420') === 0);
 
@@ -1879,6 +1909,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         copy.catch(function() { /* handled by the chain */ });
 
         var copyIssuedAt = nowMs();
+        recordStat('issue', view !== 0, copyIssuedAt - enteredAt);
 
         copyChain = copyChain.then(function() {
             return copy;

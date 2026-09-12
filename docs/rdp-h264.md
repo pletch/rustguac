@@ -367,6 +367,50 @@ the latch stays out of the way and the comparison is clean. If `decode` and
 and the pipelining around it, and the client-side combine gate is aimed at the
 wrong thing.
 
+#### It is not `copyTo()` either -- and the decode times say why
+
+The natural next suspect is `VideoFrame.copyTo()`: pulling the planes out of a
+decoded frame is a GPU-to-CPU transfer, and that cost looks unavoidable. The
+run above already measures it. `read-back wait` -- issuing the copy to the
+chain resolving it -- is **mean 0.0ms, max 0.1-0.2ms**. It is not the
+bottleneck, and it is not close to being one.
+
+But a near-free `copyTo()` is itself strange, and taken together with the rest
+of the run it points somewhere specific:
+
+* `copyTo()` costs nothing, which is what happens when the planes are **already
+  in system memory** rather than in GPU memory.
+* `decode` is **6-10ms for a main view and 14-20ms for an auxiliary one** at
+  1920x1072. A hardware decoder does 1080p in single-digit *tenths* of a
+  millisecond of engine time and a few ms of latency; this is an order out.
+* Nothing on the GPU path costs anything: combine 0.5ms, paint 0.0ms.
+* The slowdown is identical on an RTX 3070 and an Intel 770 -- which is
+  expected if the GPU is barely involved.
+
+That is the signature of **software decoding**. `H264Decoder.js` already
+documents the trap: `hardwareAcceleration: 'prefer-hardware'` is a *preference,
+not a requirement*, and a stream whose frames exceed the declared codec level
+falls back to software silently -- which is exactly why `DEFAULT_CODEC` was
+raised to level 5.2, after a 2688x1488 session "decoded in software at roughly
+twenty times the latency, and under AVC444 for two pictures per frame."
+
+If that is what is happening here, every conclusion inverts. AVC444 would not
+be expensive because combining is expensive -- combining is nearly free. It
+would be expensive because it asks a *software* decoder for two access units
+per picture instead of one, and the client-side combine gate cannot remove a
+single one of them.
+
+**The cheapest check is the format the decoder hands back**, now printed in the
+`h264CombineLog` header as `(decoder gives ...)`. A hardware decoder on Windows
+gives **NV12**; **I420** is Chrome's software decoder. `chrome://media-internals`
+confirms it by name, and shows why a fallback was taken.
+
+An `issue` stage was also added, timing `combineFrame()` entry to the copy being
+issued -- `allocationSize()` plus the synchronous half of `copyTo()`, which sat
+in neither `copyWait` nor `combine` and was inside the unexplained window.
+With `decode`, `issue`, `copyWait`, `combine`, `queue` and `paint`, `draw` is
+fully accounted for.
+
 ## Colour range
 
 The samples an RDP host sends are **full range**. [MS-RDPEGFX Color
