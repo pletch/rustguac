@@ -21,11 +21,13 @@ the build scripts.
 
 Upstream ships AVC420-only passthrough. This fork reworks it substantially.
 
-- **AVC444 support** (`patches/004-h264-passthrough.patch`) — both views of an
-  AVC444 picture are forwarded and the main one drawn, so Windows hosts can use
-  **hardware** H.264 encoding, which requires `AVC444ModePreferred=1`. Upstream
-  forces `GfxAVC444` off to sidestep the colour corruption this used to cause.
-  Both views are decoded and combined, giving full 4:4:4 chroma (see
+- **AVC444 support** (`patches/004-h264-passthrough.patch`) — guacd forwards
+  both views of an AVC444 picture rather than dropping the auxiliary one, so
+  Windows hosts can use **hardware** H.264 encoding, which requires
+  `AVC444ModePreferred=1`. Upstream forces `GfxAVC444` off to sidestep the
+  colour corruption this used to cause. What is drawn is the browser's
+  decision: the two views are combined into full 4:4:4 chroma, or the main view
+  is painted alone at 4:2:0 when the combine gate declines (see
   [`docs/rdp-h264.md`](docs/rdp-h264.md)).
 - **4:4:4 chroma reconstruction** — the auxiliary view of an AVC444 picture is
   not an image: its planes carry the chroma samples the main view's 4:2:0
@@ -45,7 +47,8 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   server mixing H.264 with other codecs a late frame repaints stale video over
   newer content.
 - **Frame lifetime** — ordered drawing defers the paint, so a decoded frame is
-  snapshotted to a canvas and closed before its draw task runs. Holding a
+  released before its draw task runs: snapshotted to a canvas on the 4:2:0
+  path, or with its planes copied out on the combine path. Holding a
   `VideoFrame` across a promise exhausts the hardware decoder's output-surface
   pool as soon as the display queue falls behind, which shows up as brief video
   freezes. (Upstream draws straight from the output callback, so it has no
@@ -59,9 +62,16 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   This fork allows a bounded depth of 2 so the two overlap, with a 200ms
   safety timeout and a rate-limited warning, since logging from a struggling
   decoder makes the latency it reports worse.
-- **Codec configuration** — the decoder is configured as `avc1.640029` (High,
-  4.1) with `hardwareAcceleration: 'prefer-hardware'`, matching what xrdp and
-  Windows actually send. Upstream declares `avc1.42001f` (Baseline, 3.1).
+- **Codec configuration** — the decoder takes its codec string from the
+  stream's own sequence parameter set where there is one, falling back to
+  `avc1.640034` (High, 5.2), with `hardwareAcceleration: 'prefer-hardware'`.
+  Upstream declares `avc1.42001f` (Baseline, 3.1). **The level is not
+  advisory**: Chrome sizes its hardware decoder from it and a stream whose
+  frames exceed it falls back to software *silently*, because
+  `hardwareAcceleration` is a preference rather than a requirement. Level 4.1
+  permits 8192 macroblocks, which holds for 1920x944 and fails for 2688x1488 —
+  measured decoding in software at roughly twenty times the latency, and under
+  AVC444 for two pictures per frame.
 - **Survives an RDPGFX reconnect** — the SurfaceCommand and CapsConfirm
   wrappers are installed once, only for connections with H.264 enabled, and
   each is guarded on its own callback. They are reinstalled when the channel is
@@ -78,8 +88,11 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   Windows sends exactly that shape, so its sessions rendered with blacks
   crushed and chroma over-saturated by 255/224, while the xrdp fork — which
   sends the same flag *with* a BT.709 description — rendered correctly. This
-  fork splices a BT.709 description into any SPS that declares a range without
-  one, on the wire, deciding once per session. Doing it there rather than in
+  fork completes the signalling on the wire, deciding once per session: a
+  description is spliced into an SPS that declares a range without one, and
+  full-range BT.709 written into one that declares nothing at all — which is
+  what stock xrdp sends, since it passes x264 no VUI parameters and x264 then
+  omits the block entirely. Doing it there rather than in
   the client reaches `drawImage()`, which no client-side flag can, and every
   client including third-party ones. Recordings are teed upstream of the
   rewrite and keep the host's original stream, so `?h264FullRange=on` on the
@@ -343,14 +356,21 @@ framebuffer back on every painted keyframe, which is the same cost class as the
   reinstall — the unit files themselves are rewritten every run. The installer
   also warns about existing systemd drop-ins, which silently override the unit
   it just wrote.
-- **Benchmark and format tests** — `tests/bench/` measures the AVC444 combine
-  with `gl.finish()`, because the client's own `h264CombineLog` timed GPU
-  submission and read four times low, which is what got an earlier version of
-  the combine gate deleted. `tests/h264-instruction-format.mjs`,
-  `tests/h264-vui-range.mjs` and `tests/binary-blob-format.mjs` pin the wire
-  formats across the Rust/JS boundary, where a disagreement fails silently:
-  the client drops what it cannot parse and video simply stops while both ends
-  look healthy.
+- **Benchmark and format tests** — `tests/bench/` measures the combine's GPU
+  work with `gl.finish()`, which the client's own `h264CombineLog` did not do
+  at the time and so read four times low, deleting an earlier version of the
+  combine gate. **It cannot see the dominant cost**, though: it feeds
+  pre-decoded frames that already live in system memory, so its `copyTo()` row
+  reads 0.29ms against ~14ms in the field, where the frame is a GPU texture and
+  pulling its planes out means a driver copy and a staging map. Use
+  `h264CombineLog`'s `copy` and `issue` stages for that.
+
+  `tests/h264-copy-band.mjs`, `tests/h264-instruction-format.mjs`,
+  `tests/h264-vui-range.mjs` and `tests/binary-blob-format.mjs` pin formats and
+  invariants where a disagreement fails silently — the client drops what it
+  cannot parse and video simply stops while both ends look healthy, and a copy
+  band one row short paints a row of the previous picture into the middle of
+  this one, which shows on moving content and on nothing else.
 - `contrib/measure-guacd-cpu.sh`, `contrib/setup-rdp-performance.ps1`.
 
 ### Merged upstream
