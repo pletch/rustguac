@@ -134,6 +134,10 @@ pub struct CreateSessionRequest {
     /// `None` means yes. Never reaches guacd: it is passed to client.html
     /// through `SessionInfo`, since only the browser combines.
     pub h264_combine: Option<bool>,
+    /// Whether rustguac removes AVC444's auxiliary view from the wire. `None`
+    /// decides per stream from the slice headers; `Some(true)` drops from the
+    /// first picture. Never reaches guacd — the removal is rustguac's.
+    pub h264_drop_aux: Option<bool>,
     // VDI fields
     /// Docker image for VDI sessions (e.g. "myregistry/desktop:latest").
     pub container_image: Option<String>,
@@ -342,6 +346,9 @@ pub struct Session {
     /// Whether the browser may combine AVC444's two views into 4:4:4.
     /// Copied from the source entry; surfaced inverted in `SessionInfo`.
     pub h264_combine: bool,
+    /// Whether to remove AVC444's auxiliary view from this session's wire.
+    /// `None` leaves it to `crate::h264_aux_drop`'s per-stream gate.
+    pub h264_drop_aux: Option<bool>,
     /// Copied from the source entry's `autohide_side_tabs` flag.
     /// Surfaced in `SessionInfo` so client.html can auto-hide the
     /// clipboard/files side tabs.
@@ -1828,6 +1835,7 @@ impl SessionManager {
             display_scale: req.display_scale,
             fullscreen_on_connect: req.fullscreen_on_connect.unwrap_or(false),
             h264_combine: req.h264_combine.unwrap_or(true),
+            h264_drop_aux: req.h264_drop_aux,
             autohide_side_tabs: req.autohide_side_tabs.unwrap_or(false),
             frame_stats: Arc::new(crate::frame_stats::FrameStats::new()),
         };
@@ -2284,6 +2292,18 @@ impl SessionManager {
         } else {
             false
         }
+    }
+
+    /// Whether this session's entry asked for AVC444's auxiliary view to be
+    /// dropped from the wire, left to the per-stream gate, or kept.
+    ///
+    /// Read at WebSocket setup rather than carried on the connection
+    /// parameters: guacd never sees this, since the removal is rustguac's.
+    pub async fn h264_drop_aux(&self, id: Uuid) -> Option<bool> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(&id)?;
+        let session = session.lock().await;
+        session.h264_drop_aux
     }
 
     /// Get recording metadata for a session (address_book_entry, max_recordings).
@@ -2745,6 +2765,7 @@ mod tests {
             display_scale: None,
             fullscreen_on_connect: false,
             h264_combine: true,
+            h264_drop_aux: None,
             autohide_side_tabs: false,
             frame_stats: Arc::new(crate::frame_stats::FrameStats::new()),
         }

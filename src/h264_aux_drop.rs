@@ -119,6 +119,14 @@ pub struct AuxDropper {
     /// default, because the one host with that shape corrupted; never extends
     /// to `Unsafe`.
     unproven: bool,
+    /// Set when the connection entry asked for this outright, which suspends
+    /// both the gate and the running re-check.
+    ///
+    /// An override is an instruction -- the same reasoning that has an
+    /// explicit `h264Chroma444` disable the combine latch. A setting that the
+    /// gate could veto would be impossible to A/B, and the entry is where
+    /// someone records what they know about a target that this cannot see.
+    instructed: bool,
     state: State,
     dropped_streams: HashSet<u32>,
     /// Auxiliary pictures dropped, and the payload bytes they carried.
@@ -131,7 +139,33 @@ pub struct AuxDropper {
 }
 
 impl AuxDropper {
-    pub fn new() -> Self {
+    /// A dropper for one session.
+    ///
+    /// `setting` is the connection entry's `h264_drop_aux`: `None` leaves the
+    /// per-stream gate to decide, `Some(true)` drops from the first picture,
+    /// `Some(false)` never drops. The environment variable still overrides
+    /// everything, as a kill switch that needs no entry edited.
+    pub fn for_session(setting: Option<bool>) -> Self {
+        let mut dropper = Self::new();
+
+        match setting {
+            // An explicit instruction, so the gate does not second-guess it.
+            // The wait exists because nothing is known about the stream yet;
+            // an admin who has set this knows the target, and the wait is
+            // spent at the worst moment -- the connect-time fit, at the
+            // largest framebuffer, sending both views.
+            Some(true) if dropper.state != State::Off => {
+                dropper.state = State::Dropping;
+                dropper.instructed = true;
+            }
+            Some(false) => dropper.state = State::Off,
+            _ => {}
+        }
+
+        dropper
+    }
+
+    fn new() -> Self {
         let setting = std::env::var("RUSTGUAC_H264_AUX_DROP").unwrap_or_default();
         let setting = setting.trim().to_ascii_lowercase();
         let enabled = !matches!(setting.as_str(), "0" | "off" | "false" | "no");
@@ -149,6 +183,7 @@ impl AuxDropper {
             dropped_bytes: 0,
             kept_idrs: 0,
             unpaired: 0,
+            instructed: false,
         }
     }
 
@@ -171,7 +206,10 @@ impl AuxDropper {
         // always sees the unmodified stream -- and a later slice that breaks
         // the assumption stops the drop rather than being missed because the
         // decision was already taken.
-        if self.state == State::Dropping && self.probe.safety() == Safety::Unsafe {
+        if self.state == State::Dropping
+            && !self.instructed
+            && self.probe.safety() == Safety::Unsafe
+        {
             self.state = State::Off;
             lines.push(format!(
                 "auxiliary view dropping STOPPED: this stream stopped meeting \
@@ -472,11 +510,56 @@ mod tests {
     }
 
     /// A dropper already past its gate, so the filtering can be tested without
-    /// feeding it two hundred access units of real bitstream.
+    /// feeding it a session's worth of real bitstream.
     fn dropping() -> AuxDropper {
         let mut d = AuxDropper::new();
         d.state = State::Dropping;
         d
+    }
+
+    /// An entry that asks for this drops from the first picture, with no
+    /// decision window at all.
+    #[test]
+    fn an_instructed_session_drops_immediately() {
+        let mut d = AuxDropper::for_session(Some(true));
+        assert_eq!(d.state, State::Dropping);
+        assert!(
+            d.wants_frame_num_gaps(),
+            "and permits gaps from the first SPS"
+        );
+
+        let first = h264(1, false, 2, 0, false);
+        let (out, _) = d.process(&first);
+        assert_eq!(out, "", "the very first auxiliary view goes");
+        assert_eq!(d.dropped_pictures, 1);
+    }
+
+    /// And the running re-check does not second-guess it. An override is an
+    /// instruction; a setting the gate could veto could not be A/B tested.
+    #[test]
+    fn an_instructed_session_is_not_second_guessed() {
+        let d = AuxDropper::for_session(Some(true));
+        assert!(d.instructed);
+    }
+
+    /// An entry that says no is never examined.
+    #[test]
+    fn an_entry_can_refuse_outright() {
+        let mut d = AuxDropper::for_session(Some(false));
+        assert_eq!(d.state, State::Off);
+        assert!(!d.wants_frame_num_gaps());
+
+        let text = h264(1, false, 2, 0, false);
+        let (out, _) = d.process(&text);
+        assert_eq!(out, text.as_str());
+    }
+
+    /// Unset leaves the per-stream gate to decide, as before.
+    #[test]
+    fn an_unset_entry_still_waits_for_the_gate() {
+        let d = AuxDropper::for_session(None);
+        assert_eq!(d.state, State::Deciding);
+        assert!(!d.instructed);
     }
 
     #[test]

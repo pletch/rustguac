@@ -227,6 +227,10 @@ async fn handle_ws(
         "Starting proxy"
     );
 
+    // Whether this entry asked for the AVC444 auxiliary view to be dropped.
+    // Read here rather than sent to guacd: the removal happens in guacd_to_ws.
+    let drop_aux = manager.h264_drop_aux(session_id).await;
+
     // Set up recording file (only for owner connections, and only if recording is enabled)
     let is_recording_enabled = manager.is_recording_enabled(session_id).await;
     let recording_path = manager
@@ -296,6 +300,7 @@ async fn handle_ws(
         frame_stats.clone(),
         session_id,
         binary_blobs,
+        drop_aux,
     )
     .await;
     let elapsed = start.elapsed();
@@ -441,6 +446,7 @@ async fn proxy_ws_guacd(
     frame_stats: Arc<crate::frame_stats::FrameStats>,
     session_id: Uuid,
     binary_blobs: bool,
+    drop_aux: Option<bool>,
 ) -> ProxyOutcome {
     let (guacd_read, guacd_write) = tokio::io::split(guacd);
     let (ws_write, ws_read) = ws.split();
@@ -469,6 +475,7 @@ async fn proxy_ws_guacd(
             stats_g,
             session_id,
             binary_blobs,
+            drop_aux,
         )
         .await
     });
@@ -526,6 +533,7 @@ const MAX_GUACD_CARRY: usize = 16 * 1024 * 1024;
 /// of instruction was not ';' nor ','". To prevent that, every Message::Text
 /// we emit ends at a true Guacamole instruction boundary; partial tail data
 /// is held in `carry` until the next read completes it.
+#[allow(clippy::too_many_arguments)]
 async fn guacd_to_ws(
     mut guacd: tokio::io::ReadHalf<GuacdStream>,
     ws: WsSink,
@@ -534,6 +542,7 @@ async fn guacd_to_ws(
     frame_stats: Arc<crate::frame_stats::FrameStats>,
     session_id: Uuid,
     binary_blobs: bool,
+    drop_aux: Option<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 65536];
     let mut carry: Vec<u8> = Vec::new();
@@ -555,7 +564,7 @@ async fn guacd_to_ws(
     // giving up H.264 on a Windows host. Decides per stream and leaves alone
     // anything it cannot prove; RUSTGUAC_H264_AUX_DROP=0 turns it off. The
     // NAL probe lives inside it, so one pass serves both.
-    let mut aux_dropper = crate::h264_aux_drop::AuxDropper::new();
+    let mut aux_dropper = crate::h264_aux_drop::AuxDropper::for_session(drop_aux);
 
     loop {
         let n = guacd.read(&mut buf).await?;
