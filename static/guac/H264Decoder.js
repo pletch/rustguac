@@ -1602,7 +1602,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                           whole: 0, tooMany: 0, tooWide: 0,
                           wideSpanSum: 0, wideDamageSum: 0,
                           aux: 0, auxBanded: 0, auxSpanSum: 0,
-                          auxDamageSum: 0, bandsSum: 0, auxBandsSum: 0 };
+                          auxDamageSum: 0, bandsSum: 0, auxBandsSum: 0,
+                          auxWhole: 0, auxTooMany: 0, auxTooWide: 0,
+                          auxWideSpanSum: 0, auxWideDamageSum: 0 };
 
         /* Merged, so overlapping rects are not counted twice. */
         var damage = 0;
@@ -1627,14 +1629,33 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         }
 
         if (isAux) {
+
             bandStats.aux++;
+
             if (outcome === 'banded') {
                 bandStats.auxBanded++;
                 bandStats.auxSpanSum += spanRows / planeH;
                 bandStats.auxDamageSum += damage / planeH;
                 bandStats.auxBandsSum += nbands || 1;
             }
+            else if (outcome === 'whole')
+                bandStats.auxWhole++;
+            else if (outcome === 'tooMany')
+                bandStats.auxTooMany++;
+            else {
+                /* The one that matters on a server accumulating chroma
+                 * across frames: an auxiliary view carries the union of the
+                 * damage since the last one, so its declared regions are
+                 * inherently larger than a main view's and reach the span
+                 * limit sooner. Reported so that is distinguishable from a
+                 * server declaring nothing at all. */
+                bandStats.auxTooWide++;
+                bandStats.auxWideSpanSum += spanRows / planeH;
+                bandStats.auxWideDamageSum += damage / planeH;
+            }
+
             return;
+
         }
 
         if (outcome === 'banded') {
@@ -1901,6 +1922,19 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                                 + ' in '
                                 + (b.auxBandsSum / b.auxBanded).toFixed(1)
                                 + ' bands'
+                            : '')
+                        + (b.auxBanded < b.aux
+                            ? '  |  declined ' + (b.aux - b.auxBanded) + ': '
+                                + b.auxWhole + ' no-rects, ' + b.auxTooMany
+                                + ' >' + COPY_BAND_MAX_RECTS + ' rects, '
+                                + b.auxTooWide + ' wide'
+                                + (b.auxTooWide
+                                    ? ' (copied '
+                                        + pct(b.auxWideSpanSum / b.auxTooWide)
+                                        + ' damage '
+                                        + pct(b.auxWideDamageSum / b.auxTooWide)
+                                        + ')'
+                                    : '')
                             : ''));
 
         }
