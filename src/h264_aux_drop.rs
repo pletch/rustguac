@@ -13,36 +13,55 @@
 //! for it: never-combine works on any stream, this one only where the encoder
 //! has kept the two views' references apart.
 //!
-//! # Why it needs a gate
+//! # Why it needs a gate, and what the gate has to ask
 //!
 //! The two views are one H.264 sequence sharing one decoded picture buffer, so
-//! dropping access units is safe only if nothing surviving predicts from one.
-//! `crate::h264_refs` reads that out of the slice headers, and the answer
-//! differs by host: Windows names its references explicitly with disjoint
-//! long-term indices and is provably safe; the xrdp fork relies on the default
-//! list ordering and activates two entries, which reaches the auxiliary
-//! picture at index 1. So this is decided per stream, from that stream, and a
-//! host it cannot prove anything about is left alone.
+//! dropping access units is safe only if two things hold, and the second was
+//! learned the hard way.
 //!
-//! Nothing is dropped until `Safety::Safe`, which needs 150 access units —
-//! past the connect-time keyframe burst, which is not representative of
-//! anything.
+//! **Nothing surviving may predict from a dropped picture.**
+//! `crate::h264_refs` reads that out of the slice headers. Windows names its
+//! references explicitly with disjoint long-term indices; the dual-LTR xrdp
+//! fork does the same since `f42cc481`. Both pass.
+//!
+//! **And the decoder must have room for the pictures a gap makes it invent.**
+//! Dropping a picture leaves a hole in `frame_num`, and 8.2.5.2 obliges a
+//! decoder to fill each hole with an inferred *non-existing* frame held as a
+//! **short-term** reference. The sliding window can only evict short-term
+//! pictures, so a stream whose `max_num_ref_frames` is entirely consumed by
+//! long-term references has nowhere to put one, and the decoder fails outright
+//! rather than degrading.
+//!
+//! That is what froze an xrdp session on 2026-09-12. Its chains were separate
+//! and explicitly named -- the first test passed, correctly -- but
+//! `max_num_ref_frames` was 2 with long-term 0 held by main and 1 by the
+//! auxiliary view. Dropping began at 21:14:34.654 and Chrome reported a decode
+//! error 212ms later, rebuilt its decoder, and then held every frame waiting
+//! for a keyframe an idle desktop never sends. Windows survives the identical
+//! treatment only because its `max_num_ref_frames` is 3: two long-term and one
+//! to spare.
+//!
+//! So the first question was the right one and not the only one. Asking
+//! whether anything *refers* to a dropped picture says nothing about whether
+//! the decoder can account for the ones that are missing.
 //!
 //! # What it does, in order
 //!
-//! 1. **Waits.** Everything passes through while the probe accumulates.
-//! 2. **Arms.** Once the stream proves itself, every SPS from that point gets
-//!    `gaps_in_frame_num_value_allowed_flag` set. Dropping a reference picture
-//!    turns every `frame_num` it consumed into a hole, and with the flag clear
-//!    a decoder is entitled to treat that as a broken stream; with it set the
-//!    standard requires it to infer the missing pictures and carry on.
-//! 3. **Starts at a keyframe.** Not before: the decoder must have seen an SPS
-//!    permitting gaps before the first gap reaches it, and in Annex B the
-//!    in-band parameter sets are what govern.
-//! 4. **Drops** the `h264`, `blob` and `end` instructions of every non-IDR
-//!    auxiliary view, and clears the trailing `<paired>` flag on main views so
-//!    the client paints them instead of holding them for a view that is no
-//!    longer coming.
+//! 1. **Permits gaps immediately.** Every SPS gets
+//!    `gaps_in_frame_num_value_allowed_flag` set from the first instruction of
+//!    the session, before anything has been decided, because an SPS only rides
+//!    a keyframe and a host can go minutes without one. Setting it on a stream
+//!    that is never dropped from is inert.
+//! 2. **Waits** while the probe accumulates -- three auxiliary inter slices and
+//!    ten main ones, with forty access units as a floor against the
+//!    connect-time keyframe burst.
+//! 3. **Drops**, as soon as the stream proves itself, the `h264`, `blob` and
+//!    `end` instructions of every non-IDR auxiliary view, and clears the
+//!    trailing `<paired>` flag on main views so the client paints them instead
+//!    of holding them for a view that is no longer coming.
+//! 4. **Keeps watching.** A verdict reached from the first few auxiliary views
+//!    is a verdict about the first few auxiliary views, so one that turns
+//!    unsafe later stops the drop.
 //!
 //! # What it deliberately does not drop
 //!
@@ -67,28 +86,21 @@
 //! `RUSTGUAC_H264_AUX_DROP=0` turns it off; `=unproven` extends it to streams
 //! the slice headers cannot prove, which is not currently a good idea.
 //!
-//! # Unproven turned out to mean unsafe, on the one host that has that shape
+//! # Unproven, and what it turned out to be worth
 //!
 //! `Safety::Unproven` means the auxiliary picture sits in a reference list
 //! past the index the encoder is known to use, and that the slice headers
-//! cannot say whether a macroblock reaches it. That is the xrdp fork's shape:
-//! main slices take the default list and activate two entries because the
-//! *auxiliary* slices need two to reach their own chain, so the reasoning ran
-//! that main very likely never uses index 1.
+//! cannot say whether a macroblock reaches it. That was the xrdp fork's shape
+//! before `f42cc481`: main slices took the default list and activated two
+//! entries because the *auxiliary* slices needed two to reach their own chain,
+//! so the reasoning ran that main very likely never used index 1.
 //!
-//! **Tried on 2026-09-12, and xrdp corrupted.** Windows, whose headers prove
-//! the chains disjoint, was fine in the same session -- which also settles the
-//! part that was genuinely uncertain, since the `frame_num` gaps that
-//! mechanism depends on were being inferred correctly on the host that worked.
-//! So the difference between the two is the thing the headers flagged, and the
-//! likely answer is the obvious one: main slices on xrdp do reach index 1.
+//! It was tried on 2026-09-12 and xrdp corrupted, and
+//! `tests/aux-drop-replay.mjs` then settled it against a recording: the drop
+//! left 12 of 141 main access units undecodable. Very likely never was doing
+//! the work in that argument, and it was wrong. `=unproven` still exists for
+//! experiments and is off by default.
 //!
-//! "Very likely never" was doing the work in that argument, and it was wrong.
-//! `tests/aux-drop-replay.mjs` against an xrdp recording is what would say so
-//! for certain, by decoding both streams rather than reasoning about the
-//! encoder; and lowering the fork's own `num_ref_idx_l0_active_minus1` to 0 on
-//! main slices is what would make xrdp provable rather than merely probable,
-//! since the encoder is ours.
 
 use std::borrow::Cow;
 use std::collections::HashSet;

@@ -794,6 +794,7 @@ fn view_name(view: u8) -> &'static str {
 enum VerdictKind {
     NoAux,
     Droppable,
+    NoDpbRoom,
     NotAcrossAuxIdr,
     Unproven,
     NotDroppable,
@@ -1065,6 +1066,15 @@ impl Stats {
             && main_long_term.is_disjoint(&aux_long_term)
             && short_term == 0;
 
+        // Separate chains are necessary and not sufficient: the decoded
+        // picture buffer has to have somewhere to put the pictures a gap
+        // makes it invent.
+        if chains_are_separate {
+            if let Some(reason) = self.no_room_for_inferred_frames() {
+                return (VerdictKind::NoDpbRoom, reason);
+            }
+        }
+
         if !chains_are_separate {
             let mut reasons = vec![format!(
                 "{} of {} auxiliary views are reference pictures",
@@ -1196,6 +1206,61 @@ impl Stats {
                 self.frame_num_caveat(main_advances_by_one)
             ),
         )
+    }
+
+    /// Whether this stream's decoded picture buffer can hold the frames a
+    /// `frame_num` gap obliges a decoder to invent, or `None` if it can.
+    ///
+    /// Dropping a picture leaves a hole in `frame_num`, and 8.2.5.2 requires a
+    /// decoder to fill each one with an inferred *non-existing* frame, marked
+    /// **short-term**, running the sliding window as it goes. The sliding
+    /// window (8.2.5.3) can only evict short-term pictures. So a stream whose
+    /// `max_num_ref_frames` is entirely consumed by long-term references has
+    /// nowhere to put one, and the decoder fails rather than degrading.
+    ///
+    /// Measured 2026-09-12 on the dual-LTR xrdp fork: `max_num_ref_frames` 2,
+    /// with long-term 0 held by main and 1 by the auxiliary view. Dropping
+    /// began at 21:14:34.654 and Chrome reported a decode error 212ms later,
+    /// then held every frame waiting for a keyframe that an idle desktop never
+    /// sends -- a permanent freeze. Windows survives the same treatment
+    /// because its `max_num_ref_frames` is 3: two long-term and one to spare.
+    ///
+    /// This is why the separate-chains test was necessary and not sufficient.
+    /// It asked whether anything *refers* to a dropped picture, which was the
+    /// right question and not the only one; the decoder also has to be able to
+    /// account for the ones that are missing.
+    fn no_room_for_inferred_frames(&self) -> Option<String> {
+        // No gaps, nothing to infer.
+        if self.main_deltas.keys().all(|&delta| delta <= 1) {
+            return None;
+        }
+
+        let long_term: std::collections::BTreeSet<u32> = self
+            .list_mods_by_view
+            .iter()
+            .flat_map(|ops| ops.keys())
+            .filter(|(idc, _)| *idc == 2)
+            .map(|(_, value)| *value)
+            .collect();
+
+        let capacity = self.max_num_ref_frames?;
+        if capacity as usize > long_term.len() {
+            return None;
+        }
+
+        Some(format!(
+            "NO ROOM IN THE DECODED PICTURE BUFFER — the reference chains are \
+             separate, but max_num_ref_frames is {} and long-term indices {:?} \
+             already account for all of it. Dropping a picture leaves a gap in \
+             frame_num, and a decoder must fill each gap with an inferred \
+             non-existing frame held as a *short-term* reference (8.2.5.2); \
+             the sliding window can only evict short-term pictures, so there \
+             is nowhere to put one and the decoder fails rather than \
+             degrading. Raising the encoder's max_num_ref_frames by one, or \
+             renumbering frame_num so no gap is left, is what makes this \
+             stream droppable",
+            capacity, long_term
+        ))
     }
 
     /// What dropping does to `frame_num`, which is the same question however
@@ -1914,6 +1979,74 @@ mod tests {
         let verdict = stats.verdict();
         assert!(verdict.starts_with("NOT DROPPABLE"), "{}", verdict);
         assert!(verdict.contains("default reference list"), "{}", verdict);
+    }
+
+    /// The dual-LTR xrdp fork, as measured on 2026-09-12: separate chains,
+    /// explicitly named, and a decoded picture buffer with no room to spare.
+    fn xrdp_dual_ltr_stats() -> Stats {
+        let mut stats = Stats {
+            gaps_allowed: Some(false),
+            max_num_ref_frames: Some(2),
+            ..Default::default()
+        };
+        stats.views[0].total = 152;
+        stats.views[0].reference = 152;
+        stats.views[0].idr = 13;
+        stats.views[2].total = 48;
+        stats.views[2].reference = 48;
+        stats.list_mods_by_view[0].insert((2, 0), 139);
+        stats.list_mods_by_view[2].insert((2, 1), 35);
+        stats.mmco_by_view[0].insert((6, 0), 139);
+        stats.mmco_by_view[2].insert((6, 1), 48);
+        stats.long_term_marked[0] = 139;
+        stats.long_term_marked[2] = 48;
+        stats.num_ref_idx_by_view[0].insert(1, 139);
+        stats.num_ref_idx_by_view[2].insert(1, 35);
+        stats.main_deltas.insert(0, 12);
+        stats.main_deltas.insert(1, 103);
+        stats.main_deltas.insert(2, 36);
+        stats.aus = 200;
+        stats
+    }
+
+    /// Separate reference chains are necessary and not sufficient.
+    ///
+    /// This is the case that froze a session. The chains are disjoint and
+    /// explicitly named -- the gate said DROPPABLE and it was right about
+    /// that -- but max_num_ref_frames is 2 and both slots are long-term, so
+    /// the frames a frame_num gap obliges the decoder to invent have nowhere
+    /// to go. Chrome errored 212ms after the first drop and then held every
+    /// frame waiting for a keyframe that never came.
+    #[test]
+    fn a_full_decoded_picture_buffer_is_not_droppable() {
+        let stats = xrdp_dual_ltr_stats();
+        let verdict = stats.verdict();
+
+        assert_eq!(stats.safety(), Safety::Unsafe, "{}", verdict);
+        assert!(verdict.starts_with("NO ROOM"), "{}", verdict);
+        assert!(verdict.contains("max_num_ref_frames is 2"), "{}", verdict);
+    }
+
+    /// One spare slot is all it takes, which is what Windows has.
+    #[test]
+    fn one_spare_reference_slot_is_enough() {
+        let mut stats = xrdp_dual_ltr_stats();
+        stats.max_num_ref_frames = Some(3);
+
+        let verdict = stats.verdict();
+        assert_eq!(stats.safety(), Safety::Safe, "{}", verdict);
+        assert!(verdict.starts_with("DROPPABLE"), "{}", verdict);
+    }
+
+    /// And a stream that leaves no gap needs no room: the check is about the
+    /// frames a gap invents, so no gaps means nothing to account for.
+    #[test]
+    fn no_gaps_means_no_room_needed() {
+        let mut stats = xrdp_dual_ltr_stats();
+        stats.main_deltas.clear();
+        stats.main_deltas.insert(1, 139);
+
+        assert_eq!(stats.safety(), Safety::Safe, "{}", stats.verdict());
     }
 
     /// The statistics an xrdp-fork capture produces: no reordering anywhere,
