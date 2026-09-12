@@ -313,8 +313,11 @@ and the arithmetic settles it: 1920x1047 of a 1920x1072 screen is 97.67%,
 against a measured mean of 97% and max of 99%. An Electron/Chromium window
 repaints its whole surface on any change, a blinking caret included, so what
 looked like an idle desktop was one application damaging almost the entire
-screen a few times a second. Minimising it drops declared damage to a few per
-cent.
+screen a few times a second. Minimising it drops declared damage to 2%, and the
+client then bands **100% of both views** at `copied 3%`, for 0.6-0.7% of the
+main thread against the 4-7% the same idle desktop cost unbanded. That is the
+positive confirmation, not merely the absence of damage: xrdp declares real
+fine-grained rects and the banding consumes them.
 
 So **xorgxrdp is honest** -- it forwards what X reports, and X was reporting a
 genuine full-surface repaint. One rect throughout, in every regime measured, so
