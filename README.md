@@ -135,8 +135,10 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   Measuring is legitimate here where it was not for the GPU work: this is a
   wall-clock delta across a synchronous call, not execution needing a
   `gl.finish()` that would stall the pipeline the gate protects. Sync-timeout
-  and slow-flush latches sit beneath it, the latter derived from the copy
-  threshold so it cannot pre-empt the gate that knows why. It retries after 30
+  and slow-flush latches sit beneath it as the backstop for congestion the
+  share does not explain — the slow-flush one is what first caught a session
+  breaking drags, while the gate still required a per-picture threshold and
+  declined. It retries after 30
   seconds of quiet, doubling that wait per trip up to eight minutes and easing
   it back as combining holds up, so nothing is ever given up permanently; only
   newly painted regions change chroma resolution, so a transition is gradual
@@ -163,7 +165,9 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   whole planes), `h264FullRange` (force the decoder's range),
   `h264BlackProbes` (on re-enables the black-region probing, off by default
   since its causes were found and fixed — the keyframe probe read back the
-  whole framebuffer) and `h264CombineLog` (per-stage timings every 5s). Each is
+  whole framebuffer), `h264KeepBlackKeyframes` (off stops withholding a
+  keyframe that decodes black over a stable framebuffer) and
+  `h264CombineLog` (per-stage timings every 5s). Each is
   read as a window global, a query param, or a `localStorage` key — but only
   `localStorage` survives a session relaunch, since the client rebuilds its own
   URL, and only `h264Chroma444` and `h264ChromaFilter` are read per picture, so
@@ -198,6 +202,29 @@ Measured with 1080p video playing, guacd session CPU over 30s:
   upstream of that tee would turn every recording binary. Clients opt in with
   `binaryBlobs=1`, so anything older — a cached `client.html`, a third-party
   integration, the recording player — still receives base64.
+
+- **HTTP caching** — nothing was said about caching at all until recently,
+  which is the worst of the options: with no `ETag` and no `Cache-Control` a
+  browser caches heuristically and never revalidates, so a restart kept serving
+  the old page for hours and incognito was the only reliable way to see a
+  change. The branded pages are built once at startup into an in-memory map, so
+  each is hashed there and served with that `ETag` plus `no-cache` — revalidate,
+  not do-not-store, so an unchanged page costs a 304 rather than 136K of
+  `client.html`. Tags are content-derived, so a restart that changes nothing
+  still answers 304.
+
+  The same pass rewrites asset references to `...?v=<8 hex of the file>`, and
+  any URL carrying a `v=` gets a year and `immutable`. Worth doing because
+  `client.html` reloads on every session launch *and relaunch*: the 37
+  revalidations become one round trip, paid exactly when the link is worst.
+  Only a 2xx or 304 gets the long directive — a 404 under a versioned URL is a
+  deployment that has gone wrong, and pinning it until next year would outlive
+  its cause.
+
+  **The cost is that editing an asset now needs a restart where a reload used
+  to do**, since the URL in the HTML and the bytes it names are produced in the
+  same startup pass. `RUSTGUAC_NO_ASSET_VERSIONING=1` turns versioning off for
+  that reason, leaving everything revalidating as before.
 
 ### Display / HiDPI
 
@@ -258,8 +285,17 @@ Under passthrough, guacd's own framebuffer holds no pixels for any region
 delivered as H.264 — the picture exists only in the browser — so anything that
 repaints a layer from that buffer paints black over a working screen, and
 neither end can see it: guacd believes it sent pixels and the browser believes
-it received them. The fault appears about once in days, so all of this is on by
-default and bounded per minute rather than something to enable afterwards.
+it received them. The fault appeared about once in days, so this was built on
+by default rather than as something to enable afterwards.
+
+**Both causes have since been found and fixed** — a keyframe carrying zero
+region rects but painted whole, and Windows recreating its surface at the same
+size, whose first keyframe decodes black (`keepPictureOverBlackKeyframe()`
+withholds it). The wire-side watching below stays on, since it costs one atomic
+load per instruction until an `h264` is seen. **The browser-side probing is now
+off by default** (`h264BlackProbes` re-enables it): it read the whole
+framebuffer back on every painted keyframe, which is the same cost class as the
+`copyTo()` above.
 
 - **Wire-level overpaint detection** (`src/frame_stats.rs`) — per-session frame
   lag and H.264 volume, plus a warning when `img`, `copy`, `rect`, `cfill`,
@@ -273,12 +309,14 @@ default and bounded per minute rather than something to enable afterwards.
   `CreateSurface`, `DeleteSurface`), and warns when a resize flushes a
   full-layer repaint while passthrough is live.
 - **Browser-side reporting** — `POST /api/sessions/{id}/diagnostic` records what
-  only the browser knows: decoder rebuilds, keyframe starvation, abandoned
-  frames and chroma fallback, and — riding the existing 10s thumbnail capture —
-  a `display_black` report with an 8x4 grid of which cells have gone black.
-  That transition is the timestamp everything else is read against: full screen
-  points at a resize or a graphics reset, scattered blocks at cache or copy
-  operations.
+  only the browser knows. Decoder rebuilds, keyframe starvation, abandoned
+  frames, chroma fallback and the combine gate's decisions are always reported,
+  since each is one line on a state change. The black-region half is behind
+  `h264BlackProbes`: the keyframe and paint probes, and — riding the existing
+  10s thumbnail capture — a `display_black` report with an 8x4 grid of which
+  cells have gone black. That transition is the timestamp everything else is
+  read against: full screen points at a resize or a graphics reset, scattered
+  blocks at cache or copy operations.
 - **Console helpers** — `rustguacFindBlack()` locates black regions on the
   display, `rustguacDumpDraws()` reports what painted a given pixel from a ring
   of recent draws, and `rustguacDumpBlack()` does both in one call;
