@@ -239,16 +239,38 @@ derives that from the width (~309 rows at 2992 wide, asking a gap to save
 twice what it costs), and `COPY_BAND_MAX_BANDS` caps it at four by closing the
 cheapest gaps first.
 
-**It only fires where the server declares real damage.** Windows does, on both
-views. The xrdp fork declares a single full-frame rect on both, deliberately
-(`xrdp_encoder.c`): FreeRDP's `general_ChromaV1ToYUV444` walks the v1 layout's
-16-row tiles *relative to the rect* while the packing shader anchors them at
-frame row 0, so the two agree only on a 16-aligned top.
-`general_ChromaV2ToYUV444` has no such tiling -- it is absolutely addressed and
-needs only an even top and a 4-aligned left. `XRDP_AVC444_DAMAGE_RECTS=1`
-declares 2-aligned rects on the main view for A/B, which mis-maps v1; aligning
-to 16 is the fix, and
-`~/aa444work/aa444map` is what quantifies the error either way.
+**It only fires where the server declares real damage**, and the alignment it
+needs differs by chroma layout. FreeRDP's `general_ChromaV1ToYUV444` walks the
+v1 layout's 16-row tiles *relative to the rect* while the packing shader
+anchors them at frame row 0: after a 16k-row offset the full-frame walk stands
+at `uY = 8k` and the rect-relative walk needs `uY_rect + roi->top / 2`, so the
+two coincide exactly when, and only when, the top is a multiple of 16.
+`general_ChromaV2ToYUV444` has no tiling and no counters -- every row is
+computed from the absolute frame row -- so it needs only an even top. Both
+address chroma columns at `roi->left / 2` and `/ 4` and select destination
+phases on `4x+0` / `4x+2`, so both want a 4-aligned left.
+
+The fork declared a single full-frame rect on both views until 2026-09-12, on
+that invariant; it now rounds the damage rects outward to that grid instead
+(vertical 16 for v1, 2 for v2, horizontal 4 for both) and gives the same list
+to both views, which also keeps main's even chroma rows and aux's odd rows
+refreshing from one frame. `XRDP_GFX_AVC444_FULL_RECTS=1` is the kill switch,
+and `~/aa444work/aa444map` quantifies the chroma error if the alignment is ever
+in doubt.
+
+**An auxiliary view's declared rects must cover what it carries, not what the
+frame changed.** Under `CHROMA_INTERVAL=N` accel-assist accumulates damage
+across the skipped frames, so declaring only the current frame's leaves stale
+chroma wherever the screen changed in between -- fresh luma over old chroma,
+which reads as colour ghosting and is masked at high damage, where the client
+uploads whole planes anyway. How much this costs depends on whether the damage
+moves: glxgears animates one region, so its accumulated union is barely larger
+than one frame (`aux copied 37%` against `main copied 34%`), while a pointer
+dragged across a desktop would spread it.
+
+Measured on xrdp with glxgears at 2992x1648 once both were fixed: the auxiliary
+copy fell from 29.3ms to 12.6ms, per-picture copy from 22.4ms to 17.0ms, and
+throughput rose from ~30 to ~41 pictures a second.
 
 **`tests/bench` cannot see the dominant cost, by construction.** Its
 `copyTo()` row reads 0.29ms at 1080p against ~14ms in the field, because it
