@@ -1367,7 +1367,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (!bandStats)
             bandStats = { banded: 0, spanSum: 0, damageSum: 0,
                           whole: 0, tooMany: 0, tooWide: 0,
-                          wideSpanSum: 0, wideDamageSum: 0 };
+                          wideSpanSum: 0, wideDamageSum: 0,
+                          aux: 0, auxWhole: 0, auxSpanSum: 0,
+                          auxDamageSum: 0 };
 
         /* Merged, so overlapping rects are not counted twice. */
         var damage = 0;
@@ -1389,6 +1391,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 }
             }
             damage += hi - lo;
+        }
+
+        if (outcome === 'aux') {
+            bandStats.aux++;
+            bandStats.auxSpanSum += spanRows / planeH;
+            bandStats.auxDamageSum += damage / planeH;
+            if (damage >= planeH)
+                bandStats.auxWhole++;
+            return;
         }
 
         if (outcome === 'banded') {
@@ -1585,6 +1596,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                     + (b.tooWide ? ' (span ' + pct(b.wideSpanSum / b.tooWide)
                         + ' damage ' + pct(b.wideDamageSum / b.tooWide) + ')'
                         : ''));
+
+            if (b.aux)
+                lines.push('          aux ' + b.aux + ' views (not banded):'
+                        + ' span ' + pct(b.auxSpanSum / b.aux)
+                        + ' damage ' + pct(b.auxDamageSum / b.aux)
+                        + ', ' + b.auxWhole + ' whole-frame');
 
         }
 
@@ -2082,6 +2099,28 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         var copyBand = (view === 0 && !resyncNeeded && sameSize)
                 ? copyBandFor(frameState.rects, planeH) : null;
+
+        /* An auxiliary view is measured but never banded. Its copy is now the
+         * larger half of what is left -- on a Windows host it is one picture
+         * in two or three, against xrdp's one in nine, and it reads the whole
+         * plane every time -- but its plane rows are not its picture rows:
+         * the v1 layout scatters an output row across 16-row bands, and
+         * Yuv444.js needs auxV1LumaBands() to invert it. Worth building only
+         * if the rects turn out to describe real damage, which is what this
+         * says. xrdp declares a full frame here deliberately; Windows is an
+         * open question. */
+        if (view !== 0 && frameState.rects && frameState.rects.length) {
+            var aY0 = Infinity;
+            var aY1 = -Infinity;
+            for (var ai = 0; ai < frameState.rects.length; ai++) {
+                var aTop = frameState.rects[ai].y | 0;
+                var aBot = aTop + (frameState.rects[ai].height | 0);
+                if (aTop < aY0) aY0 = aTop;
+                if (aBot > aY1) aY1 = aBot;
+            }
+            if (isFinite(aY0) && aY1 > aY0)
+                noteBand('aux', aY1 - aY0, frameState.rects, pictureH);
+        }
 
         if (view === 0)
             lastPictureSize = [pictureW, pictureH];
