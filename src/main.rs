@@ -8,6 +8,7 @@ mod drive;
 mod frame_stats;
 mod guacd;
 mod h264_aux_drop;
+mod h264_aux_drop;
 mod h264_refs;
 mod h264_rewrite;
 mod h264_sps;

@@ -785,7 +785,18 @@ pub enum Safety {
     Undecided,
     /// Nothing surviving a drop predicts from a dropped picture.
     Safe,
-    /// Something does, or might, and cannot be shown otherwise.
+    /// Nothing *demonstrably* does, but the slice headers cannot rule it out:
+    /// the auxiliary picture sits in a reference list past the index the
+    /// encoder is known to use, and whether a macroblock reaches it is in the
+    /// slice data. The xrdp fork's shape.
+    ///
+    /// Kept apart from `Unsafe` because the two need different answers. This
+    /// one is settled by proving the negative -- replaying a recording with
+    /// the auxiliary views stripped and comparing the decode -- or by lowering
+    /// the encoder's active reference count. `Unsafe` is settled by not doing
+    /// it.
+    Unproven,
+    /// Something does, and the headers say so.
     Unsafe,
 }
 
@@ -802,6 +813,7 @@ impl Stats {
         }
         match self.verdict_kind() {
             VerdictKind::Droppable => Safety::Safe,
+            VerdictKind::Unproven => Safety::Unproven,
             _ => Safety::Unsafe,
         }
     }
@@ -1083,9 +1095,11 @@ impl Stats {
                          main slices activate up to {} list-0 entries, and from \
                          index 1 that list reaches the auxiliary pictures. \
                          Whether any macroblock actually picks one is below the \
-                         slice header and cannot be read here: decide it by \
-                         lowering the encoder's reference count, or by \
-                         dropping and watching for drift",
+                         slice header and cannot be read here. Settle it with \
+                         tests/aux-drop-replay.mjs against a recording, or by \
+                         lowering the encoder's num_ref_idx_l0_active_minus1 \
+                         where the encoder is yours; \
+                         RUSTGUAC_H264_AUX_DROP=force drops anyway",
                             main_active_entries
                         ),
                     );
@@ -1967,7 +1981,9 @@ mod tests {
                     s.num_ref_idx_by_view[0].insert(2, 138);
                     s
                 },
-                Safety::Unsafe,
+                // Unproven, not Unsafe: the headers cannot rule the reference
+                // out, which is a different answer from ruling it in.
+                Safety::Unproven,
             ),
             (
                 {

@@ -64,7 +64,25 @@
 //! 4:4:4 stream and `SessionRecording.js` is unaffected — and before the
 //! colour rewrite and the binary blob splitter.
 //!
-//! `RUSTGUAC_H264_AUX_DROP=0` turns it off.
+//! `RUSTGUAC_H264_AUX_DROP=0` turns it off, and `=force` extends it to the
+//! streams the headers cannot clear.
+//!
+//! # Forcing
+//!
+//! `Safety::Unproven` is not `Safety::Unsafe`. It means the auxiliary picture
+//! sits in a reference list past the index the encoder is known to use, and
+//! that the slice headers cannot say whether a macroblock reaches it -- the
+//! xrdp fork's shape, where main slices take the default list and activate two
+//! entries because the *auxiliary* slices need two to reach their own chain.
+//!
+//! `=force` drops on those streams as well. It does **not** extend to
+//! `Unsafe`, which is a stream whose headers say outright that main predicts
+//! from chroma; forcing there would be asking for a broken picture.
+//!
+//! Forcing is for finding out. The two ways to actually settle such a stream
+//! are `tests/aux-drop-replay.mjs`, which strips the auxiliary views from a
+//! recording and compares the decode against the original, and lowering the
+//! encoder's `num_ref_idx_l0_active_minus1` where the encoder is yours.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -92,6 +110,9 @@ enum State {
 /// Removes the auxiliary view from a stream that has proved it can spare it.
 pub struct AuxDropper {
     probe: NalProbe,
+    /// Whether to drop on streams the headers leave `Unproven`. Never extends
+    /// to `Unsafe`.
+    force: bool,
     state: State,
     dropped_streams: HashSet<u32>,
     /// Auxiliary pictures dropped, and the payload bytes they carried.
@@ -101,22 +122,30 @@ pub struct AuxDropper {
     kept_idrs: u64,
     /// Main views whose `<paired>` flag was cleared.
     unpaired: u64,
+    /// Set at the keyframe that started the drop, so the caller can say so
+    /// once. Arming and engaging are separated by however long the host takes
+    /// to send its next keyframe, which on a quiet Windows desktop can be a
+    /// long time and is the difference between "will drop" and "is dropping".
+    engaged: bool,
 }
 
 impl AuxDropper {
     pub fn new() -> Self {
-        let enabled = std::env::var("RUSTGUAC_H264_AUX_DROP")
-            .map(|v| !matches!(v.trim(), "0" | "off" | "false" | "no"))
-            .unwrap_or(true);
+        let setting = std::env::var("RUSTGUAC_H264_AUX_DROP").unwrap_or_default();
+        let setting = setting.trim();
+        let enabled = !matches!(setting, "0" | "off" | "false" | "no");
+        let force = matches!(setting, "force" | "unproven");
 
         Self {
             probe: NalProbe::for_gating(),
+            force,
             state: if enabled { State::Deciding } else { State::Off },
             dropped_streams: HashSet::new(),
             dropped_pictures: 0,
             dropped_bytes: 0,
             kept_idrs: 0,
             unpaired: 0,
+            engaged: false,
         }
     }
 
@@ -134,14 +163,33 @@ impl AuxDropper {
         }
 
         if self.state == State::Deciding {
-            match self.probe.safety() {
+            let safety = self.probe.safety();
+            let forced = self.force && safety == Safety::Unproven;
+
+            match safety {
                 Safety::Undecided => return (Cow::Borrowed(text), lines),
-                Safety::Safe => {
+                Safety::Unproven if !forced => {
+                    self.state = State::Off;
+                    lines.push(format!(
+                        "auxiliary view will NOT be dropped on this stream; the \
+                         slice headers cannot rule out a reference to it, and \
+                         RUSTGUAC_H264_AUX_DROP=force is what says to try \
+                         anyway — {}",
+                        self.probe.verdict()
+                    ));
+                    return (Cow::Borrowed(text), lines);
+                }
+                Safety::Safe | Safety::Unproven => {
                     self.state = State::Armed;
                     lines.push(format!(
-                        "auxiliary view can be dropped on this stream; \
-                         permitting frame_num gaps and waiting for a keyframe \
-                         to start — {}",
+                        "auxiliary view {} on this stream; permitting \
+                         frame_num gaps and waiting for a keyframe to start — \
+                         {}",
+                        if forced {
+                            "is being dropped BY FORCE, unproven"
+                        } else {
+                            "can be dropped"
+                        },
                         self.probe.verdict()
                     ));
                 }
@@ -156,7 +204,12 @@ impl AuxDropper {
             }
         }
 
-        (self.filter(text), lines)
+        let filtered = self.filter(text);
+        if self.engaged {
+            self.engaged = false;
+            lines.push("keyframe reached; auxiliary view is now being dropped".into());
+        }
+        (filtered, lines)
     }
 
     /// Rewrites one chunk, borrowing it unchanged when nothing needed doing --
@@ -268,6 +321,7 @@ impl AuxDropper {
         // decoder has seen an SPS permitting gaps before the first gap.
         if self.state == State::Armed && keyframe {
             self.state = State::Dropping;
+            self.engaged = true;
         }
 
         if self.state != State::Dropping {
