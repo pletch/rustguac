@@ -1830,7 +1830,23 @@
              * The threshold is lower than for black because green of this
              * shade is not something a desktop shows in bulk.
              */
+            /* Off by default since 2026-09-12 -- see blackProbesEnabled() in
+             * H264Decoder.js for why, and for the override that brings the
+             * whole apparatus back. Read once: it cannot change mid-session
+             * without a reload anyway, and this sits on the thumbnail path. */
+            var _blackProbes = (function() {
+                try {
+                    if (window.__h264BlackProbes !== undefined)
+                        return !!window.__h264BlackProbes;
+                    var v = localStorage.getItem('h264BlackProbes');
+                    return v === 'on' || v === 'true';
+                } catch (e) {
+                    return false;
+                }
+            })();
+
             function checkForGreenDisplay(fraction, cells) {
+                if (!_blackProbes) return;
                 var decoder = client._h264Decoder;
                 if (!_greenReported && fraction > 0.25) {
                     _greenReported = true;
@@ -1855,6 +1871,8 @@
             }
 
             function checkForBlackDisplay(thumb) {
+
+                if (!_blackProbes) return;
 
                 var data;
                 try {

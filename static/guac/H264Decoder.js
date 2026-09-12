@@ -366,6 +366,35 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var probesLeft = 0;
 
     /**
+     * Whether the black-region probes run at all. Off by default since
+     * 2026-09-12.
+     *
+     * They were built when a display going black on a Windows host appeared
+     * once in days and could not be reproduced, so everything had to be on
+     * before the fault rather than switched on after it. Both causes were then
+     * found -- a keyframe with zero region rects painted whole, and Windows
+     * recreating its surface at the same size -- and both are fixed, the
+     * second by keepPictureOverBlackKeyframe(). What is left is the cost.
+     *
+     * And it is not small. probeKeyframe() runs on every painted keyframe and
+     * samples the layer through sampleGrid(), which drawImage()s the **whole
+     * framebuffer** into a willReadFrequently canvas -- a full GPU-to-CPU
+     * readback, ~19.7MB at 2992x1648, in the same class as the copyTo() cost
+     * this file spends most of its length avoiding.
+     *
+     * Set h264BlackProbes on to bring the whole apparatus back if the fault
+     * recurs: this gate covers the keyframe probe, the delta probes and the
+     * episode trigger, and client.html checks the same override before its
+     * periodic black and green display checks.
+     *
+     * @private
+     * @returns {!boolean}
+     */
+    function blackProbesEnabled() {
+        return override('h264BlackProbes') === true;
+    }
+
+    /**
      * When the last delta-frame probe ran. Keyframes are not counted here:
      * probeKeyframe() reports every one of them regardless.
      *
@@ -524,6 +553,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     function probeKeyframe(frameState, snapshot, layerCanvas) {
 
+        if (!blackProbesEnabled())
+            return;
+
         var fbWidth = display ? display.getWidth() : layerCanvas.width;
         var fbHeight = display ? display.getHeight() : layerCanvas.height;
 
@@ -578,6 +610,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @private
      */
     function probePaint(frameState, snapshot, layerCanvas) {
+
+        if (!blackProbesEnabled())
+            return;
 
         var sw = snapshot.width, sh = snapshot.height;
         var sx, sy, lx, ly, w, h;
@@ -4005,7 +4040,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @param {!boolean} on
      */
     this.setProbing = function(on) {
-        probesLeft = on ? PROBES_PER_EPISODE : 0;
+        probesLeft = (on && blackProbesEnabled()) ? PROBES_PER_EPISODE : 0;
         lastProbeAt = 0;
     };
 

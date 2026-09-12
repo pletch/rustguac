@@ -647,6 +647,18 @@ guacd defaults to `-L info` and rustguac to `RUST_LOG=info`, so all of it lands
 in the journal with no configuration — but the journal must be persistent, or
 a fault this rare is gone by the time it is reported.
 
+**The browser-side probing is off by default since 2026-09-12**
+(`h264BlackProbes` to bring it back — it gates the keyframe probe, the delta
+probes, the episode trigger, and client.html's periodic black and green display
+checks). It was on before the fault because the fault could not be reproduced;
+both causes have since been found and fixed, and the cost was not small:
+`probeKeyframe()` ran on every painted keyframe and sampled the layer through
+`sampleGrid()`, which `drawImage()`s the **whole framebuffer** into a
+`willReadFrequently` canvas — a full GPU-to-CPU readback, ~19.7MB at 2992x1648,
+in the same class as the `copyTo()` cost the rest of this section is about.
+`src/frame_stats.rs` is unchanged: it is one relaxed atomic load per
+instruction until an `h264` is seen, which is cheap enough to leave watching.
+
 ### Binary blobs
 
 Blob payloads of `h264` and `audio` streams are sent as **binary WebSocket
