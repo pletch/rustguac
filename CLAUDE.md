@@ -506,6 +506,18 @@ three sit at levels the others cannot reach:
      unaided. The pathological case per picture would have caught, one
      enormous copy against an idle session, exceeds `SYNC_WAIT_TIMEOUT_MS`
      and the sync-timeout latch takes it.
+   **Combining costs latency and main-thread occupancy, not frame rate**,
+   which is why the frame-rate framing this gate was first built on kept
+   stepping over it. Measured across one suspension, xrdp at 1920x1080 with
+   VS Code scrolling: 211 pictures in 5s while combining against 207 after --
+   the rate is unchanged, the server was never the limiter and the client kept
+   up either way. What changed was `copyTo()` from 52% of the main thread to
+   nothing, `draw` (decoded to painted) from 12.9ms to **0.3ms**, `decode`
+   luma from 3.1ms to 0.5ms and chroma from **15.5ms to 0.9ms** -- the same
+   decoder doing the same work, so that was never decode cost but output
+   callbacks queued behind a blocked main thread. A drag feels exactly that
+   and a video does not.
+
    **The flush latch caught the first real input case and the copy gate did
    not**, which is what removed the per-picture condition. xrdp at 1920x1080,
    dragging a VS Code scrollbar: `mean flush 30.0ms over 128 syncs in 10s`.
