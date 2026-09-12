@@ -1917,8 +1917,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         /* The synchronous half of copyTo(). `read-back wait` times the
          * promise, which is why the transfer looked free: by the time the
-         * promise is awaited the blocking work is already done. */
-        recordStat('copy', view !== 0, nowMs() - copyAt);
+         * promise is awaited the blocking work is already done.
+         *
+         * Charged per plane megapixel, because that is what says whether
+         * copying less would help. A cost proportional to area is a transfer,
+         * and restricting the rect to the damaged rows would cut it in
+         * proportion. A cost that barely moves between a full-size main view
+         * and a smaller auxiliary one is a fixed pipeline stall per call, and
+         * the thing to reduce is then the number of copies, not their size.
+         * The two lead to different fixes, so measure before building
+         * either. */
+        recordStat('copy', view !== 0, nowMs() - copyAt, planeW * planeH);
 
         /* The chain below is this copy's real error handler, but it may not
          * attach for some time, and a rejection with nothing attached yet is
