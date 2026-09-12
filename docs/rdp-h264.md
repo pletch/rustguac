@@ -540,52 +540,70 @@ The sync-timeout and slow-flush latches stay as the safety net beneath it.
 Note their signal is decoder latency, not display cost -- see above -- which
 is worth revisiting now that the latency has collapsed.
 
-#### xrdp's damage: what was measured, and what was inferred
+#### xrdp's damage: measured, and the answer
 
 Windows declares tight region rects; the xrdp fork declared a single
 full-frame rect for AVC444 by design until 2026-09-12. Once that was fixed,
-the rects arriving still covered 34-93% of rows, with `span` and `damage`
-equal.
+the rects arriving still covered 34-99% of rows, with `span` and `damage`
+equal, and for a while that was read as xrdp coarsening the damage.
 
-**Every one of those measurements was taken with glxgears running**, which
-animates a window continuously. A window that is a third of the screen
-legitimately damages a third of the screen every frame, and it does so
-contiguously -- which is `span` equal to `damage` without anything unusual
-happening. So the figures say what glxgears costs and nothing about what a
-desktop costs. There is at present **no post-fix measurement of light typing
-on xrdp**, and none of the conclusions below should be read as if there were.
+It was not. Each of those captures was mislabelled by what was on the screen:
 
-What can be said from the code rather than from those numbers is that
-xorgxrdp has a mechanism that would coarsen damage, in
-`module/rdpClientCon.c`, `rdpCapRect()`:
+| the capture was called | what was actually running | damage |
+| --- | --- | --- |
+| desktop work | glxgears animating a window | 33-34% |
+| idle | the tail of a scroll | 98-99% |
+| idle desktop, clock ticking | VS Code, maximized | 97-99% |
 
-```c
-if (num_rects > MAX_CAPTURE_RECTS)   /* 15, rdpCapture.h */
-{
-    /* the dirty region is too complex, just get a rect that
-       covers the whole region */
-    rect = *rdpRegionExtents(cap_dirty);
+The last one settles it arithmetically. VS Code was 1920x1047 on a 1920x1072
+screen: 97.67%, against a measured mean of 97% and max of 99%. An
+Electron/Chromium window repaints its whole surface on any change, a blinking
+caret included, so what was called an idle desktop was one application
+damaging almost the entire screen a few times a second. Minimising it dropped
+declared damage to a few per cent -- across the straddling 100-capture window,
+the 66 captures still at ~97% account for the whole 64% mean on their own,
+which leaves the other 34 at essentially zero.
+
+So the damage rects are honest and banding works on xrdp. What banding cannot
+do is help while one application owns the screen and repaints all of it, and
+that is a property of the application rather than of the server.
+
+**`MAX_CAPTURE_RECTS` is not involved, and never was.** The hypothesis was
+that sixteen dirty rects -- a caret, a scrollbar, a tray clock, some text --
+would trip the extents collapse in `rdpCapRect()` and hand the client a
+corner-to-corner bounding box. Instrumenting the server directly (xorgxrdp
+`feature/gbm-dmabuf-hwencode`, reported under `XORGXRDP_TIMING`) shows the
+branch is never entered:
+
+```
+xorgxrdp dirty region: 100 captures, rects mean 1 max 1,
+  monitor covered mean 97% max 99%, 100 captures covered 90% or more
+xorgxrdp dirty region collapse: fired 0 of 0 multi-rect frames
 ```
 
-Sixteen dirty rects anywhere on screen and the whole region becomes its
-bounding box -- a cursor blink, a scrollbar, a tray clock and some text would
-do it, and the extents then run corner to corner. That is a real hazard for
-the copy banding, which can only narrow to what the server declares. But it
-was **not** demonstrated by the captures above: contiguous animating damage
-and a collapsed region look identical in `span` versus `damage`, so that
-comparison cannot tell them apart.
+`rects mean 1 max 1`, in every regime measured -- idle, light activity, and
+glxgears saturated at 58 fps -- across more than 1200 captures. A caret and a
+clock do not produce sixteen rects; they produce one. The collapse needs more
+than fifteen and has never seen more than one, so raising the cap, or
+switching to the area-ratio rule that now sits behind `XORGXRDP_COLLAPSE=area`,
+would change nothing on this pipe.
 
-The measurement that would settle it is light typing on xrdp with
-`h264CombineLog` on, reading the `band` line: a few per cent damage means the
-region survives and banding works there as it does on Windows; tens of per
-cent for a caret and a clock means the collapse is firing and
-`MAX_CAPTURE_RECTS` is worth raising -- or better, collapsing to a bounded
-number of row bands, since every consumer downstream wants rows anyway. Do
-that before changing anything in xorgxrdp.
+Coarsening to row bands upstream is not the answer either. It is redundant
+with `copyBandsFor()`, which merges using a cost model -- `minWorthwhileGap()`
+derived from the measured copy fit and the real plane width -- that xorgxrdp
+does not have, and it would give up the horizontal extent the server still
+uses in `rdpCopyBoxList()`'s blit and in the v2 auxiliary shader pass. The end
+that owns the cost model should do the coarsening.
 
-Independently of which it is, a single bounding span in the client is
-defeated by a clock in one corner and a caret in the other, which is why
-`copyBandsFor()` produces several.
+None of this was visible from either end of the wire. xrdp receives
+`REGION_NUM_RECTS()` of the already-collapsed region, so from there a collapse
+and a genuine full-screen rect look identical, and the client only ever sees
+what xrdp declares. The question stayed open across three captures for want of
+an instrument in the one place that could answer it.
+
+A single bounding span in the client is still defeated by a clock in one
+corner and a caret in the other, which is why `copyBandsFor()` produces
+several.
 
 #### The per-call floor, and a threshold that outlived its calibration
 
