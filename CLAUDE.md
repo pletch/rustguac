@@ -308,24 +308,29 @@ Measured on xrdp with glxgears at 2992x1648 once both were fixed: the auxiliary
 copy fell from 29.3ms to 12.6ms, per-picture copy from 22.4ms to 17.0ms, and
 throughput rose from ~30 to ~41 pictures a second.
 
-**Banding is inert on xrdp**, where it took Windows from 77% of the main thread
-to 12-17%. Measured 2026-09-12 at 1920x1080 with light scrolling and reading:
-`banded 0 (0%)`, `damage 98-99%`, on both views, in every window -- so every
-copy reads a whole plane. What protects an xrdp desktop is the picture rate,
-not the banding: 12.2 pictures a second at 15.4ms is an 18.9% share and 3.1 a
-second is 4.2%, both well under the gate, against 39-47 a second while
-scrolling hard.
+**Every xrdp capture showing 97-99% damage was a maximized VS Code window**,
+and the arithmetic settles it: 1920x1047 of a 1920x1072 screen is 97.67%,
+against a measured mean of 97% and max of 99%. An Electron/Chromium window
+repaints its whole surface on any change, a blinking caret included, so what
+looked like an idle desktop was one application damaging almost the entire
+screen a few times a second. Minimising it drops declared damage to a few per
+cent.
 
-**That capture was full-screen text scrolling throughout**, including the
-quiet-looking window at 3.1 pictures a second, which is the tail of the scroll
-rather than an idle desktop -- so 98-99% damage is simply correct for it, and
-says nothing about what xrdp declares when little has changed. Earlier xrdp
-numbers here were all taken with glxgears running, which likewise damages the
-window it animates. **There is still no capture of an xrdp desktop that is
-genuinely idle** -- a clock ticking, a cursor blinking, nothing else -- and
-that is the one that would say whether xrdp over-declares damage and whether
-banding could ever fire there. Until it exists, do not read any of these
-damage figures as evidence about `MAX_CAPTURE_RECTS` in xorgxrdp.
+So **xorgxrdp is honest** -- it forwards what X reports, and X was reporting a
+genuine full-surface repaint. One rect throughout, in every regime measured, so
+`MAX_CAPTURE_RECTS` and its extents collapse were never entered and remain
+irrelevant. Banding works on xrdp for ordinary desktop content; what it cannot
+do is help while one application owns the screen and repaints all of it, which
+is a property of the application rather than of the server. The glxgears
+figures read the same way once seen in this light: 33-34% was the size of the
+window it animated, not some lesser quantity of damage.
+
+**Three xrdp captures in a row were mislabelled by what was on screen** --
+glxgears read as desktop work, a scroll tail read as idle, and a maximized
+Electron app read as an idle desktop. The instrument was right every time and
+the label was not, so before drawing anything from a damage figure, establish
+what was actually on the screen and how large it was. The client's `span` and
+`damage` are merged *row* coverage, so a single large window saturates both.
 
 **`tests/bench` cannot see the dominant cost, by construction.** Its
 `copyTo()` row reads 0.29ms at 1080p against ~14ms in the field, because it
