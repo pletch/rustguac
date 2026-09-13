@@ -1531,7 +1531,8 @@ Guacamole.Client = function(tunnel) {
 
             // Create or reuse H.264 decoder for this display
             if (!guac_client._h264Decoder) {
-                guac_client._h264Decoder = new Guacamole.H264Decoder(display);
+                guac_client._h264Decoder
+                        = Guacamole.H264Decoder.create(display);
             }
 
             // Collect NAL unit data. Guacamole.ArrayBufferReader decodes each

@@ -208,6 +208,14 @@
     <script src="/guac/VideoPlayer.js"></script>
     <script src="/guac/Yuv444.js"></script>
     <script src="/guac/H264Decoder.js"></script>
+    <script src="/guac/H264DecoderProxy.js"></script>
+    <!-- The worker's own URL, here rather than in the script that starts it,
+         because the startup pass that content-hashes assets rewrites href and
+         src attributes in this file and nothing else. A worker started at the
+         unversioned URL would be free to run a stale decoder against a fresh
+         page, which is exactly what the hashes exist to prevent. -->
+    <link id="h264-worker-src" rel="preload" as="worker"
+          href="/guac/H264Worker.js">
     <script src="/guac/JSONReader.js"></script>
     <script src="/guac/Object.js"></script>
     <script src="/guac/RawAudioFormat.js"></script>
@@ -1602,6 +1610,38 @@
 
             if (window.Guacamole && Guacamole.H264Decoder)
                 Guacamole.H264Decoder.onDiagnostic = reportDiagnostic;
+
+            /* Offer the worker path the URLs it needs, all three carrying the
+             * content hash of the build this page was made from. Whether it is
+             * taken is Guacamole.H264Decoder.create()'s decision. */
+            if (window.Guacamole && Guacamole.H264Decoder) {
+
+                var workerLink = document.getElementById('h264-worker-src');
+                var decoderSrc = null;
+                var rendererSrc = null;
+
+                var tags = document.getElementsByTagName('script');
+                for (var t = 0; t < tags.length; t++) {
+                    var src = tags[t].getAttribute('src') || '';
+                    if (src.indexOf('/guac/H264Decoder.js') === 0)
+                        decoderSrc = src;
+                    else if (src.indexOf('/guac/Yuv444.js') === 0)
+                        rendererSrc = src;
+                }
+
+                if (workerLink && decoderSrc && rendererSrc)
+                    Guacamole.H264Decoder.workerConfig = {
+                        workerUrl : workerLink.getAttribute('href'),
+
+                        /* The renderer before the decoder, which is the
+                         * order this page loads them in. Both open by
+                         * declaring the namespace if it is absent, so either
+                         * order works, but there is no reason for the worker
+                         * to differ from the page. */
+                        scripts   : [rendererSrc, decoderSrc]
+                    };
+
+            }
 
             // ── Thumbnail capture (owner only, not shared viewers) ──
             var _thumbInterval = null;

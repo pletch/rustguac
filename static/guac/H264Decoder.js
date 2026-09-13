@@ -3602,6 +3602,7 @@ Guacamole.H264Decoder = function H264Decoder(display, host) {
             timestamp += 33333; // ~30fps in microseconds
 
             var frameState = pendingFrames[token] = {
+                token: token,
                 layer: layer,
                 x: x,
                 y: y,
@@ -3816,9 +3817,22 @@ Guacamole.H264Decoder = function H264Decoder(display, host) {
             }
 
         } finally {
+
             frameState.canvas = null;
-            releaseSnapshot(snapshot);
+
+            /* A host that hands the picture somewhere else takes the snapshot
+             * with it, and closing it here would close what is already in
+             * flight. Only the host knows which of the two kinds of snapshot
+             * it took: the 4:2:0 path's pooled canvas is never taken, because
+             * what leaves is a bitmap transferred out of it, and the combine
+             * path's bitmap always is, because copying it again to avoid
+             * saying so would cost exactly what this whole path exists to
+             * avoid. */
+            if (!frameState.snapshotTaken)
+                releaseSnapshot(snapshot);
+
             settle(frameState);
+
         }
 
     };
@@ -4169,6 +4183,58 @@ Guacamole.H264Decoder = function H264Decoder(display, host) {
  */
 Guacamole.H264Decoder.isSupported = function isSupported() {
     return typeof VideoDecoder !== 'undefined';
+};
+
+/**
+ * Where the page says a decoder may be hosted on a worker, and what the worker
+ * needs to build one: `{ workerUrl, scripts }`, both carrying the content
+ * hashes this page was built with. Null where the page has not offered one --
+ * the recording player, for instance, which has no input to protect and no
+ * reason to pay for a thread.
+ *
+ * @type {?{workerUrl: !string, scripts: !Array.<string>}}
+ */
+Guacamole.H264Decoder.workerConfig = null;
+
+/**
+ * Builds a decoder for the given display, on a worker where the page has
+ * offered one and the browser can host it, and on this thread otherwise.
+ *
+ * Off unless asked for, by `h264Worker` as a window global, a query parameter
+ * or a localStorage key. The worker path is the better place for the decode
+ * and the combine to live -- it is the only way to stop `copyTo()` blocking
+ * the thread that dispatches input -- but it is new, and the thing it changes
+ * is the one the sync gate paces the server from. It earns the default by
+ * being measured against the local path, not by being the newer of the two.
+ *
+ * @param {!Guacamole.Display} display
+ * @returns {!Object} A decoder, hosted either way.
+ */
+Guacamole.H264Decoder.create = function create(display) {
+
+    var config = Guacamole.H264Decoder.workerConfig;
+    var wanted = Guacamole.H264Decoder.directHost(null).override('h264Worker');
+
+    if (wanted && config && Guacamole.H264DecoderProxy
+            && Guacamole.H264DecoderProxy.isSupported()) {
+
+        try {
+            var proxy = new Guacamole.H264DecoderProxy(display,
+                    config.scripts, config.workerUrl);
+            console.log('[rustguac] H.264: decoding on a worker');
+            return proxy;
+        } catch (e) {
+            /* A worker that cannot be started is not a reason to lose H.264;
+             * the local path is what this was before and still works. */
+            console.warn('[rustguac] H.264: could not start the decoder'
+                    + ' worker, decoding on the main thread instead:',
+                    e && e.message ? e.message : e);
+        }
+
+    }
+
+    return new Guacamole.H264Decoder(display);
+
 };
 
 /**
