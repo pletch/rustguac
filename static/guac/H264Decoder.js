@@ -1697,19 +1697,48 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * between damaged regions is worth a second copy rather than being read
      * through.
      *
-     * Fitted 2026-09-12 across two framebuffer sizes on one client: at 4.93MP
-     * a main view's copy took 34.6ms and at 1.72MP 13.8ms, which is
-     * 2.7ms + 6.5ms/MP to within 0.1ms at both points. Later windows put the
-     * fixed part nearer 5-10ms, so 3ms is the conservative end -- and
-     * conservative here means fewer, larger copies, which is the safe
-     * direction.
+     * Refitted 2026-09-13 on a Windows client with hardware decode, against a
+     * Windows host at 2992x1648: 28 `copy` windows spanning 0.15MP to 4.96MP,
+     * giving **10ms + 5ms/MP**, R-squared 0.90, with bucketed residuals inside
+     * 2ms across the whole range.
+     *
+     * The previous pair, 2.7ms + 6.5ms/MP, was fitted to two points at 4.93MP
+     * and 1.72MP. Both are large, so the intercept was an extrapolation off a
+     * short lever arm, and it landed a third of the way to the truth: at
+     * 0.15MP it predicts 3.6ms where eight measured copies averaged **11.8ms**.
+     * The two models agree to 0.4ms at 4.93MP, which is the tell -- they
+     * differ only where the old one had no data, and small copies are exactly
+     * what banding produces.
+     *
+     * The old note argued that 3ms was "the conservative end" and that
+     * conservative meant "fewer, larger copies". The second half is backwards
+     * and takes the first with it: the threshold is
+     * `FIXED * rowsPerMs * FACTOR`, so a *smaller* fixed cost makes splitting
+     * *easier*. Picking the low end bought more copies and smaller ones, which
+     * is the opposite of what it was chosen for, and each of them cost three
+     * times what it was budgeted.
+     *
+     * At 2992 wide this moves the minimum worthwhile gap from 309 rows to
+     * about 1280, so a second copy now has to skip roughly 4MP of transfer to
+     * pay for itself. That is deliberate and it is what the arithmetic says:
+     * at 10ms a call and 5ms/MP, nothing smaller earns the stall. It does not
+     * touch the win banding was built for, which is cropping one copy to the
+     * damaged rows rather than reading whole planes; what it removes is the
+     * marginal second and third copy. The case that still splits is the one
+     * that motivated splitting -- a clock in one corner and a caret in the
+     * other, with most of a 1648-row frame between them.
+     *
+     * Both numbers are properties of one client's GPU and driver. What is not
+     * machine-specific is that the fixed part is the larger term for any copy
+     * a banded picture makes, and that measuring it needs small copies in the
+     * sample.
      *
      * @private
      * @constant
      * @type {!number}
      */
-    var COPY_BAND_FIXED_MS = 3;
-    var COPY_BAND_MS_PER_MP = 6.5;
+    var COPY_BAND_FIXED_MS = 10;
+    var COPY_BAND_MS_PER_MP = 5;
 
     /**
      * How many times over a gap must pay for the copy it costs before it is

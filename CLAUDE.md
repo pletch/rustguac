@@ -266,7 +266,10 @@ makes AVC444 dearer than AVC420. **The read-back is almost all of it, and it
 is not where it was looked for.** `VideoFrame.copyTo()`'s *synchronous* half --
 the D3D11 array-texture copy and staging map, before the promise exists --
 measured 2026-09-12 at ~6.5ms per megapixel plus a 5-10ms per-call stall,
-against under 2ms for the uploads, the shader and the blit together. It used
+against under 2ms for the uploads, the shader and the blit together. Refitted
+2026-09-13 with small copies in the sample, it is 10ms + 5ms/MP -- so the
+per-call stall named here was right, and the constant derived from it was not;
+see the banding note below. It used
 to scale with resolution; since both views' copies are limited to the damaged
 rows it scales with damage. Four things trim it: a main view whose auxiliary
 view follows is uploaded but never painted (the `h264` instruction carries a
@@ -303,14 +306,39 @@ while the copy read the whole frame every picture. On a Windows host at
 2992x1648 with light typing, main-thread time inside `copyTo()` went from ~77%
 to ~16%, and `decode` from 28-38ms to 1-4ms behind it.
 
-**Several bands, not one span.** A single bounding span is defeated by
-anything scattered -- a clock in one corner and a caret in the other span the
-whole screen between them, and a desktop reliably has both. Each extra
-`copyTo()` is a fixed stall (~3ms), so two regions are worth separating only
-when the gap saves more transfer than the call costs: `minWorthwhileGap()`
-derives that from the width (~309 rows at 2992 wide, asking a gap to save
-twice what it costs), and `COPY_BAND_MAX_BANDS` caps it at four by closing the
+**Several bands, not one span -- but rarely, and the cost of an extra one was
+badly underestimated.** A single bounding span is defeated by anything
+scattered: a clock in one corner and a caret in the other span the whole screen
+between them, and a desktop reliably has both. So two regions are worth
+separating when the gap saves more transfer than the extra `copyTo()` costs,
+which `minWorthwhileGap()` derives from the width, asking a gap to save twice
+what it costs, with `COPY_BAND_MAX_BANDS` capping it at four by closing the
 cheapest gaps first.
+
+What that call costs was refitted on 2026-09-13 against a Windows client with
+hardware decode: **10ms + 5ms/MP**, from 28 windows spanning 0.15MP to 4.96MP,
+R-squared 0.90. The old pair (2.7ms + 6.5ms/MP) came from two points at 4.93MP
+and 1.72MP, so its intercept was extrapolated off a short lever arm -- the two
+models agree to 0.4ms at 4.93MP and diverge by 3x at 0.15MP, which is the size
+banding actually produces. Eight measured copies at 0.15MP averaged 11.8ms
+where the old model predicted 3.6ms.
+
+The old note also had the sign backwards, arguing that 3ms was "the
+conservative end" and that conservative meant "fewer, larger copies". The
+threshold is `FIXED * rowsPerMs * FACTOR`, so a *smaller* fixed cost makes
+splitting *easier*: the low end bought more copies and smaller ones, each
+costing three times its budget.
+
+At 2992 wide the minimum worthwhile gap moves from **309 rows to about 1337**,
+which takes almost everything down to a single band -- `caret + clock` included,
+whose 782-row gap saves 11.7ms against a 10ms call and does not clear the 2x
+bar. That is the arithmetic rather than a policy: at 10ms a call, nothing
+smaller earns the stall. It leaves untouched the win banding was built for,
+which is cropping one copy to the damaged rows instead of reading whole planes;
+what it removes is the marginal second and third copy. The shape that still
+splits is the two ends of the screen, and `tests/h264-copy-band.mjs` now
+asserts that *something* still splits -- a threshold change can otherwise take
+the whole path out of reach while every assertion continues to pass.
 
 **It only fires where the server declares real damage**, and the alignment it
 needs differs by chroma layout. FreeRDP's `general_ChromaV1ToYUV444` walks the

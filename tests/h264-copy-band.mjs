@@ -92,12 +92,29 @@ const cases = [
     ['single row',       [{ y: 823, height: 1 }]],
     ['odd origin',       [{ y: 801, height: 17 }]],
     ['whole picture',    [{ y: 0, height: H }]],
+
+    /* A gap wide enough to pay for the second copy it costs. The threshold is
+     * derived from COPY_BAND_FIXED_MS and COPY_BAND_MS_PER_MP, and when those
+     * were refitted on 2026-09-13 it went from 309 rows to about 1337 -- which
+     * took every case above down to a single band, 'caret + clock' included,
+     * and left the splitting this file exists to check with nothing exercising
+     * it. This is the shape that still splits: the two ends of the screen.
+     *
+     * It is deliberately expressed against the real threshold rather than a
+     * fixed row number, so that it keeps testing what it means to test if the
+     * costs are measured again. */
+    ['screen ends',      [{ y: 0, height: 16 },
+                          { y: H - 16, height: 16 }]],
 ];
+
+let maxBandsSeen = 0;
 
 for (const [name, rects] of cases) {
     for (const isAux of [false, true]) {
 
         const label = name + (isAux ? ' [aux]' : '');
+        /* Tracked so the run can assert, at the end, that something actually
+         * exercised the multi-band path. */
         const bands = copyBandsFor(rects.map(r => ({ x: 0, width: W, ...r })),
                 H, W, isAux);
 
@@ -106,6 +123,8 @@ for (const [name, rects] of cases) {
             check(label + ' (declined, copies whole frame)', true);
             continue;
         }
+
+        if (bands && bands.length > maxBandsSeen) maxBandsSeen = bands.length;
 
         check(label + ` at most ${consts.COPY_BAND_MAX_BANDS} bands`,
                 bands.length <= consts.COPY_BAND_MAX_BANDS,
@@ -168,6 +187,12 @@ for (const [name, rects] of cases) {
 
 check('null rects declines', copyBandsFor(null, H, W, false) === null);
 check('empty rects declines', copyBandsFor([], H, W, false) === null);
+
+/* The splitting logic is the point of this file, and a threshold change can
+ * take it out of reach without failing anything: every case collapses to one
+ * band and every assertion still passes. */
+check(`multi-band splitting is still reachable (gap ${minWorthwhileGap(W)} rows)`,
+        maxBandsSeen > 1, `most bands any case produced: ${maxBandsSeen}`);
 
 console.log(failures ? `\n${failures} FAILED` : '\nall passed');
 process.exit(failures ? 1 : 0);
