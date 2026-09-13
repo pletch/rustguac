@@ -41,6 +41,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var configured = false;
 
     /**
+     * Whether a hardware-accelerated configuration has been refused, in which
+     * case none is asked for again. See ensureDecoder().
+     *
+     * @private
+     * @type {boolean}
+     */
+    var hardwareRefused = false;
+
+    /**
      * The codec string most recently configured, so that a change is logged
      * once rather than on every decoder rebuild.
      *
@@ -3479,9 +3488,32 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
                 console.error('[rustguac] H.264 decode error:', e.message);
 
-                diagnostic('decoder_rebuild', 'decode error: ' + e.message
-                        + '. Every queued frame is discarded and nothing is '
-                        + 'painted until the next keyframe.', true);
+                /* A configuration refused for want of a hardware decoder,
+                 * which is the one error that is worth answering by trying
+                 * something different rather than by rebuilding the same
+                 * thing. Latched, so it is asked for once per session and the
+                 * rebuild below is not an endless alternation. */
+                if (!hardwareRefused && /nsupported configuration/.test(
+                        e.message || '')) {
+                    hardwareRefused = true;
+                    lastCodec = null;
+                    console.warn('[rustguac] H.264: no hardware decoder for'
+                            + ' this stream; falling back to whatever the'
+                            + ' browser will give us. Expect the decode to'
+                            + ' cost considerably more.');
+                    diagnostic('decoder_software_fallback', 'the browser '
+                            + 'refused a hardware-accelerated configuration '
+                            + 'and H.264 is being decoded without that hint. '
+                            + 'On a client with no hardware decoder this is '
+                            + 'the difference between a picture and a black '
+                            + 'screen, and it is much slower than the path '
+                            + 'this feature was built for.', true);
+                }
+
+                else
+                    diagnostic('decoder_rebuild', 'decode error: ' + e.message
+                            + '. Every queued frame is discarded and nothing '
+                            + 'is painted until the next keyframe.', true);
 
                 /* Terminal: the decoder is now closed and will never accept
                  * another chunk. Force ensureDecoder() to build a replacement,
@@ -3512,11 +3544,36 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             lastCodec = codec;
         }
 
-        decoder.configure({
+        var config = {
             codec: codec,
-            hardwareAcceleration: 'prefer-hardware',
             optimizeForLatency: true
-        });
+        };
+
+        /* 'prefer-hardware' reads as a hint and is not one: Chrome reports a
+         * configuration carrying it as unsupported outright where no hardware
+         * decoder exists, rather than falling back. So a client without one --
+         * a VM, a machine whose driver is blocklisted, a browser with
+         * acceleration switched off -- loses H.264 altogether, and loses it in
+         * the worst way: configure() fails asynchronously, the decoder closes,
+         * every frame is held for a keyframe that cures nothing, and since
+         * guacd suppresses ordinary image operations for a layer carrying
+         * H.264 the result is a permanently black screen rather than a
+         * degraded one.
+         *
+         * Measured on Chrome 153 against an Intel UHD 770 with no VA-API
+         * decode available: isConfigSupported() said supported for the same
+         * codec with no hint and with 'prefer-software', and not supported
+         * with 'prefer-hardware'.
+         *
+         * So ask for hardware once, and if that is refused build again without
+         * asking. Dropping the hint unconditionally would be the smaller
+         * change and the wrong one -- it hands the choice to the browser on
+         * every client, including the ones this whole path exists for, where
+         * a software decode would cost far more than it saves. */
+        if (!hardwareRefused)
+            config.hardwareAcceleration = 'prefer-hardware';
+
+        decoder.configure(config);
 
         configured = true;
 
