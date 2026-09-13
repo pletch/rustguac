@@ -823,6 +823,62 @@ checks both shapes against ffmpeg, field by field. The journal says
 Encoders can say it themselves -- NVENC's `bitstreamRestrictionFlag` -- and the
 edit then finds nothing to do.
 
+## Dropping the chroma view in transit
+
+AVC444 sends two pictures per frame: a main view, which is ordinary 4:2:0, and
+an auxiliary view carrying the chroma 4:2:0 leaves out. The browser can combine
+them into full 4:4:4, but only by reading every decoded frame back from the GPU
+with `VideoFrame.copyTo()` -- WebCodecs offers no way to reach a frame's planes
+on the GPU -- and that read-back blocks the main thread input is handled on.
+It is most of what AVC444 costs a client.
+
+A Windows host cannot simply be asked for AVC420 instead. Its hardware encoder
+engages only in AVC444 mode (`AVC444ModePreferred`, above), and FreeRDP
+advertises the RDPGFX 10.x capability sets only alongside AVC444: offered
+AVC420 alone it offers 8.1, and Windows at 8.1 sent only CLEARCODEC and
+CAPROGRESSIVE when tested, no H.264 at all. So the host has to be offered a
+picture the client may not want, and at native resolution on a HiDPI screen,
+where a 4:2:0 chroma block already covers about one logical pixel, does not
+need.
+
+`src/h264_aux_drop.rs` removes the auxiliary view between guacd and the
+browser, where the stream proves it can be spared: 13% of the H.264 bytes
+against a Windows host and 43% against xrdp sending AVC444, and one decode per
+frame instead of two. The browser is told with an `h264-aux` instruction --
+rustguac's own, which guacd never sees and an older client ignores -- so it
+stops holding main views for a picture that is no longer coming.
+
+**It has to be proved per stream**, because the two views are one H.264
+sequence sharing one decoded picture buffer. `src/h264_refs.rs` reads the
+slice headers (it never decodes) to establish two things:
+
+- **Nothing that survives predicts from a dropped picture.** The two views must
+  keep separate long-term reference chains, and nothing in the main view may
+  reorder short-term references relatively, since a removed picture shifts
+  every `PicNum` after it.
+- **The decoder has room for what the gap obliges it to invent.** Dropping
+  leaves holes in `frame_num`, and H.264 8.2.5.2 requires a decoder to fill
+  each with an inferred short-term reference. A stream whose
+  `max_num_ref_frames` is all taken by long-term pictures has nowhere to put
+  one, and freezes.
+
+`gaps_in_frame_num_value_allowed_flag` is set on every SPS from the start of
+the session, which is inert on a stream that is never dropped from. The
+evidence only arrives with the first inter slices, so the decision takes about
+2.5 seconds, almost all of it the connect-time keyframe burst. A stream that
+cannot be proved is passed through unchanged and the reason is logged;
+auxiliary IDRs are always kept.
+
+The dropper sits after the recording tee, so recordings keep the full stream.
+`RUSTGUAC_H264_AUX_DROP=0` switches it off for the whole deployment, and
+`RUSTGUAC_H264_AUX_DROP=unproven` relaxes the gate for experiments.
+
+Two harnesses check it against real streams: `tests/aux-drop-replay.mjs
+<recording>` strips the auxiliary views from a recording and compares the
+decoded pictures with ffmpeg, and `RUSTGUAC_AUX_DROP_RECORDING=<recording>
+cargo test aux_drop_over_a_recording -- --ignored` runs the real dropper over
+one and checks the result is a stream a client can follow.
+
 ## Recording
 
 Session recordings capture the raw stream, so a recording of an H.264 session

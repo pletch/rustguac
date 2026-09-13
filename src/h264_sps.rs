@@ -202,6 +202,33 @@ pub fn parse_sps(payload: &[u8]) -> Option<ColourSignal> {
     parse_rbsp(&unescape(payload)).map(|parsed| parsed.signal)
 }
 
+/// Rewrites an SPS payload with `gaps_in_frame_num_value_allowed_flag` set, or
+/// `None` if it is already set or the SPS cannot be read.
+///
+/// Needed by `crate::h264_aux_drop`. Dropping an auxiliary view removes a
+/// reference picture, and every `frame_num` it consumed becomes a hole in the
+/// sequence. With this flag clear a decoder is entitled to treat that as a
+/// broken stream; with it set, the standard requires it to infer the missing
+/// pictures (8.2.5.2) and carry on. The encoders seen here all clear it,
+/// because none of them intends anything to be dropped.
+///
+/// Unlike the colour splice this changes no lengths — one bit, in place — but
+/// it still goes back through `escape()`, because flipping a bit can create a
+/// `00 00 00` or `00 00 01` sequence that must be escaped to stay parseable.
+pub fn allow_frame_num_gaps(payload: &[u8]) -> Option<Vec<u8>> {
+    let mut rbsp = unescape(payload);
+    let parsed = parse_rbsp(&rbsp)?;
+
+    let byte = parsed.gaps_bit / 8;
+    let mask = 0x80u8 >> (parsed.gaps_bit % 8);
+    if rbsp.get(byte)? & mask != 0 {
+        return None;
+    }
+
+    rbsp[byte] |= mask;
+    Some(escape(&rbsp))
+}
+
 /// Where colour signalling can be spliced into an SPS, and what is missing.
 ///
 /// The two sites need different edits, and both occur in the field: Windows
@@ -221,26 +248,47 @@ enum SpliceSite {
     Nowhere,
 }
 
+/// What the SPS says before `log2_max_frame_num_minus4`, for the readers that
+/// need it: `chroma_array_type` sizes the weighted prediction tables a slice
+/// header has to be walked past, and `seq_parameter_set_id` is what a PPS
+/// names.
+pub(crate) struct SpsPrefix {
+    pub(crate) seq_parameter_set_id: u32,
+    pub(crate) chroma_array_type: u32,
+    /// Set only by the 4:4:4 high profiles, and the reason a slice header
+    /// carries a `colour_plane_id`.
+    pub(crate) separate_colour_plane: bool,
+}
+
 /// Walks an SPS RBSP from its first byte up to `log2_max_frame_num_minus4`.
 ///
-/// The high-profile chroma format and the optional scaling lists are the
-/// fiddliest part of the walk, and the part whose cost of being wrong is
-/// silent: everything after it would still parse, just from the wrong bits.
-fn skip_sps_prefix(r: &mut BitReader) -> Option<()> {
+/// Shared with `crate::h264_refs` rather than copied into it: the high-profile
+/// chroma format and the optional scaling lists are the fiddliest part of the
+/// walk and the part whose cost of drifting is silent — both readers would
+/// still return values, just from the wrong bits.
+pub(crate) fn read_sps_prefix(r: &mut BitReader) -> Option<SpsPrefix> {
     let profile_idc = r.bits(8)?;
     r.bits(8)?; // constraint flags + reserved
     r.bits(8)?; // level_idc
-    r.ue()?; // seq_parameter_set_id
+    let seq_parameter_set_id = r.ue()?;
 
     // The high profiles carry a chroma format and optional scaling lists that
     // have to be walked past to reach the fields below.
+    let mut chroma_array_type = 1;
+    let mut separate_colour_plane = false;
     if matches!(
         profile_idc,
         100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135
     ) {
         let chroma_format_idc = r.ue()?;
+        chroma_array_type = chroma_format_idc;
         if chroma_format_idc == 3 {
-            r.bit()?; // separate_colour_plane_flag
+            // separate_colour_plane_flag: with the planes coded separately
+            // there is no chroma to weight, and ChromaArrayType is 0.
+            separate_colour_plane = r.bit()? == 1;
+            if separate_colour_plane {
+                chroma_array_type = 0;
+            }
         }
         r.ue()?; // bit_depth_luma_minus8
         r.ue()?; // bit_depth_chroma_minus8
@@ -265,7 +313,11 @@ fn skip_sps_prefix(r: &mut BitReader) -> Option<()> {
         }
     }
 
-    Some(())
+    Some(SpsPrefix {
+        seq_parameter_set_id,
+        chroma_array_type,
+        separate_colour_plane,
+    })
 }
 
 /// Where `bitstream_restriction` can be added to an SPS that lacks it.
@@ -290,6 +342,8 @@ enum ReorderSite {
 struct Parsed {
     signal: ColourSignal,
     splice: SpliceSite,
+    /// Bit offset of `gaps_in_frame_num_value_allowed_flag` within the RBSP.
+    gaps_bit: usize,
     reorder: ReorderSite,
     max_num_ref_frames: u32,
 }
@@ -355,7 +409,7 @@ fn unrestricted_flag_bit(r: &mut BitReader) -> Option<usize> {
 fn parse_rbsp(rbsp: &[u8]) -> Option<Parsed> {
     let mut r = BitReader::new(rbsp);
 
-    skip_sps_prefix(&mut r)?;
+    read_sps_prefix(&mut r)?;
 
     r.ue()?; // log2_max_frame_num_minus4
     let pic_order_cnt_type = r.ue()?;
@@ -377,6 +431,7 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<Parsed> {
     }
 
     let max_num_ref_frames = r.ue()?;
+    let gaps_bit = r.pos;
     r.bit()?; // gaps_in_frame_num_value_allowed_flag
     r.ue()?; // pic_width_in_mbs_minus1
     r.ue()?; // pic_height_in_map_units_minus1
@@ -409,6 +464,7 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<Parsed> {
                 matrix: None,
             },
             splice: SpliceSite::Nowhere,
+            gaps_bit,
             reorder: if can_bound_reordering {
                 ReorderSite::NoVui(vui_flag_bit)
             } else {
@@ -487,6 +543,7 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<Parsed> {
     Some(Parsed {
         signal,
         splice,
+        gaps_bit,
         reorder,
         max_num_ref_frames,
     })
@@ -989,6 +1046,127 @@ mod tests {
         }
     }
 
+    /// The gaps flag is set, and nothing else in the SPS moves.
+    ///
+    /// Checked against ffmpeg's own reading rather than by parsing it back
+    /// here: a bit offset that is wrong in the same way in both the writer and
+    /// the reader agrees with itself perfectly.
+    #[test]
+    fn setting_the_gaps_flag_matches_ffmpegs_reading() {
+        use std::process::Command;
+
+        let run = |args: &[&str]| -> Option<String> {
+            let out = Command::new("ffmpeg").args(args).output().ok()?;
+            Some(String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+
+        if run(&["-version"]).is_none() {
+            eprintln!("SKIP: needs ffmpeg");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("rustguac-gaps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let clip = dir.join("in.264");
+
+        assert!(Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=128x96:rate=10:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-f",
+                "h264",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg")
+            .success());
+
+        let annexb = std::fs::read(&clip).expect("clip");
+        let range = find_sps_range(&annexb).expect("an SPS");
+
+        // x264 clears it, which is what makes this worth doing at all.
+        let trace = |path: &std::path::Path| -> String {
+            run(&[
+                "-v",
+                "trace",
+                "-i",
+                &path.to_string_lossy(),
+                "-c",
+                "copy",
+                "-bsf:v",
+                "trace_headers",
+                "-f",
+                "null",
+                "-",
+            ])
+            .unwrap_or_default()
+        };
+        assert!(
+            trace(&clip)
+                .contains("gaps_in_frame_num_allowed_flag                              0 = 0"),
+            "the fixture should start with the flag clear"
+        );
+
+        let rewritten = allow_frame_num_gaps(&annexb[range.clone()]).expect("a flag to set");
+        assert_eq!(
+            rewritten.len(),
+            range.len(),
+            "one bit in place should not change the payload length"
+        );
+
+        let mut patched = annexb.clone();
+        patched.splice(range.clone(), rewritten);
+        let out = dir.join("out.264");
+        std::fs::write(&out, &patched).expect("write");
+
+        let after = trace(&out);
+        assert!(
+            after.contains("gaps_in_frame_num_allowed_flag                              1 = 1"),
+            "ffmpeg should read the flag as set:\n{}",
+            after
+        );
+
+        // Everything else must survive, or the picture does not. Compared
+        // past the "[trace_headers @ 0x...]" prefix, whose address differs
+        // between runs.
+        let field_line = |trace: &str, field: &str| -> Option<String> {
+            trace
+                .lines()
+                .find(|l| l.contains(field))
+                .and_then(|l| l.split_once("] "))
+                .map(|(_, rest)| rest.to_owned())
+        };
+        let before_trace = trace(&clip);
+        for field in [
+            "log2_max_frame_num_minus4",
+            "pic_width_in_mbs_minus1",
+            "pic_height_in_map_units_minus1",
+        ] {
+            assert_eq!(
+                field_line(&before_trace, field),
+                field_line(&after, field),
+                "{} moved",
+                field
+            );
+        }
+
+        // A second pass has nothing to do.
+        assert!(allow_frame_num_gaps(&patched[range]).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// NVENC's SPS as the xrdp fork's accel-assist sent it (2026-09-30): Main,
     /// `constraint_set1` only, level 5.0, POC type 2, three reference frames,
     /// a full-range BT.709 description and timing info -- and no
@@ -1012,7 +1190,7 @@ mod tests {
         let rbsp = unescape(NVENC_UNRESTRICTED);
         let at = {
             let mut r = BitReader::new(&rbsp);
-            skip_sps_prefix(&mut r).unwrap();
+            read_sps_prefix(&mut r).unwrap();
             r.ue().unwrap(); // log2_max_frame_num_minus4
             assert_eq!(r.ue().unwrap(), 2, "POC type");
             r.ue().unwrap(); // max_num_ref_frames
@@ -1067,11 +1245,14 @@ mod tests {
         let rewritten = declare_no_reordering(NVENC_UNRESTRICTED).expect("rewritten");
         assert_eq!(parse_sps(&rewritten), Some(before));
 
-        // Idempotent.
+        // Idempotent, and composes with the other two edits in either order.
         assert!(declare_no_reordering(&rewritten).is_none());
+        let with_gaps = allow_frame_num_gaps(&rewritten).expect("gaps");
+        assert!(!reordering_unbounded(&with_gaps));
 
         for sps in [
             rewritten,
+            with_gaps,
             declare_no_reordering(&nvenc_without_vui()).unwrap(),
         ] {
             for window in sps.windows(3) {
@@ -1085,8 +1266,8 @@ mod tests {
 
     /// The restriction lands where ffmpeg reads it, with the values the
     /// standard would otherwise infer, and nothing else in the SPS moves --
-    /// in both shapes. Checked against ffmpeg rather than by parsing it back
-    /// here: a bit offset wrong in the writer and the reader alike agrees with
+    /// in both shapes. Checked against ffmpeg for the same reason as the gaps
+    /// flag: a bit offset wrong in the writer and the reader alike agrees with
     /// itself perfectly.
     #[test]
     fn declaring_no_reordering_matches_ffmpegs_reading() {

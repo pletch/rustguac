@@ -25,6 +25,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// The instruction rustguac sends the browser when the AVC444 auxiliary view
+/// starts or stops being dropped in transit.
+///
+/// Not a guacd opcode: it originates here, and guacd never sees it. Hyphenated
+/// so it cannot collide with an upstream instruction, and unknown opcodes are
+/// ignored by `Guacamole.Client`, so a cached client from before this existed
+/// carries on as it did. ASCII, so the element length is its byte length.
+const AUX_DROP_OPCODE: &str = "h264-aux";
+
 /// Which side terminated the proxy connection.
 enum ProxyResult {
     /// guacd closed the connection (with optional error).
@@ -526,6 +535,7 @@ const MAX_GUACD_CARRY: usize = 16 * 1024 * 1024;
 /// of instruction was not ';' nor ','". To prevent that, every Message::Text
 /// we emit ends at a true Guacamole instruction boundary; partial tail data
 /// is held in `carry` until the next read completes it.
+#[allow(clippy::too_many_arguments)]
 async fn guacd_to_ws(
     mut guacd: tokio::io::ReadHalf<GuacdStream>,
     ws: WsSink,
@@ -542,11 +552,26 @@ async fn guacd_to_ws(
     let mut splitter = binary_blobs.then(crate::binary_blob::BlobSplitter::new);
 
     // Gives a host that declares its colour range without describing its
-    // colourimetry the shape Chrome's hardware decoder will act on, and bounds
-    // picture reordering where the POC type already guarantees there is none.
-    // Costs nothing once the stream's first SPS has been seen and found to
-    // need neither. See crate::h264_rewrite.
+    // colourimetry the shape Chrome's hardware decoder will act on, bounds
+    // picture reordering where the POC type already guarantees there is none,
+    // and permits frame_num gaps once the auxiliary view is being dropped.
+    // See crate::h264_rewrite.
     let mut sps_rewriter = crate::h264_rewrite::SpsRewriter::new();
+
+    // Removes the AVC444 auxiliary view from streams that prove they can
+    // spare it, which is most of the bandwidth argument for AVC420 without
+    // giving up H.264 on a Windows host. Decides per stream and leaves alone
+    // anything it cannot prove; RUSTGUAC_H264_AUX_DROP=0 turns it off. The
+    // The slice-header analysis it gates on lives inside it, so the stream is
+    // parsed once rather than twice.
+    let mut aux_dropper =
+        crate::h264_aux_drop::AuxDropper::for_session(None).reporting_as(session_id);
+
+    // What the browser has last been told about the drop. It cannot infer it:
+    // an auxiliary IDR is kept and switches 4:4:4 combining on, after which
+    // every main view pays the combine's plane read-back waiting for a view
+    // that has been removed from the wire. See AuxDropper::dropping.
+    let mut announced_aux_drop = false;
 
     loop {
         let n = guacd.read(&mut buf).await?;
@@ -597,15 +622,46 @@ async fn guacd_to_ws(
             server_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
+        // The auxiliary view, dropped where the stream has proved that nothing
+        // surviving predicts from it. After the recording tee above, so a
+        // recording keeps the full 4:4:4 stream; before the SPS rewrite below,
+        // which needs to know whether to permit frame_num gaps.
+        let (text, aux_lines) = aux_dropper.process(&text);
+        for line in aux_lines {
+            tracing::info!(session_id = %session_id, "H.264: {}", line);
+        }
+        sps_rewriter.set_allow_frame_num_gaps(aux_dropper.wants_frame_num_gaps());
+
+        // Said only when it changes, which is at most twice a session: once
+        // when the gate arms, and once more if a later slice contradicts the
+        // verdict and the auxiliary view comes back. A client that does not
+        // know the opcode ignores it and behaves as it always did.
+        let aux_drop_notice = {
+            let dropping = aux_dropper.dropping();
+            (dropping != announced_aux_drop).then(|| {
+                announced_aux_drop = dropping;
+                format!(
+                    "{}.{},1.{};",
+                    AUX_DROP_OPCODE.len(),
+                    AUX_DROP_OPCODE,
+                    dropping as u8
+                )
+            })
+        };
+
         // Splice a colour description into the SPS where the host left one
-        // out, and bound its reordering where the POC type allows.
+        // out, bound its reordering where the POC type allows, and permit
+        // frame_num gaps where the auxiliary view is about to start being
+        // dropped.
         let text = match sps_rewriter.rewrite(&text) {
             Some(rewritten) => rewritten,
-            None => text,
+            // Cow, because the dropper borrows a chunk it did not have to
+            // change -- which is most of them.
+            None => text.into_owned(),
         };
 
         // What the stream says about colour, once per session, from the first
-        // SPS as the host sent it -- before the splice above, since the value
+        // SPS as the host sent it -- unaffected by the splice above, since the value
         // of this line is that it describes the wire. The browser's rendering
         // follows from it and nothing else logs it, and a full-range host with
         // crushed blacks looks the same on screen whether the stream says
@@ -614,12 +670,11 @@ async fn guacd_to_ws(
             tracing::info!(session_id = %session_id, "H.264 colour: {}", line);
         }
 
-        // Which edit was made, rather than that one was. The two are
-        // independent and a stream can need either alone: an NVENC host
-        // describes its colour completely and needs only its reordering
-        // bounded, and reporting that as a colour splice sends whoever reads
-        // it looking at the colour of a picture that is fine. Each is said once
-        // per session.
+        // Which edit was made, rather than that one was. They are independent
+        // and a stream can need any one alone: an xrdp host describes its
+        // colour completely and needs only the gaps flag, and reporting that
+        // as a colour splice sends whoever reads it looking at the colour of a
+        // picture that is fine. Each is said once per session.
         for edit in sps_rewriter.take_edits() {
             tracing::info!(session_id = %session_id, "H.264: {}", edit.describe());
         }
@@ -629,6 +684,15 @@ async fn guacd_to_ws(
         // one order, so a blob lifted out of the run still arrives between
         // the same neighbours it had.
         let mut sink = ws.lock().await;
+
+        // Ahead of the chunk the transition happened in, so the client has
+        // stood the combiner down before the first main view that arrives
+        // without its auxiliary view -- and, on the way back, has been told
+        // the auxiliary view is returning before one does.
+        if let Some(notice) = aux_drop_notice {
+            sink.send(Message::Text(notice.into())).await?;
+        }
+
         match splitter.as_mut() {
             Some(splitter) => {
                 for frame in splitter.split(&text) {
@@ -645,6 +709,10 @@ async fn guacd_to_ws(
             None => sink.send(Message::Text(text.into())).await?,
         }
     }
+
+    // The drop's summary is written by AuxDropper::drop, not here: this line
+    // is reached only when guacd closes first, and a session normally ends the
+    // other way round.
 
     Ok(())
 }
