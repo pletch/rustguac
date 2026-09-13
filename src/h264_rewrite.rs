@@ -40,9 +40,21 @@ enum State {
     PassThrough,
 }
 
-/// Splices a colour description into the SPS of one session's H.264 stream.
+/// Edits the SPS of one session's H.264 stream, in flight.
+///
+/// Two independent edits share this pass because both need the same thing --
+/// the SPS located inside a base64 video blob -- and decoding every keyframe's
+/// blob twice to make them separately would be work for nothing:
+///
+/// * a colour description, where the host declares a range without one
+///   (`crate::h264_sps`), and
+/// * permission to skip `frame_num` values, when `crate::h264_aux_drop` is
+///   about to start removing pictures that consume them.
 pub struct SpsRewriter {
     state: State,
+    /// Whether to set `gaps_in_frame_num_value_allowed_flag`. Driven per chunk
+    /// by the dropper, which turns it on before it drops anything.
+    allow_gaps: bool,
     /// Stream indices opened by an `h264` instruction. `audio` is deliberately
     /// not tracked: its blobs are not video and decoding them to look for a
     /// start code would be work for nothing.
@@ -59,8 +71,15 @@ impl SpsRewriter {
     pub fn new() -> Self {
         Self {
             state: State::Undecided,
+            allow_gaps: false,
             h264_streams: HashSet::new(),
         }
+    }
+
+    /// Asks for `gaps_in_frame_num_value_allowed_flag` on every SPS from now
+    /// on. Idempotent, and called on every chunk while the dropper is armed.
+    pub fn set_allow_frame_num_gaps(&mut self, allow: bool) {
+        self.allow_gaps = allow;
     }
 
     /// Rewrites the SPS in any video blob in `text`, returning the new run of
@@ -72,7 +91,10 @@ impl SpsRewriter {
     /// untouched: a blob that cannot be parsed is passed through, never
     /// dropped, since losing one loses a picture.
     pub fn rewrite(&mut self, text: &str) -> Option<String> {
-        if self.state == State::PassThrough {
+        // PassThrough means no colour work, which used to end the scan for the
+        // life of the session. It cannot any more: a stream needing no colour
+        // fix may still need the gaps flag.
+        if self.state == State::PassThrough && !self.allow_gaps {
             return None;
         }
 
@@ -177,11 +199,23 @@ impl SpsRewriter {
             };
         }
 
-        if self.state != State::Rewriting {
-            return None;
+        // Both edits, in either combination. Each returns None when it has
+        // nothing to do -- an SPS that already describes its colour, or that
+        // already permits gaps -- so an SPS needing neither rebuilds nothing.
+        let mut edited: Option<Vec<u8>> = None;
+
+        if self.state == State::Rewriting {
+            edited = crate::h264_sps::complete_colour_signalling(&bytes[sps.clone()]);
         }
 
-        let spliced = crate::h264_sps::complete_colour_signalling(&bytes[sps.clone()])?;
+        if self.allow_gaps {
+            let current = edited.as_deref().unwrap_or(&bytes[sps.clone()]);
+            if let Some(with_gaps) = crate::h264_sps::allow_frame_num_gaps(current) {
+                edited = Some(with_gaps);
+            }
+        }
+
+        let spliced = edited?;
 
         let mut rebuilt = Vec::with_capacity(bytes.len() + spliced.len());
         rebuilt.extend_from_slice(&bytes[..sps.start]);

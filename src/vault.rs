@@ -192,6 +192,28 @@ pub struct AddressBookEntry {
     /// changes what the *server* sends and loses H.264 entirely on Windows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub h264_combine: Option<bool>,
+    /// Whether rustguac removes AVC444's auxiliary chroma view from the wire.
+    ///
+    /// Unset leaves it to `crate::h264_aux_drop`, which decides per stream
+    /// from the slice headers and drops only where they prove nothing
+    /// surviving predicts from the auxiliary view. `Some(true)` drops from the
+    /// first picture without waiting for that: the admin knows the target, and
+    /// the wait costs a laggy opening at the largest framebuffer.
+    /// `Some(false)` never drops.
+    ///
+    /// Distinct from `h264_combine`, which discards the auxiliary view in the
+    /// browser after it has been sent and decoded. This one is the bandwidth
+    /// setting; that one is the latency setting.
+    ///
+    /// Setting it true skips the gate, so the target has to satisfy what the
+    /// gate would otherwise check: the two views on separate reference chains,
+    /// and a spare slot in `max_num_ref_frames` for the pictures a `frame_num`
+    /// gap obliges the decoder to invent. Both hosts measured in September
+    /// 2026 satisfy it -- Windows always did, and the xrdp fork does from
+    /// `235990e9`, which declares the third slot. An xrdp build older than
+    /// that does not, and froze a session when this was forced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub h264_drop_aux: Option<bool>,
     /// Request the framebuffer in the browser's physical pixels rather than its
     /// CSS pixels, so text renders sharply on a HiDPI display.
     ///
@@ -440,6 +462,10 @@ pub struct EntryInfo {
     /// yes; `Some(false)` paints 4:2:0 without changing what the server sends.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub h264_combine: Option<bool>,
+    /// Whether rustguac removes AVC444's auxiliary view from the wire. Unset
+    /// decides per stream; `Some(true)` drops from the first picture.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub h264_drop_aux: Option<bool>,
     /// Request the framebuffer in physical rather than CSS pixels.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_resolution: Option<bool>,
@@ -582,6 +608,7 @@ impl From<(&str, &AddressBookEntry)> for EntryInfo {
             enable_h264: e.enable_h264,
             avc444: e.avc444,
             h264_combine: e.h264_combine,
+            h264_drop_aux: e.h264_drop_aux,
             native_resolution: e.native_resolution,
             container_image: e.container_image.clone(),
             container_cpu_limit: e.container_cpu_limit,
@@ -2209,6 +2236,38 @@ mod tests {
     }
 
     #[test]
+    fn test_h264_drop_aux_round_trips_and_is_absent_by_default() {
+        // The fourth choice: the server offers AVC444 and rustguac removes the
+        // auxiliary view from the wire. Distinct from h264_combine, which
+        // lets it cross the wire and discards it in the browser -- the two can
+        // be set independently and mean different things.
+        let json = r#"{"type":"rdp","hostname":"test","avc444":true,"h264_drop_aux":true}"#;
+        let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.h264_drop_aux, Some(true));
+        assert_eq!(entry.h264_combine, None, "independent of combining");
+        assert!(serde_json::to_string(&entry)
+            .unwrap()
+            .contains("\"h264_drop_aux\":true"));
+
+        // Some(false) is a refusal and has to survive as one: skipping it
+        // would read back as "decide per stream", which is a different thing.
+        let json = r#"{"type":"rdp","hostname":"test","h264_drop_aux":false}"#;
+        let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.h264_drop_aux, Some(false));
+        assert!(serde_json::to_string(&entry)
+            .unwrap()
+            .contains("\"h264_drop_aux\":false"));
+
+        // Unset means the per-stream gate decides, and must not be written.
+        let json = r#"{"type":"rdp","hostname":"test","enable_h264":true}"#;
+        let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.h264_drop_aux, None);
+        assert!(!serde_json::to_string(&entry)
+            .unwrap()
+            .contains("h264_drop_aux"));
+    }
+
+    #[test]
     fn test_h264_combine_is_separate_from_avc444() {
         // The third choice: the server still offers AVC444, the browser never
         // combines its two views. Both fields travel, and both are absent by
@@ -2224,7 +2283,9 @@ mod tests {
         let json = r#"{"type":"rdp","hostname":"test","enable_h264":true}"#;
         let entry: AddressBookEntry = serde_json::from_str(json).unwrap();
         assert_eq!(entry.h264_combine, None);
-        assert!(!serde_json::to_string(&entry).unwrap().contains("h264_combine"));
+        assert!(!serde_json::to_string(&entry)
+            .unwrap()
+            .contains("h264_combine"));
     }
 
     // ── Path-traversal regression tests (v1.5.4 fix) ──────────────────────

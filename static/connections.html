@@ -820,9 +820,10 @@
                         <select id="em-avc444" style="margin-top:0.2em">
                             <option value="1">AVC444 + AVC420 (server chooses)</option>
                             <option value="nc">AVC444 + AVC420, never combined</option>
+                            <option value="drop">AVC444 + AVC420, chroma dropped in transit</option>
                             <option value="0">AVC420 only</option>
                         </select>
-                        <div style="color:#888;font-size:0.75em;margin-top:0.2em;">Only applies with H.264 Passthrough. AVC444 sends full-colour chroma as a second picture per frame, which the browser decodes and combines. <b>AVC444 + AVC420</b> is required for Windows targets: they offer no H.264 at all unless AVC444 is on offer, so <b>AVC420 only</b> drops them to the slower tile path. <b>AVC420 only</b> is for xrdp targets where bandwidth or decode work matters more than chroma: one picture per frame instead of two. <b>Never combined</b> keeps H.264 working everywhere but always paints 4:2:0: the second picture is still sent and decoded, and each update reaches the screen roughly 12-17ms sooner, which suits a target used mainly for typing.<br><br>This is what the server is <i>asked to send</i>, not what the browser draws. The browser combines the two views only while that costs no frame rate, and paints plain 4:2:0 when it would &mdash; commonly at 4K, where 60fps of 4:2:0 and 30fps of 4:4:4 cost about the same bandwidth. So <b>AVC444 + AVC420</b> on a 4K Windows target is still the right setting: it is what keeps H.264 working at all, even though the picture may be drawn at 4:2:0.</div>
+                        <div style="color:#888;font-size:0.75em;margin-top:0.2em;">Only applies with H.264 Passthrough. AVC444 sends full-colour chroma as a second picture per frame, which the browser decodes and combines. <b>AVC444 + AVC420</b> is required for Windows targets: they offer no H.264 at all unless AVC444 is on offer, so <b>AVC420 only</b> drops them to the slower tile path. <b>AVC420 only</b> is for xrdp targets where bandwidth or decode work matters more than chroma: one picture per frame instead of two. <b>Never combined</b> keeps H.264 working everywhere but always paints 4:2:0: the second picture is still sent and decoded, and each update reaches the screen roughly 12-17ms sooner, which suits a target used mainly for typing. <b>Chroma dropped in transit</b> goes further and removes the second picture from the link to the browser, so it is never sent and never decoded &mdash; measured at 13% of the H.264 traffic on a Windows target. Same picture as Never combined, less bandwidth and half the decoding.<br><br><b>Chroma dropped in transit</b> is the default for new entries and the cheapest setting on every target measured. rustguac proves each stream before acting on it either way &mdash; the two pictures share one H.264 sequence, so dropping one is safe only where the server keeps their references apart <i>and</i> leaves the decoder a spare reference slot for the frames the resulting gap obliges it to invent. A stream that cannot be proved is left alone and the reason is logged. Windows targets qualify, as does xrdp built from the dual-LTR encoder; older xrdp does not, and is refused rather than broken. What this setting changes is only how much corroboration is wanted first: it decides from the least evidence that can answer, which is worth a fraction of a second at connect. It cannot decide sooner than that, because the evidence arrives with the first ordinary frames and a session opens with a burst of keyframes that say nothing.<br><br>This is what the server is <i>asked to send</i>, not what the browser draws. The browser combines the two views only while that costs no frame rate, and paints plain 4:2:0 when it would &mdash; commonly at 4K, where 60fps of 4:2:0 and 30fps of 4:4:4 cost about the same bandwidth. So <b>AVC444 + AVC420</b> on a 4K Windows target is still the right setting: it is what keeps H.264 working at all, even though the picture may be drawn at 4:2:0.</div>
                     </label>
                     <div class="field-hint" style="margin-top:0.8em;margin-bottom:0.5em">Desktop appearance. Off by default to save bandwidth; enable for a normal-looking Windows desktop.</div>
                     <label style="margin-top:0.3em">
@@ -3358,7 +3359,10 @@
             document.getElementById('em-force-lossless').checked = false;
             document.getElementById('em-enable-h264').checked = false;
             document.getElementById('em-native-resolution').checked = false;
-            document.getElementById('em-avc444').value = '1';
+            // New entries drop the chroma picture in transit: it is the
+            // cheapest setting on every target measured, and rustguac still
+            // proves each stream before acting on it.
+            document.getElementById('em-avc444').value = 'drop';
             document.getElementById('em-enable-wallpaper').checked = false;
             document.getElementById('em-enable-theming').checked = false;
             document.getElementById('em-enable-full-window-drag').checked = false;
@@ -3590,11 +3594,12 @@
                     // Unset (saved when Automatic existed) offers both views.
                     document.getElementById('em-avc444').value =
                         entryData.avc444 === false ? '0'
-                            : entryData.h264_combine === false ? 'nc' : '1';
+                            : entryData.h264_drop_aux === true ? 'drop'
+                                : entryData.h264_combine === false ? 'nc' : '1';
                     document.getElementById('em-enable-wallpaper').checked = !!entryData.enable_wallpaper;
                     document.getElementById('em-enable-theming').checked = !!entryData.enable_theming;
                     document.getElementById('em-enable-full-window-drag').checked = !!entryData.enable_full_window_drag;
-                    if (entryData.enable_gfx || entryData.enable_desktop_composition || entryData.force_lossless || entryData.enable_h264 || entryData.native_resolution || entryData.avc444 === false || entryData.h264_combine === false || entryData.enable_wallpaper || entryData.enable_theming || entryData.enable_full_window_drag) {
+                    if (entryData.enable_gfx || entryData.enable_desktop_composition || entryData.force_lossless || entryData.enable_h264 || entryData.native_resolution || entryData.avc444 === false || entryData.h264_combine === false || entryData.h264_drop_aux === true || entryData.enable_wallpaper || entryData.enable_theming || entryData.enable_full_window_drag) {
                         document.getElementById('em-video-perf-fields').style.display = '';
                         document.getElementById('em-video-perf-arrow').innerHTML = '&#9660;';
                     }
@@ -3825,6 +3830,7 @@
                 var avc444Value = document.getElementById('em-avc444').value;
                 entry.avc444 = (avc444Value !== '0');
                 if (avc444Value === 'nc') entry.h264_combine = false;
+                if (avc444Value === 'drop') entry.h264_drop_aux = true;
                 if (document.getElementById('em-enable-wallpaper').checked) entry.enable_wallpaper = true;
                 if (document.getElementById('em-enable-theming').checked) entry.enable_theming = true;
                 if (document.getElementById('em-enable-full-window-drag').checked) entry.enable_full_window_drag = true;
