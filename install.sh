@@ -235,12 +235,46 @@ install_rustguac() {
 
     mkdir -p "$PREFIX"/{bin,data,recordings,static}
 
+    # A running binary cannot be overwritten -- cp fails with "Text file busy"
+    # and leaves the old one in place, after the script has already reported
+    # building the new one. That failure reads exactly like a successful
+    # upgrade that changed nothing, which is the worst shape a deploy problem
+    # can take. Stop it here and restart it at the end, but only if it was
+    # running: a first install should not be started behind the operator's
+    # back before there is an admin account.
+    WAS_RUNNING=0
+    if systemctl is-active --quiet rustguac 2>/dev/null; then
+        WAS_RUNNING=1
+        info "Stopping rustguac for the upgrade..."
+        systemctl stop rustguac
+    fi
+
     # Binary
     cp "$SCRIPT_DIR/target/release/rustguac" "$PREFIX/bin/rustguac"
     chmod 755 "$PREFIX/bin/rustguac"
 
-    # Static web assets
-    cp -r "$SCRIPT_DIR/static/"* "$PREFIX/static/"
+    # Static web assets, mirrored rather than copied over the top.
+    #
+    # An overlay copy never removes anything, so a file that leaves the repo
+    # stays served for ever. That is not only clutter: ServeDir is rooted at
+    # $PREFIX/static, so whatever is left there is reachable. A stray nested
+    # copy of the whole tree sat at $PREFIX/static/static from July until
+    # September 2026, serving two-month-old HTML and JavaScript at /static/...
+    # to anyone who asked for it, and three files from an abandoned branch
+    # outlived the branch the same way.
+    #
+    # `static/.` rather than `static/*` because the latter is one slip away
+    # from `cp -r static "$PREFIX/static/"`, which nests the tree instead of
+    # filling the directory -- which is how that copy got there.
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete "$SCRIPT_DIR/static/." "$PREFIX/static/"
+    else
+        # Same effect without rsync: replace the tree outright. Nothing in
+        # here is operator-supplied; branding comes from config and themes.
+        rm -rf "$PREFIX/static"
+        mkdir -p "$PREFIX/static"
+        cp -r "$SCRIPT_DIR/static/." "$PREFIX/static/"
+    fi
 
     # Default config (don't overwrite existing)
     if [[ ! -f "$PREFIX/config.toml" ]]; then
@@ -357,6 +391,21 @@ setup_drive() {
     if ! command -v cryptsetup &>/dev/null; then
         warn "cryptsetup not found — install cryptsetup-bin for encrypted drive support"
         return 0
+    fi
+
+    # Only ask if there is someone there to answer. Run from a pipe, a
+    # nohup, CI or any other non-interactive context, `read` gets EOF
+    # immediately under `set -e`... or worse, waits for ever holding a
+    # terminal that no one is watching. This prompt sits *after* the binary
+    # and the assets are installed, so a hang here looks like a deploy that
+    # completed except for the service coming back -- which is exactly how it
+    # presented, repeatedly, before this guard.
+    #
+    # RUSTGUAC_DRIVE_SETUP=yes|no answers it without a terminal.
+    if [[ -z "$SETUP" && ! -t 0 ]]; then
+        SETUP="no"
+        info "Drive / File Transfer Setup skipped (not interactive)."
+        info "  Set RUSTGUAC_DRIVE_SETUP=yes to enable it from a script."
     fi
 
     if [[ -z "$SETUP" ]]; then
@@ -558,6 +607,23 @@ install_systemd
 rm -rf "$BUILD_DIR"
 
 # ---------------------------------------------------------------------------
+# Restart, if this was an upgrade of a running service
+# ---------------------------------------------------------------------------
+# Only when it was already running. A first install leaves it stopped so that
+# an admin account can be created before anything is reachable.
+if [[ "${WAS_RUNNING:-0}" -eq 1 ]]; then
+    info "Restarting rustguac..."
+    systemctl restart rustguac
+    sleep 2
+    if systemctl is-active --quiet rustguac; then
+        info "rustguac is running."
+    else
+        error "rustguac did not come back up. Check: journalctl -u rustguac -n 50"
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 echo ""
@@ -569,8 +635,12 @@ info "Next steps:"
 info "  1. Create an admin:"
 info "     $PREFIX/bin/rustguac --config $PREFIX/config.toml add-admin --name admin"
 info ""
-info "  2. Start the services:"
-info "     sudo systemctl start rustguac"
+if [[ "${WAS_RUNNING:-0}" -eq 1 ]]; then
+    info "  2. Services were already running and have been restarted."
+else
+    info "  2. Start the services:"
+    info "     sudo systemctl start rustguac"
+fi
 info ""
 if [[ $NO_TLS -eq 0 ]]; then
     info "  3. Open in browser:"
