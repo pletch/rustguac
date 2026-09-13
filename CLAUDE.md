@@ -711,6 +711,58 @@ AVC420, since every row is fed the same pre-decoded frames and none of them
 models the second decode that is not performed, nor the bytes that are not
 sent -- 13% of the payload on a Windows host and 43% on the xrdp fork.
 
+#### Decoding on a worker does not pay, and the reason is one number
+
+Built, measured against a real Windows client and host, and **not merged**. It
+lives on `feature/h264-worker` as research. The finding is worth more than the
+code, because it is not what anyone would guess and it is what stops this being
+rebuilt.
+
+**`VideoFrame.copyTo()` is about 2.7x slower on a worker thread.** Matched copy
+for copy by area, same machine, same host, same session type, while combining:
+
+| copied | worker | main |
+|---|---|---|
+| 0.50MP chroma | 31.5ms | 12.3ms |
+| 0.51MP luma | 34.8ms | 11.7ms |
+| 0.78MP chroma | 36.6ms | 11.7ms |
+| overall | 54.6 ms/MP | 19.9 ms/MP |
+
+Everything else followed from that. In a controlled A/B -- the same scripted
+pointer path, the same 7200 events on the same clock, 66s each, 8.9 against
+9.2 pictures a second, so the two arms genuinely carried the same load -- the
+worker took `h264 output` from **13.3% of the main thread to zero**, and in
+exchange 4:4:4 ran at **1.7 syncs/s against 4.7**, flushed at 58.8ms against
+17.5ms with 14 slow flushes against none, and the combine gate gave up 4:4:4
+altogether while the main-thread arm sustained it for the full minute.
+
+**And nothing was being protected.** Both arms recorded `blocked 0ms`, zero
+slow input events, and delivered all 7200 scheduled pointer moves on time. The
+main thread at 13.3% occupancy was not in trouble, so the whole benefit was
+theoretical while the cost was not.
+
+The architecture was sound and that is not where it failed. The handover is
+free: `h264 draw` measured 35ms on the worker against 42ms on the main thread
+across 66 seconds, so transferring an `ImageBitmap` per picture costs nothing
+on receipt. Stream order held, the `012` pacing loop behaved across the
+boundary, and no frame was ever stranded. It fails on one platform fact.
+
+**An earlier, uncontrolled comparison read 52-58% of the main thread and 563
+slow input events**, which looks like a much stronger case for the worker and
+was the reason it survived as long as it did. That workload was heavier
+(whole-plane copies rather than ~10% banded), and at that load the main thread
+is genuinely under threat -- but the 2.7x copy penalty applies there too, so
+the worker saturates sooner. The direction does not reverse with load. What
+that comparison mostly demonstrated is that **an uncontrolled A/B is worse than
+none**, because it produces a plausible answer: the arms were carrying
+different work and nothing in the output said so.
+
+**What would change the verdict** is the same thing tracked in the AVC444
+section above: [w3c/webcodecs#37](https://github.com/w3c/webcodecs/issues/37)
+yielding decoded planes as GPU textures. That removes the read-back entirely,
+and with it the only reason the worker loses. Until then, moving the decoder
+off the main thread moves the cost and multiplies it.
+
 #### Dropping the auxiliary view in transit
 
 `src/h264_aux_drop.rs` removes AVC444's second picture from the wire between
