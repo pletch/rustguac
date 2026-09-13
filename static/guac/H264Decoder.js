@@ -3187,6 +3187,16 @@ Guacamole.H264Decoder = function H264Decoder(display, host) {
 
             output: function(frame) {
 
+                /* Where the cost is. The combine -- copyTo()'s blocking
+                 * prologue above all -- runs here, in the decoder's output
+                 * callback, not in drawDecoded(), which is one blit whichever
+                 * host is running. So timing drawDecoded() alone reports the
+                 * two hosts as identical and says nothing about what moved.
+                 *
+                 * Only the direct host answers this: on a worker it is not
+                 * main-thread time and must not be counted as any. */
+                var workStartedAt = host.noteWork ? nowMs() : 0;
+
                 var frameState = null;
                 var canvas = null;
 
@@ -3362,6 +3372,9 @@ Guacamole.H264Decoder = function H264Decoder(display, host) {
                         frameState.canvas = null;
 
                 } finally {
+
+                    if (workStartedAt)
+                        host.noteWork(nowMs() - workStartedAt);
 
                     /* Null when combineFrame() took ownership: it closes the
                      * frame once its plane copy has settled, and releases the
@@ -4327,6 +4340,16 @@ Guacamole.H264Decoder.directHost = function directHost(display) {
     return {
 
         autoDraw : false,
+
+        /**
+         * Charges main-thread time to the decoder. Present only on this host:
+         * the worker host leaves it undefined, which is what switches the
+         * timing off there rather than a flag.
+         */
+        noteWork : function (ms) {
+            if (Guacamole.MainThreadLoad)
+                Guacamole.MainThreadLoad.noteDecodeWork(ms);
+        },
 
         getWidth : function () {
             return display ? display.getWidth() : 0;

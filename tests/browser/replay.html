@@ -1,0 +1,247 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>H.264 worker replay</title>
+<style>
+  body { background:#111; color:#ddd; font:13px/1.5 ui-monospace,monospace; margin:0; padding:12px; }
+  #display { border:1px solid #333; display:inline-block; }
+  #log { white-space:pre-wrap; margin-top:10px; }
+  b { color:#6cf; }
+</style>
+
+<div id="bar">
+  <b id="mode">…</b> — <span id="progress">loading</span>
+</div>
+<div id="display"></div>
+<div id="log"></div>
+
+<script src="/guac/Namespace.js"></script>
+<script src="/guac/Event.js"></script>
+<script src="/guac/Position.js"></script>
+<script src="/guac/Layer.js"></script>
+<script src="/guac/Display.js"></script>
+<script src="/guac/Mouse.js"></script>
+<script src="/guac/Yuv444.js"></script>
+<script src="/guac/H264Decoder.js"></script>
+<script src="/guac/H264DecoderProxy.js"></script>
+<script src="/guac/MainThreadLoad.js"></script>
+<link id="h264-worker-src" rel="preload" as="worker" href="/guac/H264Worker.js">
+
+<script>
+/*
+ * Replays the H.264 of a real recording through the real client stack, in a
+ * real browser, so that the worker path can be exercised without a live
+ * session -- there is no guacd here and no RDP host.
+ *
+ * What this can and cannot answer is worth being precise about, because this
+ * project has been misled by a harness before. tests/bench feeds pre-decoded
+ * frames that already live in system memory, so its copyTo() row reads 0.29ms
+ * against ~14ms in the field and it cannot see the dominant cost at all. This
+ * does not make that mistake: the bytes go through a real VideoDecoder, so the
+ * frames come from wherever that decoder puts them.
+ *
+ * But that is exactly the thing to check rather than assume. If the decode
+ * falls back to software the frames are in system memory again and copyTo() is
+ * cheap for the same wrong reason, so the page reports what it got and no
+ * timing here means anything until that line says hardware.
+ *
+ * What it cannot test at all: the tunnel, guacd's pacing, and real input.
+ */
+
+const params = new URLSearchParams(location.search);
+const logEl = document.getElementById('log');
+const lines = [];
+
+function log(s) {
+    lines.push(s);
+    if (lines.length > 40) lines.shift();
+    logEl.textContent = lines.join('\n');
+}
+
+/* Everything the decoder says, kept where the driver can read it. */
+window.__replayLog = lines;
+const origLog = console.log.bind(console);
+const origWarn = console.warn.bind(console);
+console.log = (...a) => { const s = a.join(' '); if (s.includes('[rustguac]')) log(s); origLog(...a); };
+console.warn = (...a) => { const s = a.join(' '); log('WARN ' + s); origWarn(...a); };
+
+/* ── The display, and a decoder chosen exactly as Client.js chooses one ── */
+
+const display = new Guacamole.Display();
+document.getElementById('display').appendChild(display.getElement());
+
+Guacamole.H264Decoder.workerConfig = {
+    workerUrl : document.getElementById('h264-worker-src').getAttribute('href'),
+    scripts   : ['/guac/Yuv444.js', '/guac/H264Decoder.js']
+};
+
+Guacamole.H264Decoder.onDiagnostic = (name, detail) =>
+        log('diag ' + name + ': ' + detail);
+
+Guacamole.MainThreadLoad.start();
+
+const decoder = Guacamole.H264Decoder.create(display);
+const usingWorker = !!(decoder instanceof Guacamole.H264DecoderProxy);
+document.getElementById('mode').textContent =
+        usingWorker ? 'decoding on a WORKER' : 'decoding on the MAIN THREAD';
+window.__mode = usingWorker ? 'worker' : 'main';
+
+Guacamole.MainThreadLoad.watchInput(document.getElementById('display'));
+
+/* ── Is this decode hardware? Nothing below means anything if it is not ── */
+
+window.__hardware = 'unknown';
+(async () => {
+    try {
+        const probe = await VideoDecoder.isConfigSupported({
+            codec : 'avc1.42001e', hardwareAcceleration : 'prefer-hardware',
+            codedWidth : 1500, codedHeight : 831
+        });
+        window.__hardware = probe.supported ? 'hardware offered' : 'software only';
+    } catch (e) {
+        window.__hardware = 'probe failed: ' + e.message;
+    }
+    log('decode: ' + window.__hardware);
+})();
+
+/* ── Parsing, replay ────────────────────────────────────────────────── */
+
+function* instructions(text) {
+    let pos = 0;
+    for (;;) {
+        const els = [];
+        for (;;) {
+            const dot = text.indexOf('.', pos);
+            if (dot < 0) return;
+            const len = parseInt(text.slice(pos, dot), 10);
+            if (isNaN(len)) return;
+            els.push(text.slice(dot + 1, dot + 1 + len));
+            const sep = text[dot + 1 + len];
+            pos = dot + 2 + len;
+            if (sep === ';') break;
+            if (sep !== ',') return;
+        }
+        yield els;
+    }
+}
+
+function b64(s) {
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function run() {
+
+    log('fetching recording…');
+    const text = await (await fetch('/recording.guac')).text();
+    log('parsed ' + (text.length / 1e6).toFixed(1) + 'MB');
+
+    const streams = new Map();
+    let pictures = 0, syncs = 0, firstTs = null, startedAt = performance.now();
+    const limit = parseInt(params.get('limit') || '0', 10);
+
+    for (const els of instructions(text)) {
+
+        const op = els[0];
+
+        if (op === 'size' && els[1] === '0')
+            display.resize(display.getDefaultLayer(),
+                    parseInt(els[2], 10), parseInt(els[3], 10));
+
+        else if (op === 'h264') {
+
+            /* Indexed off the parameter list, not the raw elements, so the
+             * offsets here are the ones Client.js uses and the ones
+             * tests/h264-instruction-format.mjs pins. Reading the raw array
+             * directly is off by one at every field, which shows up as a
+             * stream that never contains a keyframe -- the layer is read where
+             * the keyframe flag is, and the layer is 0. */
+            const par = els.slice(1);
+
+            const numRects = par.length > 8 ? parseInt(par[8], 10) : 0;
+            const rects = [];
+            for (let r = 0; r < numRects; r++) {
+                const b = 9 + r * 4;
+                if (b + 3 >= par.length) break;
+                rects.push({ x: +par[b], y: +par[b + 1],
+                             width: +par[b + 2], height: +par[b + 3] });
+            }
+
+            streams.set(par[0], {
+                layer    : display.getDefaultLayer(),
+                key      : par[2] !== '0',
+                x        : +par[3], y : +par[4], w : +par[5], h : +par[6],
+                view     : par.length > 7 ? +par[7] : 0,
+                rects    : par.length > 8 ? rects : null,
+                paired   : par.length > 9 + numRects * 4
+                                ? par[9 + numRects * 4] !== '0' : false,
+                chunks   : [], total : 0
+            });
+        }
+
+        else if (op === 'blob' && streams.has(els[1])) {
+            const s = streams.get(els[1]);
+            const bytes = b64(els[2]);
+            s.chunks.push(bytes);
+            s.total += bytes.length;
+        }
+
+        else if (op === 'end' && streams.has(els[1])) {
+            const s = streams.get(els[1]);
+            streams.delete(els[1]);
+            if (!s.total) continue;
+            const bytes = new Uint8Array(s.total);
+            let off = 0;
+            for (const c of s.chunks) { bytes.set(c, off); off += c.length; }
+            display.drawH264(s.layer, decoder, s.x, s.y, s.w, s.h,
+                    bytes.buffer, s.key, s.rects, s.view, s.paired);
+            pictures++;
+        }
+
+        else if (op === 'sync') {
+
+            const ts = parseInt(els[1], 10);
+            if (firstTs === null) firstTs = ts;
+            syncs++;
+
+            /* Exactly what Client.js does: flush the display, then hold the
+             * acknowledgement on the decoder's gate. This is the loop the
+             * worker changes, so it is replayed rather than skipped. */
+            const syncAt = performance.now();
+            await new Promise(resolve => {
+                display.flush(() => {
+                    const flushMs = performance.now() - syncAt;
+                    decoder.waitForPending(resolve, flushMs);
+                });
+            });
+
+            /* Paced to the recording, so the main thread sees the load at the
+             * rate the session actually produced it. */
+            const due = startedAt + (ts - firstTs);
+            const wait = due - performance.now();
+            if (wait > 1) await sleep(Math.min(wait, 250));
+
+            if (syncs % 50 === 0) {
+                document.getElementById('progress').textContent =
+                        pictures + ' pictures, ' + syncs + ' syncs, '
+                        + ((performance.now() - startedAt) / 1000).toFixed(0) + 's';
+                window.__progress = { pictures, syncs };
+            }
+
+            if (limit && pictures >= limit) break;
+        }
+    }
+
+    window.__done = true;
+    window.__state = decoder.describeState();
+    log('DONE: ' + pictures + ' pictures, ' + syncs + ' syncs in '
+            + ((performance.now() - startedAt) / 1000).toFixed(1) + 's');
+    log('state: ' + window.__state);
+    Guacamole.MainThreadLoad.stop();
+}
+
+run().catch(e => { window.__error = e.message; log('ERROR ' + e.message + '\n' + e.stack); });
+</script>

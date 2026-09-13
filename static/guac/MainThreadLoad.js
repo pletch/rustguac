@@ -104,6 +104,10 @@ Guacamole.MainThreadLoad = (function defineMainThreadLoad() {
             drawMs       : 0,
             drawMaxMs    : 0,
 
+            decodes      : 0,
+            decodeMs     : 0,
+            decodeMaxMs  : 0,
+
             moves        : 0,
             coalesced    : 0,
             dragMoves    : 0,
@@ -170,7 +174,8 @@ Guacamole.MainThreadLoad = (function defineMainThreadLoad() {
          * input, which is worth no line at all. Slow events count: a window
          * whose only content is input arriving late is the one most worth
          * reporting, and leaving it out made exactly that case silent. */
-        if (!c.longTasks && !c.draws && !c.moves && !c.slowEvents)
+        if (!c.longTasks && !c.draws && !c.moves && !c.slowEvents
+                && !c.decodes)
             return;
 
         var parts = [];
@@ -181,6 +186,11 @@ Guacamole.MainThreadLoad = (function defineMainThreadLoad() {
         parts.push('blocked ' + c.blockedMs.toFixed(0) + 'ms in ' + c.longTasks
                 + ' long tasks (' + pct(c.blockedMs, elapsed) + ', longest '
                 + c.longestMs.toFixed(0) + 'ms)');
+
+        parts.push('h264 output ' + c.decodeMs.toFixed(0) + 'ms over '
+                + c.decodes + ' callbacks (' + pct(c.decodeMs, elapsed) + ', '
+                + (c.decodes ? (c.decodeMs / c.decodes).toFixed(2) : '0')
+                + 'ms mean, ' + c.decodeMaxMs.toFixed(1) + 'ms max)');
 
         parts.push('h264 draw ' + c.drawMs.toFixed(0) + 'ms over ' + c.draws
                 + ' pictures (' + pct(c.drawMs, elapsed) + ', '
@@ -302,6 +312,23 @@ Guacamole.MainThreadLoad = (function defineMainThreadLoad() {
          *
          * @param {!number} ms
          */
+        /**
+         * Charges main-thread time to the decoder's output callback, which is
+         * where the combine runs and therefore what a worker actually removes.
+         * Never called when the decoder is hosted on one -- that time is not
+         * this thread's.
+         *
+         * @param {!number} ms
+         */
+        noteDecodeWork : function (ms) {
+            if (!active)
+                return;
+            counters.decodes++;
+            counters.decodeMs += ms;
+            if (ms > counters.decodeMaxMs)
+                counters.decodeMaxMs = ms;
+        },
+
         noteDraw : function (ms) {
             if (!active)
                 return;
