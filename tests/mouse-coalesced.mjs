@@ -36,6 +36,9 @@ const sources = await Promise.all([
     'static/guac/Mouse.js'
 ].map((f) => readFile(join(root, f), 'utf8')));
 
+const monitorPointer = await readFile(
+        join(root, 'static/guac/MonitorPointer.js'), 'utf8');
+
 /**
  * A Guacamole.Mouse on a fake element, with the listeners it attached and the
  * mousemove events it emitted both reachable.
@@ -214,47 +217,34 @@ test('a browser without pointer events keeps the behaviour it had', () => {
 
 /*
  * Those windows bypass Guacamole.Mouse entirely -- it does not track the X
- * axis correctly in a popup -- and map the pointer themselves, inline in
- * client.html. The mapping is not reachable from here, but what makes the
- * replay work there is: the two shared pieces below, and a check that the same
- * state is not sent twice.
- *
- * The failure to guard against is quiet. Renaming sampleCoalesced would at
- * least throw once a drag started, but coalescedMovement simply reading
- * undefined leaves the whole path switched off with nothing said, which is
- * indistinguishable from the behaviour it replaced.
+ * axis correctly in a popup -- and map the pointer themselves. That code is
+ * exercised directly by tests/monitor-pointer.mjs, which is possible only
+ * because it lives in Guacamole.MonitorPointer rather than inline in the page.
+ * What is left here is the join between them: the popup path must be bounded
+ * by the same rule and switched by the same override as the main display, or
+ * the two drift and only one of them answers the setting.
  */
 
 const page = await readFile(join(root, 'static/client.html'), 'utf8');
 
-test('the popup windows use the shared gate and the shared sampler', () => {
-    assert.ok(page.includes('Guacamole.Mouse.coalescedMovement'),
-            'the popup path must honour the same override as the main display');
-    assert.ok(page.includes('Guacamole.Mouse.sampleCoalesced'),
-            'and bound the replay by the same rule');
+test('the page hands its pop-out windows to the shared implementation', () => {
+    assert.ok(page.includes('Guacamole.MonitorPointer('),
+            'client.html must use the extracted pointer handling');
+    assert.ok(page.includes('src="/guac/MonitorPointer.js"'),
+            'and must actually load it, or the call is a ReferenceError');
+});
 
-    const sandbox = { Guacamole: {} };
+test('the popup path is gated and bounded by the main display\'s own rules', () => {
+    const sandbox = { Guacamole: {}, console: { log() {}, warn() {} } };
     vm.createContext(sandbox);
     vm.runInContext(sources[3], sandbox);
-    assert.equal(typeof sandbox.Guacamole.Mouse.sampleCoalesced, 'function',
-            'which Mouse.js must actually still export');
-    assert.notEqual(sandbox.Guacamole.Mouse.coalescedMovement, undefined);
-});
+    vm.runInContext(monitorPointer, sandbox);
 
-test('the popup windows replay only a drag, and only a real mouse', () => {
-    const listener = page.slice(page.indexOf("canvas.addEventListener('pointermove'"));
-    assert.ok(/ev\.pointerType !== 'mouse' \|\| !ev\.buttons/.test(listener),
-            'a hover or a touch must be left to the listeners that had them');
-});
-
-test('the popup windows do not send the same state twice', () => {
-    /* The replay delivers the dispatched position and the mousemove behind it
-     * delivers the same one again. Guacamole.Mouse drops that in move(); this
-     * path sends unconditionally and had to be given the check. */
-    assert.ok(page.includes('if (key !== lastSent)'),
-            'the popup pointer must drop a repeat of what it last sent');
-    assert.ok(/lastSent = null;[\s\S]{0,200}ev\.preventDefault\(\);\n\s*\}, \{ passive: false \}\);/.test(page),
-            'and the wheel, which sends behind its back, must clear it');
+    assert.equal(typeof sandbox.Guacamole.MonitorPointer, 'function');
+    assert.ok(monitorPointer.includes('Guacamole.Mouse.coalescedMovement'),
+            'the same override must reach both, or one ignores the setting');
+    assert.ok(monitorPointer.includes('Guacamole.Mouse.sampleCoalesced'),
+            'and the same cap, or the two drift apart');
 });
 
 console.log(failures ? `\n${failures} failure(s)` : '\nall passed');
