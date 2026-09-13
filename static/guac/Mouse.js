@@ -136,6 +136,102 @@ Guacamole.Mouse = function Mouse(element) {
 
     }, false);
 
+    /* Recovers the moves the browser merged away.
+     *
+     * A busy main thread does not delay pointer movement, it *discards* it:
+     * moves that arrive while a handler is running are coalesced into one, and
+     * what is dispatched afterwards carries only the last position. A drag
+     * feels that immediately -- the path between two points is gone, so a
+     * dragged scrollbar thumb is dropped rather than merely lagged -- while a
+     * hover or a video degrades gracefully under the same load, which is why
+     * this is worth doing for one and not the other.
+     *
+     * getCoalescedEvents() returns the moves that were merged, the dispatched
+     * one last. Replaying them in order restores the path. It does not restore
+     * the timing: nothing running on a blocked thread can, and the positions
+     * still arrive together once the thread is free. The remote end sees where
+     * the pointer went rather than only where it ended up.
+     *
+     * This is deliberately additive. The mousemove listener above is untouched
+     * and still delivers every position it did before, so touch, the
+     * compatibility mouse events it produces and the ignore_mouse counter that
+     * swallows them all behave exactly as they did. The dispatched position
+     * arrives here first and again there, and the second is dropped by the
+     * unchanged-coordinates check in move(). Migrating this file to pointer
+     * events outright would be the tidier shape and a much larger change:
+     * every listener would have to move together, or synthetic mouse events
+     * from touch would arrive with nothing left counting them down. */
+    if (typeof PointerEvent !== 'undefined'
+            && typeof PointerEvent.prototype.getCoalescedEvents === 'function'
+            && Guacamole.Mouse.coalescedMovement) {
+
+        element.addEventListener("pointermove", function(e) {
+
+            /* Touch has its own handling -- Guacamole.Touch and
+             * Guacamole.Mouse.Touchscreen -- and reaches the listener above
+             * as compatibility mouse events, which the counter below is there
+             * to swallow. Pen does not coalesce meaningfully. */
+            if (e.pointerType !== 'mouse')
+                return;
+
+            /* Recently touched: the listener above is counting synthetic
+             * events down and this must not interfere with either the count
+             * or what it is suppressing. */
+            if (ignore_mouse)
+                return;
+
+            /* Only while a button is held. The path matters for a drag and
+             * the endpoint is all that matters for a hover, and replaying
+             * every merged move of an idle pointer would multiply the
+             * upstream mouse traffic of a session that had nothing wrong with
+             * it. */
+            if (!e.buttons)
+                return;
+
+            var merged = e.getCoalescedEvents();
+            if (!merged || merged.length <= 1)
+                return;
+
+            var events = sampled(merged);
+            for (var i = 0; i < events.length; i++)
+                guac_mouse.move(Guacamole.Position.fromClientPosition(element,
+                        events[i].clientX, events[i].clientY), events[i]);
+
+        }, false);
+
+    }
+
+    /**
+     * The merged moves to replay, at most COALESCED_MAX of them. A pointer
+     * reporting at 1000Hz behind a thread blocked for 100ms offers a hundred
+     * positions for one drag, and forwarding each as its own instruction would
+     * answer a rendering problem with a traffic one. Sampling evenly, and
+     * always keeping the last, holds the shape of the path at a bounded cost;
+     * an ordinary pointer never reaches the cap at all.
+     *
+     * @private
+     * @param {!Array} merged - What getCoalescedEvents() returned.
+     * @returns {!Array} The events to replay, in order.
+     */
+    function sampled(merged) {
+
+        if (merged.length <= Guacamole.Mouse.COALESCED_MAX)
+            return merged;
+
+        var out = [];
+        var step = merged.length / Guacamole.Mouse.COALESCED_MAX;
+
+        for (var i = 0; i < Guacamole.Mouse.COALESCED_MAX - 1; i++)
+            out.push(merged[Math.floor(i * step)]);
+
+        /* The last is where the pointer actually is, so it is never the one
+         * dropped. */
+        out.push(merged[merged.length - 1]);
+
+        return out;
+
+    }
+
     element.addEventListener("mousedown", function(e) {
 
         // Do not handle if ignoring events
@@ -339,6 +435,51 @@ Guacamole.Mouse = function Mouse(element) {
     };
 
 };
+
+/**
+ * Whether the moves the browser coalesced away during a drag are replayed, so
+ * that the remote end sees the path the pointer took rather than only where it
+ * ended up. See the pointermove listener above for what this does and does
+ * not recover.
+ *
+ * Settable as window.__mouseCoalesced, or as the mouseCoalesced key in
+ * localStorage to survive a reconnect -- which is the form that works on a
+ * live session, since client.html rebuilds its own URL on every launch and
+ * relaunch and drops anything added to it by hand.
+ *
+ * @type {!boolean}
+ */
+Guacamole.Mouse.coalescedMovement = (function coalescedMovement() {
+
+    if (typeof window === 'undefined')
+        return true;
+
+    if (window.__mouseCoalesced !== undefined)
+        return !!window.__mouseCoalesced;
+
+    try {
+        var stored = window.localStorage
+                && window.localStorage.getItem('mouseCoalesced');
+        if (stored === 'off' || stored === 'false')
+            return false;
+    } catch (e) {
+        /* Storage can be blocked outright; the global still works. */
+    }
+
+    return true;
+
+}());
+
+/**
+ * The most merged moves replayed for one dispatched move. A pointer reporting
+ * at 1000Hz behind a thread blocked for 100ms offers a hundred positions for a
+ * single drag, and forwarding each as its own instruction would answer a
+ * rendering problem with a traffic one. An ordinary pointer never reaches
+ * this.
+ *
+ * @type {!number}
+ */
+Guacamole.Mouse.COALESCED_MAX = 16;
 
 /**
  * The current state of a mouse, including position and buttons.
