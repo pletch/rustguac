@@ -18,10 +18,35 @@ var Guacamole = Guacamole || {};
  * whenever decode happens to finish. See Guacamole.Display.drawH264().
  *
  * @constructor
- * @param {!Guacamole.Display} display
- *     The Guacamole display to render decoded frames to.
+ * @param {Guacamole.Display} display
+ *     The Guacamole display to render decoded frames to, or null when this
+ *     decoder is hosted somewhere that has no display -- a worker, where the
+ *     host below supplies the framebuffer size and takes the finished picture.
+ *
+ * @param {Guacamole.H264Decoder.Host} [host]
+ *     Where this decoder reads the things a worker cannot reach and hands
+ *     back the pictures it produces. Defaults to the direct host, which reads
+ *     the display and paints straight into the layer -- the whole decoder on
+ *     the main thread, as it was before any of this was hosted.
  */
-Guacamole.H264Decoder = function H264Decoder(display) {
+Guacamole.H264Decoder = function H264Decoder(display, host) {
+
+    /**
+     * The host, defaulted so that `new Guacamole.H264Decoder(display)` keeps
+     * meaning exactly what it used to.
+     *
+     * @private
+     * @type {!Guacamole.H264Decoder.Host}
+     */
+    host = host || Guacamole.H264Decoder.directHost(display);
+
+    /**
+     * This decoder, for the paths that must reach its own public methods.
+     *
+     * @private
+     * @type {!Guacamole.H264Decoder}
+     */
+    var api = this;
 
     /**
      * The WebCodecs VideoDecoder instance, or null if not yet initialised
@@ -453,9 +478,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             return null;
 
         if (!probeCanvas) {
-            probeCanvas = document.createElement('canvas');
-            probeCanvas.width = 32;
-            probeCanvas.height = 32;
+            probeCanvas = host.createCanvas(32, 32);
         }
 
         var ctx = probeCanvas.getContext('2d', { willReadFrequently: true });
@@ -503,9 +526,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             return null;
 
         if (!gridCanvas) {
-            gridCanvas = document.createElement('canvas');
-            gridCanvas.width = 64;
-            gridCanvas.height = 32;
+            gridCanvas = host.createCanvas(64, 32);
         }
 
         var ctx = gridCanvas.getContext('2d', { willReadFrequently: true });
@@ -573,8 +594,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (!blackProbesEnabled())
             return;
 
-        var fbWidth = display ? display.getWidth() : layerCanvas.width;
-        var fbHeight = display ? display.getHeight() : layerCanvas.height;
+        var fbWidth = host.getWidth() || layerCanvas.width;
+        var fbHeight = host.getHeight() || layerCanvas.height;
 
         var w = Math.min(snapshot.width, fbWidth - frameState.x);
         var h = Math.min(snapshot.height, fbHeight - frameState.y);
@@ -812,9 +833,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @private
      */
     function noteFramebufferSize() {
-        if (!display)
+        if (!host.getWidth())
             return;
-        var size = display.getWidth() + 'x' + display.getHeight();
+        var size = host.getWidth() + 'x' + host.getHeight();
         if (size !== lastFramebufferSize) {
             lastFramebufferSize = size;
             framebufferChangedAt = nowMs();
@@ -1450,7 +1471,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         var canvas = canvasPool.pop();
         if (!canvas)
-            canvas = document.createElement('canvas');
+            canvas = host.createCanvas(width, height);
 
         /* Assigning either dimension clears the canvas, so only resize when the
          * size actually differs; the frame is about to overwrite it anyway. */
@@ -2341,80 +2362,16 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     }
 
     /**
-     * Overrides already read from the query string or localStorage, by name.
-     * Neither source can change without a reload, so each is read once.
-     *
-     * @private
-     * @type {!Object.<string, *>}
-     */
-    var storedOverrides = {};
-
-    /**
-     * Reads a runtime override, from a window global, a query parameter, or
-     * localStorage, in that order. The last two exist because the devices
-     * where these paths behave differently -- phones and tablets -- are the
-     * ones with no console to set a global from.
+     * Reads a runtime override by name, from wherever this decoder's host
+     * keeps them -- a window global, a query parameter or localStorage on the
+     * main thread, and a pushed snapshot of the same in a worker.
      *
      * @private
      * @param {!string} name - The override's name.
      * @returns {*} The override's value, or undefined if unset.
      */
     function override(name) {
-
-        if (typeof window === 'undefined')
-            return undefined;
-
-        if (window['__' + name] !== undefined)
-            return window['__' + name];
-
-        /* The window global above is a property read and is checked every
-         * time, so setting one still takes effect mid-session -- which is the
-         * point of these, since one build is meant to compare 4:2:0, combined
-         * and combined-plus-filtered without a reload.
-         *
-         * The query string and localStorage cannot change without a reload,
-         * and reading them is not free: URLSearchParams parses the whole query
-         * on construction and localStorage is a synchronous, disk-backed read.
-         * On the combine path this ran twice per picture -- 60 times a second
-         * on the main thread -- for a value that was fixed before the first
-         * frame arrived. */
-        if (name in storedOverrides)
-            return storedOverrides[name];
-
-        /* The query string is read, but on a live session it cannot be
-         * reached: client.html builds `/client/{id}?name=...` itself on every
-         * launch and relaunch and drops anything added by hand, so a pasted
-         * parameter lasts until the first reconnect and no longer. It is the
-         * usable form only on the recording player, whose URL nothing
-         * rewrites. localStorage is what survives a live session; a window
-         * global takes effect immediately but does not outlive the page.
-         * Operator-facing messages in this file should say so rather than
-         * naming a query parameter. */
-        var value = null;
-
-        try {
-            value = new URLSearchParams(window.location.search).get(name);
-            if (value === null && window.localStorage)
-                value = window.localStorage.getItem(name);
-        } catch (e) {
-            /* Storage can be blocked outright; the global still works. */
-        }
-
-        if (value === null || value === undefined)
-            return (storedOverrides[name] = undefined);
-
-        /* '0' is deliberately not in that list: it is a valid threshold for
-         * h264ChromaFilter, and an override that takes a number has to be
-         * able to take zero. It still switches a boolean override off, since
-         * callers coerce, and 0 is falsy. */
-        if (value === 'off' || value === 'false')
-            return (storedOverrides[name] = false);
-        if (value === 'on' || value === 'true')
-            return (storedOverrides[name] = true);
-
-        var number = parseFloat(value);
-        return (storedOverrides[name] = isNaN(number) ? true : number);
-
+        return host.override(name);
     }
 
     /**
@@ -2455,7 +2412,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * -- the same picture costs the same to combine whatever sent it,
          * which is why this was mistaken for an xrdp problem before a Windows
          * session was run at native resolution. */
-        var pixels = display ? display.getWidth() * display.getHeight() : 0;
+        var pixels = host.getWidth() * host.getHeight();
 
         /* Nothing sized yet: combine, and let the next picture decide once
          * the display has been sized. */
@@ -2472,7 +2429,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (!combine && !chromaDeclineLogged) {
             chromaDeclineLogged = true;
             console.log('[rustguac] H.264: not combining AVC444 -- '
-                    + display.getWidth() + 'x' + display.getHeight() + ' is '
+                    + host.getWidth() + 'x' + host.getHeight() + ' is '
                     + (pixels / 1e6).toFixed(1) + 'MP, over the '
                     + (limit / 1e6).toFixed(1) + 'MP the combine is worth its '
                     + 'GPU cost at; window.__h264Chroma444 = true '
@@ -3298,8 +3255,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                                 ? 'stopped 4:4:4 combining: the h264Chroma444 '
                                     + 'override is off'
                                 : 'stopped 4:4:4 combining: the framebuffer '
-                                    + 'grew to ' + display.getWidth() + 'x'
-                                    + display.getHeight() + ', over the '
+                                    + 'grew to ' + host.getWidth() + 'x'
+                                    + host.getHeight() + ', over the '
                                     + (combineMaxPixels() / 1e6).toFixed(1)
                                     + 'MP it is worth its cost at',
                                 true);
@@ -3678,9 +3635,24 @@ Guacamole.H264Decoder = function H264Decoder(display) {
              * not. */
             if (onReady)
                 frameState.onReady = function __h264_ready() {
+
                     if (!frameState.readyAt)
                         frameState.readyAt = nowMs();
+
+                    /* A host that does its own drawing owns the ordering too,
+                     * and calls drawDecoded() when the display queue reaches
+                     * the frame. A host that does not -- the worker -- has no
+                     * queue to wait for and no layer to wait on: it finishes
+                     * the frame here, and what "finishing" produces is a
+                     * picture handed to the thread that does have both. The
+                     * order the stream specified is still the main thread's to
+                     * keep, and it keeps it exactly as before, because this
+                     * runs before the readiness that unblocks its task. */
+                    if (host.autoDraw)
+                        api.drawDecoded(token);
+
                     onReady();
+
                 };
 
             frameState.submittedAt = nowMs();
@@ -3809,42 +3781,36 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
         try {
 
-            if (frameState.layer) {
+            /* What "paint" means belongs to the host. The direct host draws
+             * into the layer here and now, on the main thread; the worker host
+             * hands the picture over for the main thread to draw when the
+             * display queue reaches it. Either way this is the decoder's last
+             * sight of the picture.
+             *
+             * It returns the layer's canvas where there is one to read back,
+             * which is what the probes need and what a worker cannot give
+             * them, or false where nothing was painted at all. */
+            var layerCanvas = host.paintFrame(frameState, snapshot);
 
-                var ctx = frameState.layer.getCanvas().getContext('2d');
-
-                /* Draw only the regions the server marked valid. The decoded
-                 * picture spans the whole surface, so blitting all of it would
-                 * overwrite areas delivered via other codecs on a server that
-                 * mixes them within a frame. */
-                if (frameState.rects) {
-                    for (var r = 0; r < frameState.rects.length; r++) {
-                        var rect = frameState.rects[r];
-                        ctx.drawImage(snapshot,
-                                rect.x, rect.y, rect.width, rect.height,
-                                rect.x, rect.y, rect.width, rect.height);
-                    }
-                }
-
-                /* No regions given: the entire picture is valid */
-                else
-                    ctx.drawImage(snapshot, frameState.x, frameState.y);
+            if (layerCanvas !== false) {
 
                 counts.painted++;
                 counts.lastPaintAt = nowMs();
                 if (frameState.keyFrame)
                     counts.lastKeyframePaintAt = counts.lastPaintAt;
 
-                if (frameState.keyFrame)
-                    probeKeyframe(frameState, snapshot,
-                            frameState.layer.getCanvas());
+                if (!layerCanvas) {
+                    /* Hosted away from the layer: nothing to read back. */
+                }
+
+                else if (frameState.keyFrame)
+                    probeKeyframe(frameState, snapshot, layerCanvas);
 
                 else if (probesLeft > 0 && counts.lastPaintAt - lastProbeAt
                         >= PROBE_DELTA_INTERVAL_MS) {
                     probesLeft--;
                     lastProbeAt = counts.lastPaintAt;
-                    probePaint(frameState, snapshot,
-                            frameState.layer.getCanvas());
+                    probePaint(frameState, snapshot, layerCanvas);
                 }
 
             }
@@ -3980,7 +3946,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         }
 
         diagnostic('sync_hold', 'last ' + (elapsed / 1000).toFixed(0) + 's at '
-                + (display ? display.getWidth() + 'x' + display.getHeight()
+                + (host.getWidth() ? host.getWidth() + 'x' + host.getHeight()
                     : '?') + ': ' + describeHolds(holdWindow, elapsed), true);
 
         holdWindow = newHoldStats();
@@ -4216,3 +4182,199 @@ Guacamole.H264Decoder.isSupported = function isSupported() {
  */
 Guacamole.H264Decoder.onDiagnostic = null;
 
+
+/**
+ * Everything a decoder needs that depends on where it is running, in one
+ * object, so that the decoder itself contains no reference to the DOM.
+ *
+ * There are two implementations. The direct host below runs the decoder on the
+ * main thread against a real Guacamole.Display, which is what this file did
+ * before it was hosted at all. The worker host in H264Worker.js runs it on a
+ * worker, where there is no display to measure, no document to create a canvas
+ * from, no localStorage to read an override out of, and no layer to paint --
+ * and where the whole point is that `copyTo()` no longer blocks the thread
+ * that dispatches input.
+ *
+ * @typedef {Object} Guacamole.H264Decoder.Host
+ *
+ * @property {!function(): number} getWidth
+ *     The framebuffer's current width, or 0 where it is not known. The combine
+ *     gate's area threshold and the settle clock both read it, so a host that
+ *     cannot answer leaves those to their defaults rather than guessing.
+ *
+ * @property {!function(): number} getHeight
+ *     The framebuffer's current height, on the same terms.
+ *
+ * @property {!function(number, number): !Object} createCanvas
+ *     A drawable of the given size: an HTMLCanvasElement on the main thread,
+ *     an OffscreenCanvas in a worker. Both answer getContext('2d') and both
+ *     are valid sources for drawImage(), which is all this file asks of them.
+ *
+ * @property {!function(string): *} override
+ *     A runtime override by name, or undefined if unset.
+ *
+ * @property {!function(!Object, !Object): (Object|boolean)} paintFrame
+ *     Paints a finished picture, or hands it somewhere that will. Returns the
+ *     canvas the picture landed on where the probes can read it back, true
+ *     where it was painted somewhere unreadable, and false where it was not
+ *     painted at all.
+ *
+ * @property {!boolean} autoDraw
+ *     Whether the decoder should finish each frame itself, as soon as it is
+ *     ready, rather than waiting for a caller to call drawDecoded() in display
+ *     order. True only where the host has no display queue of its own.
+ */
+
+/**
+ * The host for a decoder running on the main thread, beside the display it
+ * draws to.
+ *
+ * @param {Guacamole.Display} display
+ *     The display whose layers this decoder paints, or null.
+ *
+ * @returns {!Guacamole.H264Decoder.Host}
+ */
+Guacamole.H264Decoder.directHost = function directHost(display) {
+
+    /**
+     * Overrides already read from the query string or localStorage, by name.
+     * Neither source can change without a reload, so each is read once.
+     *
+     * @private
+     * @type {!Object.<string, *>}
+     */
+    var storedOverrides = {};
+
+    return {
+
+        autoDraw : false,
+
+        getWidth : function () {
+            return display ? display.getWidth() : 0;
+        },
+
+        getHeight : function () {
+            return display ? display.getHeight() : 0;
+        },
+
+        createCanvas : function (width, height) {
+            var canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            return canvas;
+        },
+
+        /**
+         * Reads a runtime override, from a window global, a query parameter,
+         * or localStorage, in that order. The last two exist because the
+         * devices where these paths behave differently -- phones and tablets
+         * -- are the ones with no console to set a global from.
+         */
+        override : function (name) {
+
+            if (typeof window === 'undefined')
+                return undefined;
+
+            if (window['__' + name] !== undefined)
+                return window['__' + name];
+
+            /* The window global above is a property read and is checked every
+             * time, so setting one still takes effect mid-session -- which is
+             * the point of these, since one build is meant to compare 4:2:0,
+             * combined and combined-plus-filtered without a reload.
+             *
+             * The query string and localStorage cannot change without a
+             * reload, and reading them is not free: URLSearchParams parses the
+             * whole query on construction and localStorage is a synchronous,
+             * disk-backed read. On the combine path this ran twice per picture
+             * -- 60 times a second on the main thread -- for a value that was
+             * fixed before the first frame arrived. */
+            if (name in storedOverrides)
+                return storedOverrides[name];
+
+            /* The query string is read, but on a live session it cannot be
+             * reached: client.html builds `/client/{id}?name=...` itself on
+             * every launch and relaunch and drops anything added by hand, so a
+             * pasted parameter lasts until the first reconnect and no longer.
+             * It is the usable form only on the recording player, whose URL
+             * nothing rewrites. localStorage is what survives a live session;
+             * a window global takes effect immediately but does not outlive
+             * the page. Operator-facing messages in this file should say so
+             * rather than naming a query parameter. */
+            var value = null;
+
+            try {
+                value = new URLSearchParams(window.location.search).get(name);
+                if (value === null && window.localStorage)
+                    value = window.localStorage.getItem(name);
+            } catch (e) {
+                /* Storage can be blocked outright; the global still works. */
+            }
+
+            if (value === null || value === undefined)
+                return (storedOverrides[name] = undefined);
+
+            return (storedOverrides[name]
+                    = Guacamole.H264Decoder.parseOverride(value));
+
+        },
+
+        /**
+         * Draws the picture into its layer, here and now.
+         */
+        paintFrame : function (frameState, snapshot) {
+
+            if (!frameState.layer)
+                return false;
+
+            var layerCanvas = frameState.layer.getCanvas();
+            var ctx = layerCanvas.getContext('2d');
+
+            /* Draw only the regions the server marked valid. The decoded
+             * picture spans the whole surface, so blitting all of it would
+             * overwrite areas delivered via other codecs on a server that
+             * mixes them within a frame. */
+            if (frameState.rects) {
+                for (var r = 0; r < frameState.rects.length; r++) {
+                    var rect = frameState.rects[r];
+                    ctx.drawImage(snapshot,
+                            rect.x, rect.y, rect.width, rect.height,
+                            rect.x, rect.y, rect.width, rect.height);
+                }
+            }
+
+            /* No regions given: the entire picture is valid */
+            else
+                ctx.drawImage(snapshot, frameState.x, frameState.y);
+
+            return layerCanvas;
+
+        }
+
+    };
+
+};
+
+/**
+ * Turns an override's string form into the value the decoder reads. Shared,
+ * because a worker is handed the same strings the main thread read and has to
+ * arrive at the same values.
+ *
+ * @param {!string} value
+ * @returns {*}
+ */
+Guacamole.H264Decoder.parseOverride = function parseOverride(value) {
+
+    /* '0' is deliberately not in that list: it is a valid threshold for
+     * h264ChromaFilter, and an override that takes a number has to be able to
+     * take zero. It still switches a boolean override off, since callers
+     * coerce, and 0 is falsy. */
+    if (value === 'off' || value === 'false')
+        return false;
+    if (value === 'on' || value === 'true')
+        return true;
+
+    var number = parseFloat(value);
+    return isNaN(number) ? true : number;
+
+};
