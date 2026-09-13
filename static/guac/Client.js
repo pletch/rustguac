@@ -1088,6 +1088,16 @@ Guacamole.Client = function(tunnel) {
      * @private
      * @type {!Object.<string, function>}
      */
+    /**
+     * Whether rustguac has said it is dropping the AVC444 auxiliary view in
+     * transit. Held here as well as on the decoder, since the instruction may
+     * arrive before the decoder is built.
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var h264AuxDropped = false;
+
     var instructionHandlers = {
 
         "ack": function(parameters) {
@@ -1463,6 +1473,27 @@ Guacamole.Client = function(tunnel) {
 
         },
 
+        /* Whether rustguac is removing the AVC444 auxiliary view from the
+         * wire. Not a guacd instruction: rustguac originates it, because the
+         * browser cannot tell a dropped auxiliary view from a host that has
+         * merely gone quiet, and an auxiliary IDR -- which is kept -- switches
+         * 4:4:4 combining on for good. Every main view then pays the
+         * combiner's plane read-back waiting for a picture that has been
+         * removed upstream. */
+        "h264-aux": function(parameters) {
+
+            h264AuxDropped = parseInt(parameters[0]) !== 0;
+
+            /* Remembered either way: the decoder is built at the first h264
+             * instruction, which in practice comes first by seconds, but a
+             * flag applied to a decoder that does not exist is lost silently
+             * and the cost of being wrong here is the whole point of the
+             * instruction. */
+            if (guac_client._h264Decoder)
+                guac_client._h264Decoder.setAuxDropped(h264AuxDropped);
+
+        },
+
         "h264": function(parameters) {
 
             var stream_index = parseInt(parameters[0]);
@@ -1532,6 +1563,7 @@ Guacamole.Client = function(tunnel) {
             // Create or reuse H.264 decoder for this display
             if (!guac_client._h264Decoder) {
                 guac_client._h264Decoder = new Guacamole.H264Decoder(display);
+                guac_client._h264Decoder.setAuxDropped(h264AuxDropped);
             }
 
             // Collect NAL unit data. Guacamole.ArrayBufferReader decodes each

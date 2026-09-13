@@ -4237,6 +4237,7 @@ pub fn session_request_from_entry(
         wol_broadcast_addr: entry.wol_broadcast_addr,
         wol_udp_port: entry.wol_udp_port,
         wol_wait_time: entry.wol_wait_time,
+        h264_drop_aux: entry.h264_drop_aux,
         h264_combine: entry.h264_combine,
         avc444: entry.avc444,
     })
@@ -7648,6 +7649,7 @@ pub async fn quick_connect(
         enable_h264: None,
         avc444: None,
         h264_combine: None,
+        h264_drop_aux: None,
         container_image: None,
         container_cpu_limit: None,
         container_memory_limit: None,
@@ -7959,6 +7961,7 @@ mod tests {
             wol_broadcast_addr: ab_entry.wol_broadcast_addr,
             wol_udp_port: ab_entry.wol_udp_port,
             wol_wait_time: ab_entry.wol_wait_time,
+            h264_drop_aux: ab_entry.h264_drop_aux,
             h264_combine: ab_entry.h264_combine,
             avc444: ab_entry.avc444,
         };
@@ -8059,6 +8062,7 @@ mod tests {
             wol_broadcast_addr: ab_entry.wol_broadcast_addr,
             wol_udp_port: ab_entry.wol_udp_port,
             wol_wait_time: ab_entry.wol_wait_time,
+            h264_drop_aux: ab_entry.h264_drop_aux,
             h264_combine: ab_entry.h264_combine,
             avc444: ab_entry.avc444,
         };
