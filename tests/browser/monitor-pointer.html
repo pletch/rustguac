@@ -1,0 +1,69 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>pop-out monitor pointer, in a real browser</title>
+<style>
+  body { background:#111; color:#ddd; font:13px/1.6 ui-monospace,monospace; margin:0; padding:12px; }
+  #screen { position:absolute; left:100px; top:80px; width:800px; height:400px;
+            background:#234; display:block; }
+  #out { position:absolute; top:500px; left:12px; white-space:pre; }
+</style>
+
+<div>drag across the blue area &mdash; real PointerEvents, real coalescing</div>
+<canvas id="screen" width="1920" height="1080"></canvas>
+<div id="out">&hellip;</div>
+
+<script src="/guac/Namespace.js"></script>
+<script src="/guac/Event.js"></script>
+<script src="/guac/Position.js"></script>
+<script src="/guac/Mouse.js"></script>
+<script src="/guac/MonitorPointer.js"></script>
+
+<script>
+/*
+ * Guacamole.MonitorPointer against the browser's own PointerEvents, which is
+ * the half tests/monitor-pointer.mjs cannot reach: there the coalesced events
+ * are fakes shaped the way the code expects them, and whether the browser
+ * really merges moves under load -- and what it puts in the list when it does
+ * -- is its business and not something to take on trust from a stub.
+ *
+ * Driven by tests/browser/drive-pointer.mjs.
+ */
+
+const canvas = document.getElementById('screen');
+
+/* The monitor this stands for: a second head, offset in the combined
+ * framebuffer, and a different size from the canvas showing it, so a mapping
+ * that drops a term cannot land on the right answer by luck. */
+const rect = { left: 2560, top: 0, width: 1920, height: 1080 };
+
+const sent = [];
+window.__sent = sent;
+window.__maxCoalesced = 0;
+
+/* Captured ahead of the module's own listener, purely to record what the
+ * browser handed over. */
+canvas.addEventListener('pointermove', function (e) {
+    if (e.getCoalescedEvents)
+        window.__maxCoalesced = Math.max(window.__maxCoalesced,
+                e.getCoalescedEvents().length);
+}, true);
+
+Guacamole.MonitorPointer(canvas, function () { return rect; }, function (state) {
+    sent.push({
+        x : Math.round(state.x), y : Math.round(state.y),
+        left : state.left, middle : state.middle, right : state.right,
+        up : state.up, down : state.down
+    });
+    document.getElementById('out').textContent =
+            sent.length + ' sent, max coalesced ' + window.__maxCoalesced + '\n'
+            + sent.slice(-6).map(function (s) { return JSON.stringify(s); }).join('\n');
+});
+
+/* Something expensive on the main thread, so moves arriving while it runs are
+ * merged rather than delivered. Without this there is nothing to recover and
+ * the run proves nothing. */
+window.__block = function (ms) {
+    var until = performance.now() + ms;
+    while (performance.now() < until) { /* deliberately */ }
+};
+</script>

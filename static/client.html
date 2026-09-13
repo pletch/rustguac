@@ -186,6 +186,7 @@
     <script src="/guac/KeyEventInterpreter.js"></script>
     <script src="/guac/Layer.js"></script>
     <script src="/guac/Mouse.js"></script>
+    <script src="/guac/MonitorPointer.js"></script>
     <script src="/guac/Parser.js"></script>
     <script src="/guac/Position.js"></script>
     <script src="/guac/Status.js"></script>
@@ -1126,58 +1127,18 @@
                     }, 500);
                 });
 
-                // Mouse: map the pointer from popup-window pixels to this
-                // monitor's native pixels using the canvas's LIVE on-screen
-                // geometry (getBoundingClientRect), then offset into the combined
-                // framebuffer. Reading the live rect each event avoids any stale
-                // cached scale/offset. Sent raw; guacd maps the combined
-                // coordinate back to this head.
-                // Native pointer handling (bypasses Guacamole.Mouse, which does
-                // not track the X axis correctly in a popup window). Map the raw
-                // client coordinate into the canvas's live on-screen rect as a
-                // 0..1 fraction, then into this monitor's native pixels and the
-                // combined framebuffer. Fraction-based, so it self-recalibrates
-                // on any resize.
-                function popupPointer(ev) {
-                    var rect = monitorLayout[index];
-                    if (!rect) return;
-                    var cr = canvas.getBoundingClientRect();
-                    var fx = cr.width > 0 ? (ev.clientX - cr.left) / cr.width : 0;
-                    var fy = cr.height > 0 ? (ev.clientY - cr.top) / cr.height : 0;
-                    if (fx < 0) fx = 0; else if (fx > 1) fx = 1;
-                    if (fy < 0) fy = 0; else if (fy > 1) fy = 1;
-                    client.sendMouseState(new Guacamole.Mouse.State({
-                        x: rect.left + fx * rect.width,
-                        y: rect.top + fy * rect.height,
-                        left:   (ev.buttons & 1) !== 0,
-                        middle: (ev.buttons & 4) !== 0,
-                        right:  (ev.buttons & 2) !== 0,
-                        up: false, down: false
-                    }), false);
-                    ev.preventDefault();
-                }
-                canvas.addEventListener('mousedown', popupPointer);
-                canvas.addEventListener('mousemove', popupPointer);
-                canvas.addEventListener('mouseup', popupPointer);
-                canvas.addEventListener('contextmenu', function(ev) { ev.preventDefault(); });
-                // Scroll wheel -> momentary up/down button.
-                canvas.addEventListener('wheel', function(ev) {
-                    var rect = monitorLayout[index];
-                    if (!rect) return;
-                    var cr = canvas.getBoundingClientRect();
-                    var fx = cr.width > 0 ? (ev.clientX - cr.left) / cr.width : 0;
-                    var fy = cr.height > 0 ? (ev.clientY - cr.top) / cr.height : 0;
-                    if (fx < 0) fx = 0; else if (fx > 1) fx = 1;
-                    if (fy < 0) fy = 0; else if (fy > 1) fy = 1;
-                    var base = { x: rect.left + fx * rect.width, y: rect.top + fy * rect.height,
-                                 left: false, middle: false, right: false, up: false, down: false };
-                    var dir = ev.deltaY < 0 ? 'up' : 'down';
-                    base[dir] = true;
-                    client.sendMouseState(new Guacamole.Mouse.State(base), false);
-                    base[dir] = false;
-                    client.sendMouseState(new Guacamole.Mouse.State(base), false);
-                    ev.preventDefault();
-                }, { passive: false });
+                // Pointer, wheel and context menu. Guacamole.Mouse is not
+                // used here -- it does not track the X axis correctly in a
+                // popup -- so the mapping, the repeat suppression and the
+                // coalesced replay live in Guacamole.MonitorPointer, where a
+                // test can reach them. The rect is read per event rather than
+                // captured, because the layout changes under a running window.
+                Guacamole.MonitorPointer(canvas,
+                    function () { return monitorLayout[index]; },
+                    function (state) {
+                        client.sendMouseState(new Guacamole.Mouse.State(state),
+                                false);
+                    });
 
                 // Keyboard: forward to the same client (combined session).
                 var keyboard = new Guacamole.Keyboard(win.document);
