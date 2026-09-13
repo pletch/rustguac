@@ -4221,12 +4221,22 @@ Guacamole.H264Decoder.workerConfig = null;
  * Builds a decoder for the given display, on a worker where the page has
  * offered one and the browser can host it, and on this thread otherwise.
  *
- * Off unless asked for, by `h264Worker` as a window global, a query parameter
- * or a localStorage key. The worker path is the better place for the decode
- * and the combine to live -- it is the only way to stop `copyTo()` blocking
- * the thread that dispatches input -- but it is new, and the thing it changes
- * is the one the sync gate paces the server from. It earns the default by
- * being measured against the local path, not by being the newer of the two.
+ * Off unless asked for, and on a live session the way to ask is
+ * `localStorage.setItem('h264Worker', 'on')` followed by a relaunch. A query
+ * parameter is read and cannot be reached: client.html builds its own URL on
+ * every launch and relaunch and drops anything added to it by hand, so one
+ * pasted in lasts until the first reconnect and no longer -- which is the
+ * whole session, since the decoder is built once and this is read once with
+ * it. A window global works for the current page and does not outlive it,
+ * which is the same problem. The query parameter is usable only where nothing
+ * rewrites the URL: the recording player, and the replay harness under
+ * tests/browser.
+ *
+ * The worker path is the better place for the decode and the combine to live
+ * -- it is the only way to stop `copyTo()` blocking the thread that dispatches
+ * input -- but it is new, and the thing it changes is the one the sync gate
+ * paces the server from. It earns the default by being measured against the
+ * local path, not by being the newer of the two.
  *
  * @param {!Guacamole.Display} display
  * @returns {!Object} A decoder, hosted either way.
