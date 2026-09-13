@@ -4230,6 +4230,8 @@ Guacamole.H264Decoder.create = function create(display) {
             var proxy = new Guacamole.H264DecoderProxy(display,
                     config.scripts, config.workerUrl);
             console.log('[rustguac] H.264: decoding on a worker');
+            if (Guacamole.MainThreadLoad)
+                Guacamole.MainThreadLoad.setMode('worker');
             return proxy;
         } catch (e) {
             /* A worker that cannot be started is not a reason to lose H.264;
@@ -4240,6 +4242,9 @@ Guacamole.H264Decoder.create = function create(display) {
         }
 
     }
+
+    if (Guacamole.MainThreadLoad)
+        Guacamole.MainThreadLoad.setMode('main');
 
     return new Guacamole.H264Decoder(display);
 

@@ -1039,7 +1039,24 @@ Guacamole.Display = function() {
         var token = null;
 
         var task = scheduleTask(function __display_draw_h264() {
-            decoder.drawDecoded(token);
+
+            /* The one call site both decoder hosts share, so it is where the
+             * main thread's share of a picture is measured -- the whole paint
+             * in the local mode, one blit of an already-finished bitmap in the
+             * worker mode. A property read per picture while nothing is
+             * asking. */
+            if (!Guacamole.MainThreadLoad || !Guacamole.MainThreadLoad.active) {
+                decoder.drawDecoded(token);
+                return;
+            }
+
+            var startedAt = performance.now();
+            try {
+                decoder.drawDecoded(token);
+            } finally {
+                Guacamole.MainThreadLoad.noteDraw(performance.now() - startedAt);
+            }
+
         }, true);
 
         /* Unblocking runs the display queue synchronously, and the decoder may

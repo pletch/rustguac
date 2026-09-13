@@ -164,9 +164,35 @@ Guacamole.Client = function(tunnel) {
 
     function setState(state) {
         if (state != currentState) {
+
             currentState = state;
+
+            /* A decoder outlives nothing: it holds a VideoDecoder, the
+             * hardware surfaces behind it and, where it is hosted on one, a
+             * worker. Reaching DISCONNECTED by any route -- this client's own
+             * disconnect(), or the tunnel closing under it -- is the end of
+             * every one of those.
+             *
+             * It has never been released before because client.html rebuilds
+             * its URL and reloads the page on every launch and relaunch, so
+             * the page always died first. A worker makes that a real leak
+             * rather than a theoretical one, and a page that ever reconnects
+             * in place would accumulate them. */
+            if (state == Guacamole.Client.State.DISCONNECTED
+                    && guac_client._h264Decoder) {
+                try {
+                    guac_client._h264Decoder.destroy();
+                } catch (e) {
+                    if (typeof console !== 'undefined')
+                        console.warn('[rustguac] H.264: decoder teardown'
+                                + ' failed:', e && e.message ? e.message : e);
+                }
+                guac_client._h264Decoder = null;
+            }
+
             if (guac_client.onstatechange)
                 guac_client.onstatechange(currentState);
+
         }
     }
 

@@ -209,6 +209,7 @@
     <script src="/guac/Yuv444.js"></script>
     <script src="/guac/H264Decoder.js"></script>
     <script src="/guac/H264DecoderProxy.js"></script>
+    <script src="/guac/MainThreadLoad.js"></script>
     <!-- The worker's own URL, here rather than in the script that starts it,
          because the startup pass that content-hashes assets rewrites href and
          src attributes in this file and nothing else. A worker started at the
@@ -700,6 +701,15 @@
 
             var displayEl = document.getElementById('display');
             displayEl.appendChild(client.getDisplay().getElement());
+
+            /* Measuring the thread the decoder may have been moved off. Does
+             * nothing unless h264MainThreadLog or h264CombineLog asks for it,
+             * and watches input passively -- Guacamole.Mouse keeps its own
+             * listeners and its own behaviour. */
+            if (window.Guacamole && Guacamole.MainThreadLoad) {
+                Guacamole.MainThreadLoad.start();
+                Guacamole.MainThreadLoad.watchInput(displayEl);
+            }
 
             // ── Resume AudioContext on user interaction (browser autoplay policy) ──
             function resumeAudio() {
