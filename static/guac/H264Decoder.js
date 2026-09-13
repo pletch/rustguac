@@ -1535,6 +1535,32 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     var combining = false;
 
+    /**
+     * Whether rustguac has said it is removing the AVC444 auxiliary view from
+     * the wire, so no picture the combiner is holding a main view for will
+     * ever arrive.
+     *
+     * The server is asked because the browser cannot tell. Combining is
+     * switched on by an auxiliary view and off by nothing in particular, and
+     * the auxiliary IDRs are deliberately kept -- so one of those arms it and
+     * every main view afterwards pays a plane read-back, six texture uploads
+     * and a shader pass to produce the ordinary 4:2:0 picture drawImage()
+     * would have produced almost free. Measured on a Windows session with the
+     * drop active: 163 pictures in 10s at 19.0ms of copying each, 31% of the
+     * main thread, until the copy gate gave up 4:4:4 for a reason that was
+     * true and beside the point.
+     *
+     * Inferring it from a quiet stretch was the alternative and is guessing:
+     * Windows sends chroma in about one picture in eight and the xrdp fork's
+     * CHROMA_INTERVAL sends it rarer still, so a silence long enough to be
+     * evidence has already cost the session, and each wrong guess costs a
+     * whole-plane resync on the way back.
+     *
+     * @private
+     * @type {!boolean}
+     */
+    var auxDropped = false;
+
 
     /**
      * Whether the picture currently being combined had to upload whole planes
@@ -2419,6 +2445,19 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * @returns {!boolean}
      */
     function chroma444Enabled() {
+
+        /* Ahead of the override, which everything else here defers to. The
+         * override exists so a session can be compared against the other
+         * setting, and there is nothing to compare: the auxiliary view has
+         * been removed from the wire, so combining cannot produce 4:4:4 from
+         * what arrives, only the cost of trying. The lever that answers this
+         * question is the connection entry's own drop setting, one level up. */
+        if (auxDropped)
+            return false;
+
+        /* An explicit override always wins: it is how a session is compared
+         * against the other setting, and a policy that could not be overridden
+         * would make that comparison impossible. */
         var value = override('h264Chroma444');
         if (value !== undefined)
             return !!value;
@@ -3280,8 +3319,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
                             var declineOverride = override('h264Chroma444');
 
-                            diagnostic('chroma_declined', declineOverride
-                                    !== undefined
+                            diagnostic('chroma_declined', auxDropped
+                                ? 'stopped 4:4:4 combining: the server is '
+                                    + 'dropping the auxiliary view in transit, '
+                                    + 'so no view the combiner holds a main '
+                                    + 'picture for will arrive and every main '
+                                    + 'view would pay the plane read-back for '
+                                    + 'nothing'
+                                : declineOverride !== undefined
                                 ? 'stopped 4:4:4 combining: the h264Chroma444 '
                                     + 'override is off'
                                 : 'stopped 4:4:4 combining: the framebuffer '
@@ -4046,6 +4091,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 + ' queue=' + (decoder && decoder.decodeQueueSize !== undefined
                     ? decoder.decodeQueueSize : '?')
                 + ' combining=' + combining
+                + ' auxDropped=' + auxDropped
                 + ' submitted=' + counts.submitted
                 + ' decoded=' + counts.decoded
                 + ' painted=' + counts.painted
@@ -4070,6 +4116,52 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     this.setProbing = function(on) {
         probesLeft = (on && blackProbesEnabled()) ? PROBES_PER_EPISODE : 0;
         lastProbeAt = 0;
+    };
+
+    /**
+     * Tells the decoder whether the AVC444 auxiliary view is being removed
+     * from the wire between the server and here, which only the server knows.
+     * Carried by rustguac's `h264-aux` instruction.
+     *
+     * Combining stops at the next main view, through the same re-check that
+     * handles a framebuffer growing past its threshold -- never between a
+     * paired main view and the auxiliary view that paints it, which would
+     * throw that picture away. It restarts of its own accord at the next
+     * auxiliary view once the drop stops, since that is the only thing that
+     * ever starts it.
+     *
+     * @param {!boolean} dropped
+     */
+    this.setAuxDropped = function(dropped) {
+
+        dropped = !!dropped;
+        if (dropped === auxDropped)
+            return;
+
+        auxDropped = dropped;
+
+        /* Resuming: whatever the textures hold predates the gap, so the first
+         * combine back must upload whole planes. Set here rather than where
+         * combining restarts, which cannot tell this apart from an ordinary
+         * first auxiliary view. */
+        if (!dropped)
+            resyncNeeded = true;
+
+        /* Said on the state change, as everything else in this file is. It is
+         * not the same event as chroma_declined, which fires only where
+         * combining was actually running and only at the next main view: the
+         * drop can arm before the first auxiliary view has switched combining
+         * on, and then nothing else would mark the moment the client learned
+         * of it. That timestamp is what the server's own line is read
+         * against. */
+        diagnostic('chroma_aux_dropped', dropped
+            ? 'the server is dropping the AVC444 auxiliary view in transit, '
+                + 'so 4:4:4 combining is off: there is no chroma to recover '
+                + 'and combining would pay the plane read-back per picture '
+                + 'for a view that will never arrive'
+            : 'the server has stopped dropping the AVC444 auxiliary view, so '
+                + '4:4:4 combining may resume at the next one', true);
+
     };
 
     /**

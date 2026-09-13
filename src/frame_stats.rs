@@ -595,7 +595,7 @@ impl Inner {
 ///
 /// `text` always ends on an instruction boundary (see `guacd_to_ws`). If a
 /// malformed element is hit anyway, iteration stops rather than guessing.
-fn instruction_starts(text: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn instruction_starts(text: &str) -> impl Iterator<Item = &str> {
     InstructionStarts { rest: text }
 }
 
@@ -658,6 +658,20 @@ fn split_element(data: &str) -> Option<(&str, &str, u8)> {
 /// The value and remainder of the leading element, discarding the separator.
 fn next_element(data: &str) -> Option<(&str, &str)> {
     split_element(data).map(|(value, rest, _)| (value, rest))
+}
+
+/// The elements of one instruction, in order, stopping at the first malformed
+/// or truncated one.
+///
+/// Shared with `crate::h264_refs`, which reads the same instruction stream for
+/// a different purpose; the wire format has one parser here and nowhere else.
+pub(crate) fn elements(data: &str) -> impl Iterator<Item = &str> {
+    let mut rest = data;
+    std::iter::from_fn(move || {
+        let (value, remainder) = next_element(rest)?;
+        rest = remainder;
+        Some(value)
+    })
 }
 
 /// The element `index` positions along, skipping those before it.

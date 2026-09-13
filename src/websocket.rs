@@ -25,6 +25,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// The instruction rustguac sends the browser when the AVC444 auxiliary view
+/// starts or stops being dropped in transit.
+///
+/// Not a guacd opcode: it originates here, and guacd never sees it. Hyphenated
+/// so it cannot collide with an upstream instruction, and unknown opcodes are
+/// ignored by `Guacamole.Client`, so a cached client from before this existed
+/// carries on as it did. ASCII, so the element length is its byte length.
+const AUX_DROP_OPCODE: &str = "h264-aux";
+
 /// Which side terminated the proxy connection.
 enum ProxyResult {
     /// guacd closed the connection (with optional error).
@@ -227,6 +236,10 @@ async fn handle_ws(
         "Starting proxy"
     );
 
+    // Whether this entry asked for the AVC444 auxiliary view to be dropped.
+    // Read here rather than sent to guacd: the removal happens in guacd_to_ws.
+    let drop_aux = manager.h264_drop_aux(session_id).await;
+
     // Set up recording file (only for owner connections, and only if recording is enabled)
     let is_recording_enabled = manager.is_recording_enabled(session_id).await;
     let recording_path = manager
@@ -296,6 +309,7 @@ async fn handle_ws(
         frame_stats.clone(),
         session_id,
         binary_blobs,
+        drop_aux,
     )
     .await;
     let elapsed = start.elapsed();
@@ -441,6 +455,7 @@ async fn proxy_ws_guacd(
     frame_stats: Arc<crate::frame_stats::FrameStats>,
     session_id: Uuid,
     binary_blobs: bool,
+    drop_aux: Option<bool>,
 ) -> ProxyOutcome {
     let (guacd_read, guacd_write) = tokio::io::split(guacd);
     let (ws_write, ws_read) = ws.split();
@@ -469,6 +484,7 @@ async fn proxy_ws_guacd(
             stats_g,
             session_id,
             binary_blobs,
+            drop_aux,
         )
         .await
     });
@@ -526,6 +542,7 @@ const MAX_GUACD_CARRY: usize = 16 * 1024 * 1024;
 /// of instruction was not ';' nor ','". To prevent that, every Message::Text
 /// we emit ends at a true Guacamole instruction boundary; partial tail data
 /// is held in `carry` until the next read completes it.
+#[allow(clippy::too_many_arguments)]
 async fn guacd_to_ws(
     mut guacd: tokio::io::ReadHalf<GuacdStream>,
     ws: WsSink,
@@ -534,6 +551,7 @@ async fn guacd_to_ws(
     frame_stats: Arc<crate::frame_stats::FrameStats>,
     session_id: Uuid,
     binary_blobs: bool,
+    drop_aux: Option<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 65536];
     let mut carry: Vec<u8> = Vec::new();
@@ -542,13 +560,26 @@ async fn guacd_to_ws(
     // send path below stays the byte-for-byte passthrough it has always been.
     let mut splitter = binary_blobs.then(crate::binary_blob::BlobSplitter::new);
 
-    let mut sps_rewritten = false;
-
     // Gives a host that declares its colour range without describing its
     // colourimetry the shape Chrome's hardware decoder will act on. Costs
     // nothing once the stream's first SPS has been seen and found not to need
     // it, which is every host but Windows. See crate::h264_rewrite.
     let mut sps_rewriter = crate::h264_rewrite::SpsRewriter::new();
+
+    // Removes the AVC444 auxiliary view from streams that prove they can
+    // spare it, which is most of the bandwidth argument for AVC420 without
+    // giving up H.264 on a Windows host. Decides per stream and leaves alone
+    // anything it cannot prove; RUSTGUAC_H264_AUX_DROP=0 turns it off. The
+    // The slice-header analysis it gates on lives inside it, so the stream is
+    // parsed once rather than twice.
+    let mut aux_dropper =
+        crate::h264_aux_drop::AuxDropper::for_session(drop_aux).reporting_as(session_id);
+
+    // What the browser has last been told about the drop. It cannot infer it:
+    // an auxiliary IDR is kept and switches 4:4:4 combining on, after which
+    // every main view pays the combine's plane read-back waiting for a view
+    // that has been removed from the wire. See AuxDropper::dropping.
+    let mut announced_aux_drop = false;
 
     loop {
         let n = guacd.read(&mut buf).await?;
@@ -626,31 +657,68 @@ async fn guacd_to_ws(
             tracing::info!(session_id = %session_id, "H.264 colour: {}", line);
         }
 
-        // Splice a colour description into the SPS where the host left one
-        // out. After the telemetry above, so `H.264 colour:` reports what the
-        // host actually sent rather than what we made of it -- the whole value
-        // of that line is that it describes the wire.
-        let text = match sps_rewriter.rewrite(&text) {
-            Some(rewritten) => {
-                if !sps_rewritten {
-                    sps_rewritten = true;
-                    tracing::info!(
-                        session_id = %session_id,
-                        "H.264 colour: splicing a BT.709 description into the SPS, \
-                         which Chrome's hardware decoder needs before it will act \
-                         on the range the host declared"
-                    );
-                }
-                rewritten
-            }
-            None => text,
+        // The auxiliary view, dropped where the stream has proved that nothing
+        // surviving predicts from it. After the recording tee above, so a
+        // recording keeps the full 4:4:4 stream; before the SPS rewrite below,
+        // which needs to know whether to permit frame_num gaps.
+        let (text, aux_lines) = aux_dropper.process(&text);
+        for line in aux_lines {
+            tracing::info!(session_id = %session_id, "H.264: {}", line);
+        }
+        sps_rewriter.set_allow_frame_num_gaps(aux_dropper.wants_frame_num_gaps());
+
+        // Said only when it changes, which is at most twice a session: once
+        // when the gate arms, and once more if a later slice contradicts the
+        // verdict and the auxiliary view comes back. A client that does not
+        // know the opcode ignores it and behaves as it always did.
+        let aux_drop_notice = {
+            let dropping = aux_dropper.dropping();
+            (dropping != announced_aux_drop).then(|| {
+                announced_aux_drop = dropping;
+                format!(
+                    "{}.{},1.{};",
+                    AUX_DROP_OPCODE.len(),
+                    AUX_DROP_OPCODE,
+                    dropping as u8
+                )
+            })
         };
+
+        // Splice a colour description into the SPS where the host left one
+        // out, and permit frame_num gaps where the auxiliary view is about to
+        // start being dropped. After the telemetry above, so `H.264 colour:`
+        // reports what the host actually sent rather than what we made of it
+        // -- the whole value of that line is that it describes the wire.
+        let text = match sps_rewriter.rewrite(&text) {
+            Some(rewritten) => rewritten,
+            // Cow, because the dropper borrows a chunk it did not have to
+            // change -- which is most of them.
+            None => text.into_owned(),
+        };
+
+        // Which edit was made, rather than that one was. The two are
+        // independent and a stream can need either alone: an xrdp host
+        // describes its colour completely and needs only the gaps flag, and
+        // reporting that as a colour splice sends whoever reads it looking at
+        // the colour of a picture that is fine. Each is said once per session.
+        for edit in sps_rewriter.take_edits() {
+            tracing::info!(session_id = %session_id, "H.264: {}", edit.describe());
+        }
 
         // Recording and telemetry above both saw the text form; only what
         // goes to the browser is rewritten. WebSocket delivers text and binary
         // frames in one order, so a blob lifted out of the run still arrives
         // between the same neighbours it had.
         let mut sink = ws.lock().await;
+
+        // Ahead of the chunk the transition happened in, so the client has
+        // stood the combiner down before the first main view that arrives
+        // without its auxiliary view -- and, on the way back, has been told
+        // the auxiliary view is returning before one does.
+        if let Some(notice) = aux_drop_notice {
+            sink.send(Message::Text(notice.into())).await?;
+        }
+
         match splitter.as_mut() {
             Some(splitter) => {
                 for frame in splitter.split(&text) {
@@ -669,6 +737,10 @@ async fn guacd_to_ws(
             None => sink.send(Message::Text(text.into())).await?,
         }
     }
+
+    // The drop's summary is written by AuxDropper::drop, not here: this line
+    // is reached only when guacd closes first, and a session normally ends the
+    // other way round.
 
     Ok(())
 }
