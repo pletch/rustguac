@@ -1647,6 +1647,42 @@ mod tests {
         assert!(out.ends_with("></script>"));
     }
 
+    /// The worker's URL rides a preload link rather than a script tag, because
+    /// a worker is started from JavaScript and this pass rewrites the HTML.
+    /// If it ever stopped being versioned the failure would be silent and
+    /// slow: the page would start a worker at a stable URL, the browser would
+    /// serve whatever it had cached under it, and a stale decoder would run
+    /// against a fresh page for as long as the cache held.
+    #[test]
+    fn test_version_assets_versions_the_worker_preload() {
+        let static_path = std::path::Path::new("static");
+        let mut hashes = std::collections::HashMap::new();
+        let html = concat!(
+            "<link id=\"h264-worker-src\" rel=\"preload\" as=\"worker\"\n",
+            "      href=\"/guac/H264Worker.js\">",
+        );
+        let out = version_assets(html, static_path, &mut hashes);
+        assert!(out.contains("/guac/H264Worker.js?v="), "{out}");
+    }
+
+    /// And the page really does carry it, spelled the way the client reads it
+    /// back. The tag and the getElementById that finds it are in different
+    /// files and nothing else connects them.
+    #[test]
+    fn test_client_page_offers_the_worker_its_url() {
+        let html = include_str!("../static/client.html");
+        assert!(
+            html.contains("id=\"h264-worker-src\""),
+            "client.html must carry the worker's URL for the page to find"
+        );
+        assert!(html.contains("href=\"/guac/H264Worker.js\""));
+        assert!(
+            std::path::Path::new("static/guac/H264Worker.js").exists(),
+            "the URL must name a file that exists, or the worker never starts"
+        );
+        assert!(html.contains("src=\"/guac/H264DecoderProxy.js\""));
+    }
+
     #[test]
     fn test_version_assets_leaves_everything_else_alone() {
         let static_path = std::path::Path::new("static");

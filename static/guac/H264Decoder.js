@@ -3791,17 +3791,25 @@ Guacamole.H264Decoder = function H264Decoder(display, host) {
              * It returns the layer's canvas where there is one to read back,
              * which is what the probes need and what a worker cannot give
              * them, or false where nothing was painted at all. */
-            var layerCanvas = host.paintFrame(frameState, snapshot);
+            var painted = host.paintFrame(frameState, snapshot);
 
-            if (layerCanvas !== false) {
+            if (painted !== false) {
 
                 counts.painted++;
                 counts.lastPaintAt = nowMs();
                 if (frameState.keyFrame)
                     counts.lastKeyframePaintAt = counts.lastPaintAt;
 
+                /* A canvas rather than a bare true means the picture landed
+                 * somewhere this thread can read back, which is what the
+                 * probes compare against the decoder's own picture. A host
+                 * that painted somewhere else -- the worker, whose layer is on
+                 * the main thread and whose snapshot has just been transferred
+                 * away -- says so by returning true, and is not probed. */
+                var layerCanvas = (painted === true) ? null : painted;
+
                 if (!layerCanvas) {
-                    /* Hosted away from the layer: nothing to read back. */
+                    /* Nothing to read back. */
                 }
 
                 else if (frameState.keyFrame)
