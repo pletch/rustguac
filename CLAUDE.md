@@ -161,6 +161,41 @@ hardware encoding*, and makes Windows send AVC444 — which is handled: both
 views are forwarded and combined in the browser into full 4:4:4 chroma. Full
 details, including verification commands, in `docs/rdp-h264.md`.
 
+**`hardwareAcceleration: 'prefer-hardware'` reads as a hint and is not one.**
+Chrome reports a configuration carrying it as unsupported outright where no
+hardware decoder exists, rather than falling back, and it fails *after*
+configure() returns -- through the error callback. So a client without one lost
+H.264 altogether and lost it in the worst shape available: the decoder closed,
+every frame was then held for a keyframe that cured nothing, and since guacd
+suppresses ordinary image operations for a layer carrying H.264, the result was
+a permanently black screen rather than a degraded picture.
+
+`ensureDecoder()` asks once and, if refused, builds again without asking, then
+says so as `decoder_software_fallback` -- a session quietly decoding in
+software is the difference between the cost this feature avoids and the cost it
+was built around, and is worth knowing about rather than discovering as
+slowness. Dropping the hint unconditionally is the smaller change and the wrong
+one: it hands the choice to the browser on every client, including the ones
+this path exists for.
+
+Measured on Chrome 153 against an Intel UHD 770 with no VA-API decode exposed:
+`isConfigSupported()` answers supported for the same codec with no hint and
+with `'prefer-software'`, and not supported with `'prefer-hardware'`. Confirmed
+in the field the same day against a real Windows host -- the fallback fired and
+the session ran normally where it would previously have gone black.
+
+**Not exotic, and not only Linux.** Any client whose driver is blocklisted, any
+VM, any browser with acceleration switched off. Worth knowing separately that
+Chrome on Linux may expose *no* decode profiles at all while `chrome://gpu`
+still says "Video Decode: Hardware accelerated" -- that line means only that
+the feature is not blocklisted. The table that answers the question is "Video
+Acceleration Information", which is `gpu.videoDecoding` over CDP, and it was
+empty on that box under every flag combination tried
+(`VaapiVideoDecodeLinuxGL`, `AcceleratedVideoDecodeLinuxGL`,
+`--disable-gpu-sandbox`, `--ignore-gpu-blocklist`) while `vainfo` listed
+`VAProfileH264High : VAEntrypointVLD` from the shell. A Linux Chrome is
+therefore not a machine to measure any of this on.
+
 **Colour range: the samples are full range, and the signalling may not
 survive the browser.** [MS-RDPEGFX Color
 Conversion](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/954d7546-6873-4466-95c8-20a7569c43e5)
