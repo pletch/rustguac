@@ -723,6 +723,71 @@ AVC420, since every row is fed the same pre-decoded frames and none of them
 models the second decode that is not performed, nor the bytes that are not
 sent -- 13% of the payload on a Windows host and 43% on the xrdp fork.
 
+#### Decoding on a worker does not pay, and the reason is one number
+
+Built, measured against a real Windows client and host, and **not merged**. It
+lives on `feature/h264-worker` as research. The finding is worth more than the
+code, because it is not what anyone would guess and it is what stops this being
+rebuilt.
+
+**`VideoFrame.copyTo()` is about 2.7x slower on a worker thread.** Matched copy
+for copy by area, same machine, same host, same session type, while combining:
+
+| copied | worker | main |
+|---|---|---|
+| 0.50MP chroma | 31.5ms | 12.3ms |
+| 0.51MP luma | 34.8ms | 11.7ms |
+| 0.78MP chroma | 36.6ms | 11.7ms |
+| overall | 54.6 ms/MP | 19.9 ms/MP |
+
+Everything else followed from that. In an A/B driving the same scripted pointer
+path -- the same 7200 events on the same clock, 66s each -- the worker took
+`h264 output` from **13.3% of the main thread to zero**, and in exchange
+**abandoned 4:4:4 after about 17 seconds while the main-thread arm sustained it
+for the full minute**. Per sync in 4:4:4, where the two are directly
+comparable, the worker flushed at **57.0ms with 15 slow of 127 syncs against
+18.5ms and 1 slow of 540**.
+
+**Only the input workload was controlled, and that is not the same as the two
+arms doing the same work.** Once the worker's gate tripped it spent the
+remaining three quarters of the run painting 4:2:0, so any figure averaged over
+the whole window is diluted for one arm and not the other. Two that were
+quoted here at first did not survive the check: equal pictures per second (8.9
+against 9.2) is equal *delivery*, not equal work, since most of the worker's
+pictures were the cheap kind; and 4:4:4 "1.7 syncs/s against 4.7" divides each
+count by the whole window rather than by the time spent combining -- corrected,
+it is roughly 7.5 against 8.2, which is parity. The throughput claim was an
+artifact of that arithmetic. What stands is per-copy and per-sync-in-mode,
+where dilution cannot reach: the 2.7x copy, the 3x flush, and the abandonment
+itself.
+
+**And nothing was being protected.** Both arms recorded `blocked 0ms`, zero
+slow input events, and delivered all 7200 scheduled pointer moves on time. The
+main thread at 13.3% occupancy was not in trouble, so the whole benefit was
+theoretical while the cost was not.
+
+The architecture was sound and that is not where it failed. The handover is
+free: `h264 draw` measured 35ms on the worker against 42ms on the main thread
+across 66 seconds, so transferring an `ImageBitmap` per picture costs nothing
+on receipt. Stream order held, the `012` pacing loop behaved across the
+boundary, and no frame was ever stranded. It fails on one platform fact.
+
+**An earlier, uncontrolled comparison read 52-58% of the main thread and 563
+slow input events**, which looks like a much stronger case for the worker and
+was the reason it survived as long as it did. That workload was heavier
+(whole-plane copies rather than ~10% banded), and at that load the main thread
+is genuinely under threat -- but the 2.7x copy penalty applies there too, so
+the worker saturates sooner. The direction does not reverse with load. What
+that comparison mostly demonstrated is that **an uncontrolled A/B is worse than
+none**, because it produces a plausible answer: the arms were carrying
+different work and nothing in the output said so.
+
+**What would change the verdict** is the same thing tracked in the AVC444
+section above: [w3c/webcodecs#37](https://github.com/w3c/webcodecs/issues/37)
+yielding decoded planes as GPU textures. That removes the read-back entirely,
+and with it the only reason the worker loses. Until then, moving the decoder
+off the main thread moves the cost and multiplies it.
+
 #### Dropping the auxiliary view in transit
 
 `src/h264_aux_drop.rs` removes AVC444's second picture from the wire between
@@ -807,8 +872,8 @@ that thread it does -- filtering, super resolution, compositing all want zero
 copy YUV in a shader and do not care that sampling converts. **AVC444 packed
 chroma is the counterexample**, and this project has the measurements: a frame
 that is provably not an image, where the conversion is not a cost but a
-corruption, and where the readback it forces costs ~6.5ms per megapixel plus a
-5-10ms stall per call. That is the argument to bring, and it is a reply to an
+corruption, and where the readback it forces costs 10ms plus 5ms per megapixel
+per call. That is the argument to bring, and it is a reply to an
 open question rather than a fresh request.
 
 **The hard obstacle is architectural rather than political.** From the same

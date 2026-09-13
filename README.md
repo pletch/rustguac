@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/sol1/rustguac)](LICENSE)
 [![Docker](https://img.shields.io/docker/pulls/sol1/rustguac)](https://hub.docker.com/r/sol1/rustguac)
 
-> **Fork notice** — This is a personal fork of [sol1/rustguac](https://github.com/sol1/rustguac) maintained by [@pletch](https://github.com/pletch), with additional fixes and features layered on top of upstream **v1.9.10** (see [Fork changes](#fork-changes)). Badges and install instructions below still point at the upstream project; for canonical releases and commercial support, use the upstream repository.
+> **Fork notice** — This is a personal fork of [sol1/rustguac](https://github.com/sol1/rustguac) maintained by [@pletch](https://github.com/pletch), with additional fixes and features layered on top of upstream **v1.10.0** (see [Fork changes](#fork-changes)). Badges and install instructions below still point at the upstream project; for canonical releases and commercial support, use the upstream repository.
 
 A lightweight Rust replacement for the Apache Guacamole Java webapp. Browser-based SSH, RDP, VNC, SPICE, Proxmox VE consoles, web browsing, and VDI desktop containers through [guacd](https://github.com/apache/guacamole-server).
 
@@ -13,74 +13,40 @@ No Java. No Tomcat. Single binary + guacd.
 
 ## Fork changes
 
-This fork layers the following on top of upstream **v1.9.10**. Everything here
+This fork layers the following on top of upstream **v1.10.0**. Everything here
 is in `main-fork`; the guacd-side changes live in `patches/` and are applied by
 the build scripts.
 
 ### RDP H.264 passthrough
 
-Upstream ships AVC420-only passthrough. This fork reworks it substantially.
+Upstream now carries the passthrough base, AVC444 included — it started here
+and was merged for v1.10.0 (see [Merged upstream](#merged-upstream)). What
+remains below is what has been built on top of it since: the wire-side colour
+repair, the per-entry codec offer, dropping the auxiliary view in transit, and
+the measurement work that made the browser-side combine affordable.
 
-- **AVC444 support** (`patches/004-h264-passthrough.patch`) — guacd forwards
-  both views of an AVC444 picture rather than dropping the auxiliary one, so
-  Windows hosts can use **hardware** H.264 encoding, which requires
-  `AVC444ModePreferred=1`. Upstream forces `GfxAVC444` off to sidestep the
-  colour corruption this used to cause. What is drawn is the browser's
-  decision: the two views are combined into full 4:4:4 chroma, or the main view
-  is painted alone at 4:2:0 when the combine gate declines (see
-  [`docs/rdp-h264.md`](docs/rdp-h264.md)).
-- **4:4:4 chroma reconstruction** — the auxiliary view of an AVC444 picture is
-  not an image: its planes carry the chroma samples the main view's 4:2:0
-  subsampling discarded, packed by position. A WebGL2 shader
-  (`static/guac/Yuv444.js`) unpacks both MS-RDPEGFX chroma layouts and converts
-  to RGB in a single pass, and inverts the encoder's chroma filter to recover
-  the one sample per 2x2 block that neither view carries. This matters most for
-  text, since ClearType antialiases glyphs with per-pixel colour fringes —
-  precisely what 4:2:0 averages away. Frames are copied in whatever pixel
-  format the decoder produced, as hardware decoders generally give NV12 and
-  software ones I420. Falls back to 4:2:0 on its own where WebGL2 is missing,
-  the GL context is lost, or the frame carries no readable planes.
-- **Ordered drawing** — the `h264` instruction gains a `<view>` field,
-  trailing region rects and a trailing `<paired>` flag, and frames are painted
-  through the display's task queue (`Display.drawH264`) rather than straight
-  from the decoder's output callback. Upstream draws on completion, so on a
-  server mixing H.264 with other codecs a late frame repaints stale video over
-  newer content.
-- **Frame lifetime** — ordered drawing defers the paint, so a decoded frame is
-  released before its draw task runs: snapshotted to a canvas on the 4:2:0
-  path, or with its planes copied out on the combine path. Holding a
-  `VideoFrame` across a promise exhausts the hardware decoder's output-surface
-  pool as soon as the display queue falls behind, which shows up as brief video
-  freezes. (Upstream draws straight from the output callback, so it has no
-  frame to hold open — and no frame ordering either.)
-- **Recovery from a terminal decode error** — the decoder is rebuilt and frames
-  held until the next keyframe. Upstream decrements its counter and logs, but
-  the `VideoDecoder` is closed by then and `decode()` returns early forever
-  after, so the session stays blank until the user reconnects.
-- **Decode pipeline depth** — upstream's sync gate waits for `pendingDecodes`
-  to reach zero, serializing network RTT against decode time on every frame.
-  This fork allows a bounded depth of 2 so the two overlap, with a 200ms
-  safety timeout and a rate-limited warning, since logging from a struggling
-  decoder makes the latency it reports worse.
 - **Codec configuration** — the decoder takes its codec string from the
   stream's own sequence parameter set where there is one, falling back to
-  `avc1.640034` (High, 5.2), with `hardwareAcceleration: 'prefer-hardware'`.
-  Upstream declares `avc1.42001f` (Baseline, 3.1). **The level is not
-  advisory**: Chrome sizes its hardware decoder from it and a stream whose
-  frames exceed it falls back to software *silently*, because
-  `hardwareAcceleration` is a preference rather than a requirement. Level 4.1
-  permits 8192 macroblocks, which holds for 1920x944 and fails for 2688x1488 —
-  measured decoding in software at roughly twenty times the latency, and under
-  AVC444 for two pictures per frame.
-- **Survives an RDPGFX reconnect** — the SurfaceCommand and CapsConfirm
-  wrappers are installed once, only for connections with H.264 enabled, and
-  each is guarded on its own callback. They are reinstalled when the channel is
-  re-opened, because FreeRDP restores its own handlers on a reconnect — which
-  xrdp triggers at the login resize, so without this a session delivered one
-  keyframe and then went silent.
-- **Recording playback** — the recordings player loads the H.264 decoder and
-  the 4:4:4 shader, so sessions recorded with passthrough replay as video
-  instead of a black display.
+  `avc1.640034` (High, 5.2); upstream declares a fixed `avc1.640029` (High,
+  4.1). **The level is not advisory**: Chrome sizes its hardware decoder from
+  it and a stream whose frames exceed it falls back to software *silently*.
+  Level 4.1 permits 8192 macroblocks, which holds for 1920x944 and fails for
+  2688x1488 — measured decoding in software at roughly twenty times the
+  latency, and under AVC444 for two pictures per frame.
+- **`hardwareAcceleration: 'prefer-hardware'` reads as a hint and is not one** —
+  Chrome reports a configuration carrying it as unsupported outright where no
+  hardware decoder exists, rather than falling back, and it fails *after*
+  `configure()` returns. So a client without one lost H.264 altogether and lost
+  it in the worst shape available: the decoder closed, every frame was then
+  held for a keyframe that cured nothing, and since guacd suppresses ordinary
+  image operations for a layer carrying H.264, the result was a permanently
+  black screen rather than a degraded picture. The decoder asks once and, if
+  refused, builds again without asking, then reports
+  `decoder_software_fallback` — a session quietly decoding in software is the
+  difference between the cost this feature avoids and the cost it was built
+  around. Dropping the hint unconditionally is the smaller change and the wrong
+  one: it hands the choice to the browser on every client, including the ones
+  this path exists for.
 - **Colour range** (`src/h264_rewrite.rs`, `src/h264_sps.rs`) — MS-RDPEGFX
   defines the ARGB-to-AYUV transform as full-range BT.709 and hosts encode to
   it, but Chrome's *hardware* decoder ignores a `video_full_range_flag` that
@@ -102,8 +68,9 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   reconnect, and the window global is read once per decoder generation rather
   than per frame.
 - **Per-connection AVC444 request** (`patches/013-rdp-avc420-only.patch`) —
-  which H.264 codecs are offered, per entry: **AVC444 + AVC420** (the default;
-  the server chooses), **AVC444 + AVC420, never combined**, or **AVC420
+  which H.264 codecs are offered, per entry: **AVC444 + AVC420** (the server
+  chooses), **AVC444 + AVC420, never combined**, **AVC444 + AVC420, chroma
+  dropped in transit** (the default for new entries; see below), or **AVC420
   only**. Never combined leaves the offer alone and tells the browser to paint
   4:2:0: the second view is still sent and decoded, but each update reaches
   the screen 12-17ms sooner, which suits a target used mainly for typing. AVC444 + AVC420 is required for
@@ -115,12 +82,51 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   are combined is decided per picture in the browser. (An Automatic option
   that dropped AVC444 under Native Resolution was removed: on Windows it lost
   H.264 outright. Entries saved with it are treated as AVC444 + AVC420.)
+- **Dropping the auxiliary view in transit** (`src/h264_aux_drop.rs`,
+  `src/h264_refs.rs`) — removes AVC444's second picture from the wire between
+  rustguac and the browser, where the stream proves it can spare it: **13% of
+  the H.264 payload on a Windows host, 43% on the xrdp fork**, and one decode
+  per picture instead of two. It reaches what nothing else can on a Windows
+  target, where AVC444 is not a quality choice but the price of admission —
+  `AVC444ModePreferred=1` is what puts the host on its *hardware* encoder, so
+  the auxiliary view cannot be declined at the source, while at a
+  `devicePixelRatio` of 2 the colour detail it carries is already below one CSS
+  pixel. Declining the offer loses hardware encoding and on Windows H.264
+  entirely; the combine gate acts only after the bytes have arrived and been
+  decoded.
+
+  Nothing is dropped until the stream has answered two questions, parsed from
+  the first slice header of each access unit without ever decoding. *Does
+  anything surviving predict from a dropped picture?* — a relative reference
+  reordering in a main slice is refused outright, and disjoint long-term
+  indices between the views are what prove the chains separate. *Is there room
+  for the pictures a gap makes the decoder invent?* — H.264 obliges a decoder
+  to fill each hole in `frame_num` with an inferred short-term reference, and a
+  stream whose `max_num_ref_frames` is entirely consumed by long-term ones has
+  nowhere to put it and fails outright. Neither is answerable from the
+  connect-time keyframe burst, so the verdict takes about 2.5s; a stream that
+  never qualifies is passed through untouched and says in the disconnect
+  summary what it was short of. `RUSTGUAC_H264_AUX_DROP=0` is the
+  deployment-wide kill switch.
+
+  The client has to be told, because it cannot tell: auxiliary IDRs are
+  deliberately kept, and one of those arms the combiner for every main view
+  after it — paying a plane read-back and a shader pass per picture to produce
+  the ordinary 4:2:0 result `drawImage()` gives almost free, waiting for a view
+  that has been removed upstream. Measured at 163 pictures in 10s at 19.0ms of
+  copying each, 31% of the main thread. So rustguac sends an `h264-aux`
+  instruction carrying 1 or 0 when the state changes, at most twice a session.
 - **What the combine actually costs** — not the shader, and not the uploads.
   `VideoFrame.copyTo()`'s *synchronous* half — the driver's texture copy and
-  staging map, before the promise exists — is ~6.5ms per megapixel plus a
-  per-call stall, against under 2ms for the uploads, the shader and the blit
-  together. It hid for a long time because the obvious instrument times the
-  promise, which reads 0.0ms: by then the blocking work is done. The
+  staging map, before the promise exists — is **10ms plus 5ms per megapixel**,
+  against under 2ms for the uploads, the shader and the blit together. It hid
+  for a long time because the obvious instrument times the promise, which reads
+  0.0ms: by then the blocking work is done. The fixed part dominates at the
+  sizes banding produces, and was badly underestimated at first: an earlier
+  pair of 2.7ms + 6.5ms/MP came from two samples at 4.93MP and 1.72MP, so its
+  intercept was extrapolated off a short lever arm. The two models agree to
+  0.4ms at 4.93MP and differ threefold at 0.15MP, where eight measured copies
+  averaged 11.8ms against a predicted 3.6ms. The
   ImageBitmap handoff, the shader, software-decode fallback and GPU bandwidth
   were each ruled out with a measurement first (see
   [`docs/rdp-h264.md`](docs/rdp-h264.md)).
@@ -186,13 +192,6 @@ Upstream ships AVC420-only passthrough. This fork reworks it substantially.
   URL, and only `h264Chroma444` and `h264ChromaFilter` are read per picture, so
   they are the two a window global can change mid-session.
 
-Measured with 1080p video playing, guacd session CPU over 30s:
-
-| | decode + re-encode | passthrough |
-|---|---|---|
-| xrdp (AVC420) | ~100% of a core | **2.0%** |
-| Windows 11 (AVC444) | 90.6% of a core | **2.1%** |
-
 ### Transport
 
 - **Binary blobs** (`src/binary_blob.rs`, [`docs/binary-blobs.md`](docs/binary-blobs.md))
@@ -207,8 +206,9 @@ Measured with 1080p video playing, guacd session CPU over 30s:
   defined as text, `.guac` recordings are that same stream on disk, and
   Guacamole's other transport — the HTTP long-polling tunnel, which rustguac
   itself does not serve — could not carry interleaved binary at all. It is
-  worth doing here because sustained multi-megabit H.264 is a workload upstream
-  does not have: it exists only because of this fork's passthrough patch.
+  worth doing because sustained multi-megabit H.264 is a workload the protocol
+  was not shaped around: base64 was a reasonable price for keyframes and
+  clipboard, and is not one for video.
 
   The conversion is in rustguac rather than a guacd patch, because rustguac
   tees the raw guacd stream to disk as the session recording; converting
@@ -264,6 +264,24 @@ Measured with 1080p video playing, guacd session CPU over 30s:
 - **Configurable SSH terminal font size** with a **HiDPI fix** — SSH text no
   longer renders oversized on high-DPI displays (SSH DPI pinned to a 96
   baseline; the client auto-scales).
+
+### Input
+
+- **Mouse moves the browser coalesced away are replayed**
+  (`static/guac/Mouse.js`) — pointer moves arriving while a handler is running
+  are merged into one, so the intermediate positions of a fast drag are
+  discarded rather than delayed and the target sees a straight jump where the
+  user drew a curve. The client recovers them from `getCoalescedEvents()` and
+  sends them in order. Off with `mouseCoalesced` — as `window.__mouseCoalesced`
+  or, to survive a reconnect, the `localStorage` key.
+- **Pop-out monitor pointer mapping** (`static/guac/MonitorPointer.js`) — a
+  pop-out monitor window cannot use `Guacamole.Mouse`, which does not track the
+  X axis correctly in a popup, so it maps the pointer itself: the client
+  coordinate into the canvas's live on-screen rect as a fraction, then into
+  that monitor's pixels and on into the combined framebuffer, re-read on every
+  event so it self-recalibrates on a resize. In its own file because inline in
+  the page a test could only match source text and hope, and a coordinate
+  mapping is exactly the kind that looks right and is off by a term.
 
 ### Connections / sessions
 
@@ -342,9 +360,6 @@ framebuffer back on every painted keyframe, which is the same cost class as the
   the non-obvious Windows requirement that the *"Use WDDM graphics display
   driver for Remote Desktop Connections"* policy be **Disabled** or hardware
   encoding never engages.
-- [`docs/upstream-h264-issue.md`](docs/upstream-h264-issue.md) — draft write-up
-  for upstream: why `GfxAVC444 = FALSE` makes Windows hosts negotiate no H.264
-  at all, and why the server-side decode still runs on every frame.
 - [`docs/xrdp-dpi-scaling.md`](docs/xrdp-dpi-scaling.md) — what an xrdp patch
   would need in order to act on the DPI scale factor it already parses,
   validates and then discards.
@@ -366,11 +381,23 @@ framebuffer back on every painted keyframe, which is the same cost class as the
   `h264CombineLog`'s `copy` and `issue` stages for that.
 
   `tests/h264-copy-band.mjs`, `tests/h264-instruction-format.mjs`,
-  `tests/h264-vui-range.mjs` and `tests/binary-blob-format.mjs` pin formats and
+  `tests/h264-vui-range.mjs`, `tests/h264-aux-instruction.mjs`,
+  `tests/h264-hardware-fallback.mjs`, `tests/binary-blob-format.mjs`,
+  `tests/mouse-coalesced.mjs` and `tests/monitor-pointer.mjs` pin formats and
   invariants where a disagreement fails silently — the client drops what it
-  cannot parse and video simply stops while both ends look healthy, and a copy
-  band one row short paints a row of the previous picture into the middle of
-  this one, which shows on moving content and on nothing else.
+  cannot parse and video simply stops while both ends look healthy, a wrong
+  opcode is *ignored* rather than refused and leaves the client combining
+  against a view that will never arrive, and a copy band one row short paints a
+  row of the previous picture into the middle of this one, which shows on
+  moving content and on nothing else.
+
+  `tests/aux-drop-replay.mjs` takes a recording, strips its auxiliary views,
+  sets the gaps flag in an implementation deliberately independent of the Rust
+  one, decodes both streams with ffmpeg and compares the main pictures — a
+  mismatch in picture *count* is checked first, since missing pictures also
+  break the positional alignment. The in-crate `aux_drop_over_a_recording`
+  covers the half that cannot see: an `h264` whose blobs never arrive hangs a
+  browser without corrupting anything.
 - `contrib/measure-guacd-cpu.sh`, `contrib/setup-rdp-performance.ps1`.
 
 ### Merged upstream
@@ -378,9 +405,39 @@ framebuffer back on every painted keyframe, which is the same cost class as the
 These started here and now ship in upstream rustguac, so they are no longer
 fork-specific:
 
-- **AVC420-only H.264 passthrough** — worked around AVC444 colour corruption on
-  Windows hosts by disabling AVC444 outright (upstream as of v1.8.1). This fork
-  has since superseded it by handling AVC444 properly, as described above.
+- **H.264 passthrough with AVC444** (upstream as of **v1.10.0**) — the whole
+  base of the feature. guacd forwards both views of an AVC444 picture rather
+  than dropping the auxiliary one, so Windows hosts can use **hardware**
+  encoding, which requires `AVC444ModePreferred=1`; a WebGL2 shader
+  (`static/guac/Yuv444.js`) unpacks the auxiliary view's packed chroma — both
+  MS-RDPEGFX layouts — and combines the two into full 4:4:4 in a single pass,
+  inverting the encoder's chroma filter to recover the one sample per 2x2 block
+  that neither view carries. That matters most for text, since ClearType
+  antialiases glyphs with per-pixel colour fringes, precisely what 4:2:0
+  averages away.
+
+  Merged with it: ordered drawing, so a late frame cannot repaint stale video
+  over newer content on a server mixing codecs (`Display.drawH264`, and a
+  `<view>` field plus trailing region rects on the `h264` instruction); releasing every decoded frame
+  before its deferred draw runs, since holding a `VideoFrame` across a promise
+  exhausts the hardware decoder's output-surface pool; rebuilding the decoder
+  after a terminal decode error and holding frames to the next keyframe, rather
+  than leaving a closed `VideoDecoder` that returns early forever; a bounded
+  decode pipeline depth so network round trip and decode time overlap;
+  reinstalling the RDPGFX wrappers after the channel reconnect xrdp triggers at
+  the login resize; and loading the decoder in the recordings player, so
+  passthrough sessions replay as video rather than a black display.
+
+  Measured with 1080p video playing, guacd session CPU over 30s:
+
+  | | decode + re-encode | passthrough |
+  |---|---|---|
+  | xrdp (AVC420) | ~100% of a core | **2.0%** |
+  | Windows 11 (AVC444) | 90.6% of a core | **2.1%** |
+
+- **AVC420-only H.264 passthrough** — the predecessor of the above, which
+  worked around AVC444 colour corruption on Windows hosts by disabling AVC444
+  outright (upstream as of v1.8.1).
 - **Per-entry RDP desktop appearance** — configurable wallpaper, theming, and
   full-window drag (upstream as of v1.8.1).
 - **TCP_NODELAY** — Nagle's algorithm disabled on rustguac's TCP sockets.
