@@ -108,6 +108,46 @@ t('counts the moves the browser coalesced away', () => {
     assert.ok(line.includes('2 dragging with 1 gaps (max 100ms)'), line);
 });
 
+t('a pause mid-drag is not counted as lost movement', () => {
+    /* The failure this replaces: any gap over the threshold counted, so a hand
+     * that stopped moving read as dropped input. It disagreed with everything
+     * beside it -- 585ms gaps in a window with a main thread blocked for 0ms
+     * and no slow input events at all. */
+    const h = make({ flags: { h264MainThreadLog: true } });
+    const M = h.sandbox.Guacamole.MainThreadLoad;
+    M.start();
+    let handler = null;
+    M.watchInput({ addEventListener: (n, fn) => { if (n === 'pointermove') handler = fn; } });
+
+    handler({ buttons: 1, getCoalescedEvents: () => new Array(1) });
+    h.sandbox.__now = 900;                      /* a long pause */
+    handler({ buttons: 1, getCoalescedEvents: () => new Array(1) });
+
+    h.sandbox.__now = 5000;
+    h.sandbox.__tick();
+    const line = h.logs.find(l => l.includes('main_thread mode='));
+    assert.ok(line.includes('2 dragging with 0 gaps'), line);
+});
+
+t('but movement the browser merged away during a gap does count', () => {
+    const h = make({ flags: { h264MainThreadLog: true } });
+    const M = h.sandbox.Guacamole.MainThreadLoad;
+    M.start();
+    let handler = null;
+    M.watchInput({ addEventListener: (n, fn) => { if (n === 'pointermove') handler = fn; } });
+
+    handler({ buttons: 1, getCoalescedEvents: () => new Array(1) });
+    h.sandbox.__now = 900;
+    /* Same silence, but the browser hands over what it withheld: the pointer
+     * was moving the whole time and those positions were lost. */
+    handler({ buttons: 1, getCoalescedEvents: () => new Array(12) });
+
+    h.sandbox.__now = 5000;
+    h.sandbox.__tick();
+    const line = h.logs.find(l => l.includes('main_thread mode='));
+    assert.ok(line.includes('2 dragging with 1 gaps (max 900ms)'), line);
+});
+
 t('input delay is the wait before the handler ran', () => {
     const h = make({ flags: { h264MainThreadLog: true } });
     h.sandbox.Guacamole.MainThreadLoad.start();

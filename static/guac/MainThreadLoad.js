@@ -74,7 +74,17 @@ Guacamole.MainThreadLoad = (function defineMainThreadLoad() {
 
     /**
      * A pointer move arriving this long after the previous one, while a button
-     * is held, is a gap in a drag. Two frames: one is ordinary jitter.
+     * is held, is a candidate gap in a drag. Two frames: one is ordinary
+     * jitter.
+     *
+     * It is only counted as a gap if the move that ends it carries merged
+     * positions -- see the handler. A gap on its own says nothing: the
+     * commonest cause by far is a hand that stopped moving, and counting those
+     * made the column disagree with everything beside it. Measured on a
+     * Windows client 2026-09-13, the worker path reported six drag gaps up to
+     * 585ms in a window whose main thread was blocked for 0ms and which
+     * recorded no slow input events at all -- three instruments in one line,
+     * two of them right.
      *
      * @private
      * @constant
@@ -361,9 +371,11 @@ Guacamole.MainThreadLoad = (function defineMainThreadLoad() {
 
             element.addEventListener('pointermove', function (e) {
 
+                var merged = e.getCoalescedEvents
+                        ? (e.getCoalescedEvents().length || 1) : 1;
+
                 counters.moves++;
-                counters.coalesced += (e.getCoalescedEvents
-                        ? (e.getCoalescedEvents().length || 1) : 1);
+                counters.coalesced += merged;
 
                 /* Dragging is where the loss is felt, so it is counted apart:
                  * a video degrades gracefully under the same load and a drag
@@ -374,12 +386,21 @@ Guacamole.MainThreadLoad = (function defineMainThreadLoad() {
 
                     var at = now();
                     if (lastMoveAt !== null) {
+
                         var gap = at - lastMoveAt;
-                        if (gap > DRAG_GAP_MS) {
+
+                        /* A gap is only movement that was lost if the pointer
+                         * was moving through it, and the merged positions are
+                         * the proof: the browser has just handed over the
+                         * moves it did not dispatch. One position after a long
+                         * silence is a pointer that was standing still, which
+                         * is not a fault and must not be counted as one. */
+                        if (gap > DRAG_GAP_MS && merged > 1) {
                             counters.dragGaps++;
                             if (gap > counters.dragGapMaxMs)
                                 counters.dragGapMaxMs = gap;
                         }
+
                     }
                     lastMoveAt = at;
 

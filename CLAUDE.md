@@ -714,7 +714,14 @@ sent -- 13% of the payload on a Windows host and 43% on the xrdp fork.
 #### Decoding on a worker does not pay, and the reason is one number
 
 Built, measured against a real Windows client and host, and **not merged**. It
-lives on `feature/h264-worker` as research. The finding is worth more than the
+lives on `feature/h264-worker` as research.
+
+It was attempted because **nothing else can reach the problem it aimed at**:
+there is no worker-side pointer or keyboard event, and the element the
+listeners sit on stays in the document whatever is done with the canvas, so
+input cannot be moved off the main thread and the work has to move instead. A
+blocked main thread does not delay pointer movement, it discards it -- which is
+why this looked worth the trouble. The finding is worth more than the
 code, because it is not what anyone would guess and it is what stops this being
 rebuilt.
 
