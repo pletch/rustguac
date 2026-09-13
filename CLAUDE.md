@@ -728,13 +728,26 @@ for copy by area, same machine, same host, same session type, while combining:
 | 0.78MP chroma | 36.6ms | 11.7ms |
 | overall | 54.6 ms/MP | 19.9 ms/MP |
 
-Everything else followed from that. In a controlled A/B -- the same scripted
-pointer path, the same 7200 events on the same clock, 66s each, 8.9 against
-9.2 pictures a second, so the two arms genuinely carried the same load -- the
-worker took `h264 output` from **13.3% of the main thread to zero**, and in
-exchange 4:4:4 ran at **1.7 syncs/s against 4.7**, flushed at 58.8ms against
-17.5ms with 14 slow flushes against none, and the combine gate gave up 4:4:4
-altogether while the main-thread arm sustained it for the full minute.
+Everything else followed from that. In an A/B driving the same scripted pointer
+path -- the same 7200 events on the same clock, 66s each -- the worker took
+`h264 output` from **13.3% of the main thread to zero**, and in exchange
+**abandoned 4:4:4 after about 17 seconds while the main-thread arm sustained it
+for the full minute**. Per sync in 4:4:4, where the two are directly
+comparable, the worker flushed at **57.0ms with 15 slow of 127 syncs against
+18.5ms and 1 slow of 540**.
+
+**Only the input workload was controlled, and that is not the same as the two
+arms doing the same work.** Once the worker's gate tripped it spent the
+remaining three quarters of the run painting 4:2:0, so any figure averaged over
+the whole window is diluted for one arm and not the other. Two that were
+quoted here at first did not survive the check: equal pictures per second (8.9
+against 9.2) is equal *delivery*, not equal work, since most of the worker's
+pictures were the cheap kind; and 4:4:4 "1.7 syncs/s against 4.7" divides each
+count by the whole window rather than by the time spent combining -- corrected,
+it is roughly 7.5 against 8.2, which is parity. The throughput claim was an
+artifact of that arithmetic. What stands is per-copy and per-sync-in-mode,
+where dilution cannot reach: the 2.7x copy, the 3x flush, and the abandonment
+itself.
 
 **And nothing was being protected.** Both arms recorded `blocked 0ms`, zero
 slow input events, and delivered all 7200 scheduled pointer moves on time. The
