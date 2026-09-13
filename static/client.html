@@ -1138,6 +1138,15 @@
                 // 0..1 fraction, then into this monitor's native pixels and the
                 // combined framebuffer. Fraction-based, so it self-recalibrates
                 // on any resize.
+                // The last state sent, so the same one is not sent twice.
+                // Guacamole.Mouse drops an unchanged position in move(); this
+                // path has no such check and needs one, because the coalesced
+                // replay below delivers the dispatched position and the
+                // mousemove that follows delivers it again. Keyed on the
+                // buttons as well as the position: a press and a release
+                // happen at one place and are not repeats of each other.
+                var lastSent = null;
+
                 function popupPointer(ev) {
                     var rect = monitorLayout[index];
                     if (!rect) return;
@@ -1146,16 +1155,47 @@
                     var fy = cr.height > 0 ? (ev.clientY - cr.top) / cr.height : 0;
                     if (fx < 0) fx = 0; else if (fx > 1) fx = 1;
                     if (fy < 0) fy = 0; else if (fy > 1) fy = 1;
-                    client.sendMouseState(new Guacamole.Mouse.State({
+                    var state = {
                         x: rect.left + fx * rect.width,
                         y: rect.top + fy * rect.height,
                         left:   (ev.buttons & 1) !== 0,
                         middle: (ev.buttons & 4) !== 0,
                         right:  (ev.buttons & 2) !== 0,
                         up: false, down: false
-                    }), false);
-                    ev.preventDefault();
+                    };
+                    var key = state.x + ',' + state.y + ',' + ev.buttons;
+                    if (key !== lastSent) {
+                        lastSent = key;
+                        client.sendMouseState(new Guacamole.Mouse.State(state), false);
+                    }
+                    if (ev.preventDefault) ev.preventDefault();
                 }
+
+                // Replay the moves the browser merged away during a drag, on
+                // the same terms as Guacamole.Mouse does for the main display:
+                // a busy main thread discards pointer movement rather than
+                // delaying it, and a dragged scrollbar thumb is dropped rather
+                // than lagged. Additive -- the mousemove listener below is
+                // unchanged and still delivers every position it did, and the
+                // one they both deliver is dropped by the check above.
+                //
+                // Feature-detected on the event rather than on PointerEvent,
+                // because this window is a realm of its own: the constructor
+                // this page can see is not the one that made this event.
+                canvas.addEventListener('pointermove', function(ev) {
+                    if (ev.pointerType !== 'mouse' || !ev.buttons)
+                        return;
+                    if (!Guacamole.Mouse.coalescedMovement
+                            || typeof ev.getCoalescedEvents !== 'function')
+                        return;
+                    var merged = ev.getCoalescedEvents();
+                    if (!merged || merged.length <= 1)
+                        return;
+                    var events = Guacamole.Mouse.sampleCoalesced(merged);
+                    for (var i = 0; i < events.length; i++)
+                        popupPointer(events[i]);
+                });
+
                 canvas.addEventListener('mousedown', popupPointer);
                 canvas.addEventListener('mousemove', popupPointer);
                 canvas.addEventListener('mouseup', popupPointer);
@@ -1176,6 +1216,9 @@
                     client.sendMouseState(new Guacamole.Mouse.State(base), false);
                     base[dir] = false;
                     client.sendMouseState(new Guacamole.Mouse.State(base), false);
+                    // Sent behind popupPointer's back, so what it last saw is
+                    // no longer what the server last got.
+                    lastSent = null;
                     ev.preventDefault();
                 }, { passive: false });
 

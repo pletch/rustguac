@@ -192,43 +192,12 @@ Guacamole.Mouse = function Mouse(element) {
             if (!merged || merged.length <= 1)
                 return;
 
-            var events = sampled(merged);
+            var events = Guacamole.Mouse.sampleCoalesced(merged);
             for (var i = 0; i < events.length; i++)
                 guac_mouse.move(Guacamole.Position.fromClientPosition(element,
                         events[i].clientX, events[i].clientY), events[i]);
 
         }, false);
-
-    }
-
-    /**
-     * The merged moves to replay, at most COALESCED_MAX of them. A pointer
-     * reporting at 1000Hz behind a thread blocked for 100ms offers a hundred
-     * positions for one drag, and forwarding each as its own instruction would
-     * answer a rendering problem with a traffic one. Sampling evenly, and
-     * always keeping the last, holds the shape of the path at a bounded cost;
-     * an ordinary pointer never reaches the cap at all.
-     *
-     * @private
-     * @param {!Array} merged - What getCoalescedEvents() returned.
-     * @returns {!Array} The events to replay, in order.
-     */
-    function sampled(merged) {
-
-        if (merged.length <= Guacamole.Mouse.COALESCED_MAX)
-            return merged;
-
-        var out = [];
-        var step = merged.length / Guacamole.Mouse.COALESCED_MAX;
-
-        for (var i = 0; i < Guacamole.Mouse.COALESCED_MAX - 1; i++)
-            out.push(merged[Math.floor(i * step)]);
-
-        /* The last is where the pointer actually is, so it is never the one
-         * dropped. */
-        out.push(merged[merged.length - 1]);
-
-        return out;
 
     }
 
@@ -469,6 +438,40 @@ Guacamole.Mouse.coalescedMovement = (function coalescedMovement() {
     return true;
 
 }());
+
+/**
+ * The merged moves to replay, at most COALESCED_MAX of them, in order.
+ *
+ * A pointer reporting at 1000Hz behind a thread blocked for 100ms offers a
+ * hundred positions for one drag, and forwarding each as its own instruction
+ * would answer a rendering problem with a traffic one. Sampling evenly, and
+ * always keeping the last, holds the shape of the path at a bounded cost; an
+ * ordinary pointer never reaches the cap at all.
+ *
+ * @param {!Array} merged
+ *     What getCoalescedEvents() returned.
+ *
+ * @returns {!Array}
+ *     The events to replay, in order.
+ */
+Guacamole.Mouse.sampleCoalesced = function sampleCoalesced(merged) {
+
+    if (merged.length <= Guacamole.Mouse.COALESCED_MAX)
+        return merged;
+
+    var out = [];
+    var step = merged.length / Guacamole.Mouse.COALESCED_MAX;
+
+    for (var i = 0; i < Guacamole.Mouse.COALESCED_MAX - 1; i++)
+        out.push(merged[Math.floor(i * step)]);
+
+    /* The last is where the pointer actually is, so it is never the one
+     * dropped. */
+    out.push(merged[merged.length - 1]);
+
+    return out;
+
+};
 
 /**
  * The most merged moves replayed for one dispatched move. A pointer reporting

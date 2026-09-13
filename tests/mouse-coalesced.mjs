@@ -210,5 +210,52 @@ test('a browser without pointer events keeps the behaviour it had', () => {
     assert.deepEqual([...m.moves[0]], [3, 4]);
 });
 
+/* ── The pop-out monitor windows ─────────────────────────────────────── */
+
+/*
+ * Those windows bypass Guacamole.Mouse entirely -- it does not track the X
+ * axis correctly in a popup -- and map the pointer themselves, inline in
+ * client.html. The mapping is not reachable from here, but what makes the
+ * replay work there is: the two shared pieces below, and a check that the same
+ * state is not sent twice.
+ *
+ * The failure to guard against is quiet. Renaming sampleCoalesced would at
+ * least throw once a drag started, but coalescedMovement simply reading
+ * undefined leaves the whole path switched off with nothing said, which is
+ * indistinguishable from the behaviour it replaced.
+ */
+
+const page = await readFile(join(root, 'static/client.html'), 'utf8');
+
+test('the popup windows use the shared gate and the shared sampler', () => {
+    assert.ok(page.includes('Guacamole.Mouse.coalescedMovement'),
+            'the popup path must honour the same override as the main display');
+    assert.ok(page.includes('Guacamole.Mouse.sampleCoalesced'),
+            'and bound the replay by the same rule');
+
+    const sandbox = { Guacamole: {} };
+    vm.createContext(sandbox);
+    vm.runInContext(sources[3], sandbox);
+    assert.equal(typeof sandbox.Guacamole.Mouse.sampleCoalesced, 'function',
+            'which Mouse.js must actually still export');
+    assert.notEqual(sandbox.Guacamole.Mouse.coalescedMovement, undefined);
+});
+
+test('the popup windows replay only a drag, and only a real mouse', () => {
+    const listener = page.slice(page.indexOf("canvas.addEventListener('pointermove'"));
+    assert.ok(/ev\.pointerType !== 'mouse' \|\| !ev\.buttons/.test(listener),
+            'a hover or a touch must be left to the listeners that had them');
+});
+
+test('the popup windows do not send the same state twice', () => {
+    /* The replay delivers the dispatched position and the mousemove behind it
+     * delivers the same one again. Guacamole.Mouse drops that in move(); this
+     * path sends unconditionally and had to be given the check. */
+    assert.ok(page.includes('if (key !== lastSent)'),
+            'the popup pointer must drop a repeat of what it last sent');
+    assert.ok(/lastSent = null;[\s\S]{0,200}ev\.preventDefault\(\);\n\s*\}, \{ passive: false \}\);/.test(page),
+            'and the wheel, which sends behind its back, must clear it');
+});
+
 console.log(failures ? `\n${failures} failure(s)` : '\nall passed');
 process.exit(failures ? 1 : 0);
