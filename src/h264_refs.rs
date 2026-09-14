@@ -710,10 +710,10 @@ impl Stats {
         // reorders at all, the verdict reasons about the default list order
         // instead and the counts above are the whole of the evidence.
         let main_names_its_own = !self.list_mods_by_view[0].is_empty();
-        let aux_names_its_own = self.list_mods_by_view[1..]
+        let aux_has_claimed = self.mmco_by_view[1..]
             .iter()
-            .any(|ops| ops.keys().any(|(idc, _)| *idc == 2));
-        if main_names_its_own && !aux_names_its_own {
+            .any(|ops| ops.keys().any(|(op, _)| *op == 6 || *op == 3));
+        if main_names_its_own && !aux_has_claimed {
             return Safety::Undecided;
         }
         match self.verdict_kind() {
@@ -880,10 +880,20 @@ impl Stats {
             .map(|(_, idx)| *idx)
             .collect();
 
-        let chains_are_separate = !main_long_term.is_empty()
-            && main_long_term.is_disjoint(&aux_long_term)
-            && main_long_term.is_disjoint(&aux_marks)
-            && short_term == 0;
+        // Only what an auxiliary view *claims* can matter. Dropping removes
+        // the picture, so whatever it read never happens: an auxiliary slice
+        // naming main's long-term index is a consumer of main's picture, and
+        // removing a consumer is always safe. What would not be safe is main
+        // reading an index a dropped picture produced, which is `aux_marks`.
+        //
+        // Windows does exactly this after a surface recreation. The first
+        // auxiliary picture following an IDR has no chain of its own yet, so it
+        // names long-term 0 -- main's -- because that is the only long-term
+        // picture in the buffer. Testing what it reads condemned the stream
+        // 110s into a session on 2026-09-14, at the same moment
+        // `h264_black_keyframe_kept` fired: one event, two symptoms.
+        let chains_are_separate =
+            !main_long_term.is_empty() && main_long_term.is_disjoint(&aux_marks) && short_term == 0;
 
         // Separate chains are necessary and not sufficient: the decoded
         // picture buffer has to have somewhere to put the pictures a gap
@@ -906,15 +916,6 @@ impl Stats {
                      pictures and would address something else once they were \
                      gone",
                     short_term
-                ));
-            }
-            if !main_long_term.is_disjoint(&aux_long_term) {
-                reasons.push(format!(
-                    "both views name the same long-term pictures ({:?}), so \
-                     main is predicting from chroma",
-                    main_long_term
-                        .intersection(&aux_long_term)
-                        .collect::<Vec<_>>()
                 ));
             }
             if !main_long_term.is_disjoint(&aux_marks) {
@@ -1668,16 +1669,24 @@ mod tests {
         assert!(verdict.contains("short-term PicNum"), "{}", verdict);
     }
 
-    /// Both views naming the same long-term picture means main is predicting
-    /// from chroma, which no amount of header rewriting makes droppable.
+    /// An auxiliary view *reading* main's long-term index is fine.
+    ///
+    /// Dropping removes the auxiliary picture, so whatever it read never
+    /// happens -- it is a consumer of main's picture, and removing a consumer
+    /// changes nothing for what survives.
+    ///
+    /// This is not hypothetical. After a surface recreation Windows sends an
+    /// IDR, and the first auxiliary picture following it has no chain of its
+    /// own yet, so it names long-term 0 because that is the only long-term
+    /// picture in the buffer. Testing what an auxiliary view reads condemned a
+    /// live stream 110s in, at the same moment the black-keyframe guard fired
+    /// on the same surface recreation.
     #[test]
-    fn a_shared_long_term_picture_is_not_droppable() {
+    fn an_auxiliary_view_reading_mains_index_is_still_droppable() {
         let mut stats = windows_shaped_stats();
-        stats.list_mods_by_view[2].insert((2, 0), 58);
+        stats.list_mods_by_view[2].insert((2, 0), 1);
 
-        let verdict = stats.verdict();
-        assert!(verdict.starts_with("NOT DROPPABLE"), "{}", verdict);
-        assert!(verdict.contains("predicting from chroma"), "{}", verdict);
+        assert_eq!(stats.safety(false), Safety::Safe, "{}", stats.verdict());
     }
 
     /// Main slices taking the default list order are the trap the long-term
@@ -1963,24 +1972,24 @@ mod tests {
         assert_eq!(stats.safety(true), Safety::Undecided, "nor in eager mode");
     }
 
-    /// An auxiliary view that has never named a reference is not evidence that
-    /// it names a different one from main.
+    /// An auxiliary view that has never *claimed* a long-term index is not yet
+    /// evidence that it claims none of main's.
     ///
     /// An empty set is disjoint from everything, so without this the
-    /// separate-chains test could be satisfied having seen nothing at all
-    /// about what the auxiliary view points at -- and a non-IDR I slice counts
-    /// as an auxiliary inter slice while carrying no reference information,
-    /// which is how that arises in practice rather than in theory.
+    /// separate-chains test would be satisfied having seen nothing at all
+    /// about what the auxiliary view produces -- and a non-IDR I slice counts
+    /// as an auxiliary inter slice while marking nothing, which is how that
+    /// arises in practice rather than in theory.
     #[test]
-    fn an_auxiliary_view_that_has_named_nothing_decides_nothing() {
+    fn an_auxiliary_view_that_has_claimed_nothing_decides_nothing() {
         let mut stats = windows_shaped_stats();
-        stats.list_mods_by_view[2].clear();
+        stats.mmco_by_view[2].clear();
 
         assert_eq!(stats.safety(false), Safety::Undecided);
         assert_eq!(stats.safety(true), Safety::Undecided, "nor in eager mode");
 
         // And it resolves as soon as one arrives.
-        stats.list_mods_by_view[2].insert((2, 1), 1);
+        stats.mmco_by_view[2].insert((6, 1), 1);
         assert_eq!(stats.safety(true), Safety::Safe);
     }
 

@@ -890,10 +890,20 @@ are a **relative** step through short-term `PicNum`, which shifts when a
 picture is removed, so any relative reordering in a main slice is refused.
 Disjoint long-term indices between the views -- Windows names `{0}` and `{1}`,
 and the xrdp fork does the same since its dual-LTR commit -- prove the chains
-separate, and what an auxiliary view *claims* is checked as well as what it
-reads: a dropped picture that had marked itself with an index main reads would
-take that index's contents with it, which the reference lists alone do not
-show. Where no slice reorders at all, the default list order (short-term by
+separate. **What is tested is what an auxiliary view *claims*, never what it
+reads**, and the difference is not academic: dropping removes the picture, so
+whatever it read never happens, and an auxiliary slice naming main's index is
+merely a consumer of main's picture. The hazard is the other direction -- main
+reading an index a *dropped* picture produced -- which is the `mmco` marking
+and not the reference list.
+
+Windows makes the distinction load-bearing. After it recreates its surface it
+sends an IDR, and the first auxiliary picture following one has no chain of its
+own yet, so it names long-term 0 because that is the only long-term picture in
+the buffer. Testing reads rather than claims condemned a live stream 110s in,
+at the same instant `h264_black_keyframe_kept` fired on the same surface
+recreation -- one event, two symptoms, and the running re-check is what caught
+it. Where no slice reorders at all, the default list order (short-term by
 descending `PicNum`, then long-term) puts the previous main view at index 0
 *provided* every auxiliary picture marks itself long-term, and only if main
 activates a single list-0 entry; two or more and the auxiliary picture is
