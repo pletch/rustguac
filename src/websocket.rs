@@ -560,8 +560,6 @@ async fn guacd_to_ws(
     // send path below stays the byte-for-byte passthrough it has always been.
     let mut splitter = binary_blobs.then(crate::binary_blob::BlobSplitter::new);
 
-    let mut sps_rewritten = false;
-
     // Gives a host that declares its colour range without describing its
     // colourimetry the shape Chrome's hardware decoder will act on. Costs
     // nothing once the stream's first SPS has been seen and found not to need
@@ -574,7 +572,8 @@ async fn guacd_to_ws(
     // anything it cannot prove; RUSTGUAC_H264_AUX_DROP=0 turns it off. The
     // The slice-header analysis it gates on lives inside it, so the stream is
     // parsed once rather than twice.
-    let mut aux_dropper = crate::h264_aux_drop::AuxDropper::for_session(drop_aux);
+    let mut aux_dropper =
+        crate::h264_aux_drop::AuxDropper::for_session(drop_aux).reporting_as(session_id);
 
     // What the browser has last been told about the drop. It cannot infer it:
     // an auxiliary IDR is kept and switches 4:4:4 combining on, after which
@@ -686,26 +685,25 @@ async fn guacd_to_ws(
         };
 
         // Splice a colour description into the SPS where the host left one
-        // out. After the telemetry above, so `H.264 colour:` reports what the
-        // host actually sent rather than what we made of it -- the whole value
-        // of that line is that it describes the wire.
+        // out, and permit frame_num gaps where the auxiliary view is about to
+        // start being dropped. After the telemetry above, so `H.264 colour:`
+        // reports what the host actually sent rather than what we made of it
+        // -- the whole value of that line is that it describes the wire.
         let text = match sps_rewriter.rewrite(&text) {
-            Some(rewritten) => {
-                if !sps_rewritten {
-                    sps_rewritten = true;
-                    tracing::info!(
-                        session_id = %session_id,
-                        "H.264 colour: splicing a BT.709 description into the SPS, \
-                         which Chrome's hardware decoder needs before it will act \
-                         on the range the host declared"
-                    );
-                }
-                rewritten
-            }
+            Some(rewritten) => rewritten,
             // Cow, because the dropper borrows a chunk it did not have to
             // change -- which is most of them.
             None => text.into_owned(),
         };
+
+        // Which edit was made, rather than that one was. The two are
+        // independent and a stream can need either alone: an xrdp host
+        // describes its colour completely and needs only the gaps flag, and
+        // reporting that as a colour splice sends whoever reads it looking at
+        // the colour of a picture that is fine. Each is said once per session.
+        for edit in sps_rewriter.take_edits() {
+            tracing::info!(session_id = %session_id, "H.264: {}", edit.describe());
+        }
 
         // Recording and telemetry above both saw the text form; only what
         // goes to the browser is rewritten. WebSocket delivers text and binary
@@ -740,10 +738,9 @@ async fn guacd_to_ws(
         }
     }
 
-    // What the drop actually saved, once per session, and only when it ran.
-    if let Some(summary) = aux_dropper.summary() {
-        tracing::info!(session_id = %session_id, "H.264: {}", summary);
-    }
+    // The drop's summary is written by AuxDropper::drop, not here: this line
+    // is reached only when guacd closes first, and a session normally ends the
+    // other way round.
 
     Ok(())
 }

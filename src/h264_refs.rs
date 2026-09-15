@@ -1006,11 +1006,14 @@ impl Stats {
             VerdictKind::Droppable,
             format!(
                 "DROPPABLE, with one caveat — the two views run on separate \
-             long-term reference chains: main names long-term {:?} and the \
-             auxiliary views name {:?}, assigned by mmco 6, with no relative \
+             long-term reference chains: main names long-term {:?} while the \
+             auxiliary views claim {:?} by mmco 6 or 3, with no relative \
              short-term reordering anywhere. So nothing surviving predicts \
-             from a dropped picture. {}",
+             from a dropped picture. The auxiliary views read {:?}, which \
+             does not bear on it: dropping removes the picture, so whatever \
+             it read never happens. {}",
                 main_long_term,
+                aux_marks,
                 aux_long_term,
                 self.frame_num_caveat(main_advances_by_one)
             ),

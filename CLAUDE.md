@@ -236,7 +236,19 @@ stops the picture while both ends look healthy.
 `src/h264_sps.rs` logs what the host sent, once per session, and the client
 reports what it made of it (`event=colour_space`, with the decoder's pixel
 format). Read as a pair: the first describes the wire, the second the render,
-and a colour fault is a disagreement between them. Recordings are teed upstream
+and a colour fault is a disagreement between them.
+
+**The rewriter says which edit it made, not that it made one.** `SpsRewriter`
+performs two independent edits in one blob-decode pass -- the colour
+description and `gaps_in_frame_num_value_allowed_flag` -- so "returned `Some`"
+does not mean "spliced a description". Read that way, an xrdp session whose SPS
+already describes its colour completely and needs only the gaps flag is logged
+as having a BT.709 description spliced into it: a false line, on the one
+subject where the wire log and the browser's report are meant to be read
+against each other, pointing at the colour of a picture that is fine.
+`take_edits()` returns what actually changed, each reported once a session, and
+`it_says_which_edit_it_made` pins all three combinations -- gaps alone on the
+xrdp fork, both together on Windows, and neither repeated on a later keyframe. Recordings are teed upstream
 of the rewrite and keep the original stream; `?h264FullRange=on` is the lever
 for playback and for any host whose declaration cannot be believed. Full detail
 in `docs/rdp-h264.md`.
@@ -891,7 +903,10 @@ picture is removed, so any relative reordering in a main slice is refused.
 Disjoint long-term indices between the views -- Windows names `{0}` and `{1}`,
 and the xrdp fork does the same since its dual-LTR commit -- prove the chains
 separate. **What is tested is what an auxiliary view *claims*, never what it
-reads**, and the difference is not academic: dropping removes the picture, so
+reads**, and the verdict line prints the claims for that reason, giving the
+reads afterwards as the aside they are -- a line showing only the reads reports
+an empty set on a perfectly droppable stream, which reads exactly like the
+vacuous disjointness guarded against below. The difference is not academic: dropping removes the picture, so
 whatever it read never happens, and an auxiliary slice naming main's index is
 merely a consumer of main's picture. The hazard is the other direction -- main
 reading an index a *dropped* picture produced -- which is the `mmco` marking
@@ -972,6 +987,23 @@ almost all of it the keyframe burst. A session that never gets past the waiting
 stage reports what it was short of in the disconnect summary, since the gate is
 otherwise silent until it decides and a stream that never qualifies would
 otherwise look identical to one that is merely slow.
+
+**That summary is written from `Drop`, and has to be.** Writing it after
+`guacd_to_ws`'s read loop reaches it only when guacd closes first; a session
+normally ends the other way round -- the browser goes, `run_proxy`'s `select!`
+resolves on the browser-side task and drops the guacd-side future where it
+stands. Everything the summary carries would then be missing in practice: what
+the drop saved, what an undecided stream was short of, and the `OVERFLOWED`
+warning for leaked in-flight streams, which cannot be evidence of anything
+until it is in a position to fire. Two tests pin that it is emitted, which is
+the half the content tests cannot see. Measured against a Windows host on
+2026-09-14: 159 auxiliary pictures, 491 KiB, **0 in flight**, no overflow --
+which is what turns "nothing has been seen to cause it" into a measurement.
+
+A stream reaches `State::Off` two ways -- **switched off**, or examined and
+refused -- and only the second has anything to report. Reporting both writes
+"no auxiliary view has arrived in 0 pictures" for a gate that was never
+waiting, on every never-drop session.
 
 It sits in `guacd_to_ws` after the recording tee, so **recordings keep the full
 4:4:4 stream** and can be replayed against the dropper, and before the colour

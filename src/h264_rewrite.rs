@@ -40,6 +40,36 @@ enum State {
     PassThrough,
 }
 
+/// One of the two edits `SpsRewriter` makes, for the caller to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edit {
+    /// A colour description spliced in beside a range the host declared bare.
+    ColourDescription,
+    /// `gaps_in_frame_num_value_allowed_flag` set, ahead of the auxiliary
+    /// view being dropped.
+    FrameNumGaps,
+}
+
+impl Edit {
+    /// What to say the first time this edit is made. Phrased for the journal,
+    /// where it sits beside the `H.264 colour:` line describing what the host
+    /// sent and, later, the browser's own report of what it made of it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Edit::ColourDescription => concat!(
+                "splicing a BT.709 description into the SPS, which Chrome's ",
+                "hardware decoder needs before it will act on the range the ",
+                "host declared"
+            ),
+            Edit::FrameNumGaps => concat!(
+                "permitting frame_num gaps in the SPS, so a decoder accounts ",
+                "for the pictures the auxiliary view drop removes rather than ",
+                "failing on the holes they leave"
+            ),
+        }
+    }
+}
+
 /// Edits the SPS of one session's H.264 stream, in flight.
 ///
 /// Two independent edits share this pass because both need the same thing --
@@ -55,6 +85,19 @@ pub struct SpsRewriter {
     /// Whether to set `gaps_in_frame_num_value_allowed_flag`. Driven per chunk
     /// by the dropper, which turns it on before it drops anything.
     allow_gaps: bool,
+    /// Edits actually made and not yet reported.
+    ///
+    /// Held rather than inferred from `rewrite()` returning `Some`, which is
+    /// what the caller used to do: with two independent edits sharing the pass
+    /// that answers "something changed", not "the colour description was
+    /// added". A host whose SPS already describes its colour and needs only
+    /// the gaps flag was logged as having a description spliced into it --
+    /// a line that is false, about the one subject where the wire log and the
+    /// browser's report are meant to be read against each other.
+    pending_edits: Vec<Edit>,
+    /// Edits already reported once, so a stream carrying a keyframe a minute
+    /// does not repeat them.
+    made: Vec<Edit>,
     /// Stream indices opened by an `h264` instruction. `audio` is deliberately
     /// not tracked: its blobs are not video and decoding them to look for a
     /// start code would be work for nothing.
@@ -72,7 +115,24 @@ impl SpsRewriter {
         Self {
             state: State::Undecided,
             allow_gaps: false,
+            pending_edits: Vec::new(),
+            made: Vec::new(),
             h264_streams: HashSet::new(),
+        }
+    }
+
+    /// The edits made since this was last called, each reported once for the
+    /// life of the session. Empty on all but a couple of chunks.
+    pub fn take_edits(&mut self) -> Vec<Edit> {
+        std::mem::take(&mut self.pending_edits)
+    }
+
+    /// Records an edit the first time it is made, so the caller can say what
+    /// happened rather than that something did.
+    fn note(&mut self, edit: Edit) {
+        if !self.made.contains(&edit) {
+            self.made.push(edit);
+            self.pending_edits.push(edit);
         }
     }
 
@@ -206,12 +266,16 @@ impl SpsRewriter {
 
         if self.state == State::Rewriting {
             edited = crate::h264_sps::complete_colour_signalling(&bytes[sps.clone()]);
+            if edited.is_some() {
+                self.note(Edit::ColourDescription);
+            }
         }
 
         if self.allow_gaps {
             let current = edited.as_deref().unwrap_or(&bytes[sps.clone()]);
             if let Some(with_gaps) = crate::h264_sps::allow_frame_num_gaps(current) {
                 edited = Some(with_gaps);
+                self.note(Edit::FrameNumGaps);
             }
         }
 
@@ -261,6 +325,53 @@ mod tests {
             .decode(payload)
             .expect("valid base64");
         crate::h264_sps::find_sps(&bytes).expect("an SPS")
+    }
+
+    /// The two edits are independent, and the caller reports what was
+    /// actually done. Inferring it from "something changed" told an xrdp
+    /// session -- whose SPS describes its colour completely and needs only the
+    /// gaps flag -- that a BT.709 description was being spliced into it, which
+    /// points whoever reads the journal at a colour fault that is not there.
+    #[test]
+    fn it_says_which_edit_it_made() {
+        let mut r = SpsRewriter::new();
+        r.set_allow_frame_num_gaps(true);
+        r.rewrite("4.h264,1.7,1.0,1.0;");
+        assert!(
+            r.rewrite(&blob(7, COMPLETE)).is_some(),
+            "the gaps bit is set"
+        );
+        assert_eq!(
+            r.take_edits(),
+            vec![Edit::FrameNumGaps],
+            "a complete description is not spliced into"
+        );
+
+        let mut r = SpsRewriter::new();
+        r.rewrite("4.h264,1.7,1.0,1.0;");
+        assert!(
+            r.rewrite(&blob(7, BARE)).is_some(),
+            "the description is added"
+        );
+        assert_eq!(r.take_edits(), vec![Edit::ColourDescription]);
+
+        let mut r = SpsRewriter::new();
+        r.set_allow_frame_num_gaps(true);
+        r.rewrite("4.h264,1.7,1.0,1.0;");
+        r.rewrite(&blob(7, BARE));
+        let both = r.take_edits();
+        assert!(
+            both.contains(&Edit::ColourDescription) && both.contains(&Edit::FrameNumGaps),
+            "a Windows host needs both: {:?}",
+            both
+        );
+
+        // Said once, however many keyframes follow.
+        r.rewrite(&blob(7, BARE));
+        assert!(
+            r.take_edits().is_empty(),
+            "each edit is reported once a session"
+        );
     }
 
     #[test]

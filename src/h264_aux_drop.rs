@@ -168,6 +168,19 @@ pub struct AuxDropper {
     /// exactly the shape that hangs a client. Nothing has been seen to cause
     /// it, which is why it is counted rather than worked around.
     orphan_clears: u64,
+    /// Whether this session was never in the running: the deployment kill
+    /// switch, or an entry set to "never drop".
+    ///
+    /// Kept apart from `State::Off`, which a stream also reaches by being
+    /// examined and refused. Both never drop; only one of them has anything
+    /// to report. A summary saying the gate saw no auxiliary view "in 0
+    /// pictures" describes a gate that was waiting, and this one was not.
+    switched_off: bool,
+    /// The session the summary belongs to, when there is one to name.
+    ///
+    /// Held here because the summary is written from `Drop` rather than by the
+    /// caller. See the `Drop` impl.
+    session: Option<uuid::Uuid>,
 }
 
 impl AuxDropper {
@@ -194,7 +207,10 @@ impl AuxDropper {
             // is not recoverable: the decoder errors, discards its queue and
             // waits for a keyframe an idle desktop never sends.
             Some(true) if dropper.state != State::Off => dropper.eager = true,
-            Some(false) => dropper.state = State::Off,
+            Some(false) => {
+                dropper.state = State::Off;
+                dropper.switched_off = true;
+            }
             _ => {}
         }
 
@@ -221,7 +237,16 @@ impl AuxDropper {
             unpaired: 0,
             orphan_clears: 0,
             eager: false,
+            switched_off: !enabled,
+            session: None,
         }
+    }
+
+    /// Names the session its summary belongs to. Without it the summary is
+    /// still written, just without the field to correlate it by.
+    pub fn reporting_as(mut self, session: uuid::Uuid) -> Self {
+        self.session = Some(session);
+        self
     }
 
     /// Reads one chunk of the guacd → browser stream, returning what should be
@@ -461,6 +486,11 @@ impl AuxDropper {
 
     /// What the session saved, for the disconnect log.
     pub fn summary(&self) -> Option<String> {
+        if self.switched_off {
+            // Nothing was asked of this stream, so there is nothing to say
+            // about what it did not do.
+            return None;
+        }
         if self.dropped_pictures == 0 {
             // Nothing was dropped. If it never decided, say what it was short
             // of: the gate is silent until it makes up its mind, so otherwise
@@ -524,6 +554,30 @@ impl AuxDropper {
     /// the session, and a wrong guess costs a whole-plane resync each way.
     pub fn dropping(&self) -> bool {
         self.state == State::Dropping
+    }
+}
+
+/// Writes the summary on the way out, however the session ended.
+///
+/// Written here rather than by the caller after `guacd_to_ws`'s read loop,
+/// which is reached only when guacd closes first. A session normally ends the
+/// other way round -- the browser goes, `run_proxy`'s select! resolves on the
+/// browser-side task and drops the guacd-side future where it stands -- and
+/// the line would then be the instrument that is silently absent: a stream the
+/// gate never decides about says nothing at all until this reports what it was
+/// short of, and the overflow warning for leaked in-flight streams would never
+/// be in a position to fire.
+///
+/// Drop runs on every one of those paths, including cancellation.
+impl Drop for AuxDropper {
+    fn drop(&mut self) {
+        let Some(summary) = self.summary() else {
+            return;
+        };
+        match self.session {
+            Some(session) => tracing::info!(session_id = %session, "H.264: {}", summary),
+            None => tracing::info!("H.264: {}", summary),
+        }
     }
 }
 
@@ -1058,6 +1112,107 @@ mod tests {
 
         let summary = d.summary().expect("a summary");
         assert!(summary.starts_with("dropped 1 auxiliary"), "{}", summary);
+    }
+
+    /// And it is written on the way out, however the session ended.
+    ///
+    /// Written from `Drop` because the tail of `guacd_to_ws`'s read loop is
+    /// reached only when guacd closes first; a browser closing -- the normal
+    /// case -- drops that future where it stands. The two tests above cover
+    /// what the summary *says*; this is the one that covers its being said at
+    /// all, which is the half they cannot see.
+    #[test]
+    fn the_summary_is_written_when_the_dropper_is_dropped() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Buffer {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+
+        let session = uuid::Uuid::new_v4();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut d = dropping().reporting_as(session);
+            d.process(&h264(1, false, 2, 0, false));
+            // No explicit summary() call: only the drop below may write it.
+        });
+
+        let written = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            written.contains("dropped 1 auxiliary"),
+            "the summary was not written on drop: {:?}",
+            written
+        );
+        assert!(
+            written.contains(&session.to_string()),
+            "the summary lost its session id: {:?}",
+            written
+        );
+    }
+
+    /// A session the drop was switched off for says nothing on the way out.
+    ///
+    /// State::Off is reached two ways -- switched off, or examined and refused
+    /// -- and only the second has anything to report. Reporting both writes
+    /// "no auxiliary view has arrived in 0 pictures" for a gate that was never
+    /// waiting, on every never-drop session.
+    #[test]
+    fn a_dropper_that_was_switched_off_writes_nothing() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        struct W(Arc<Mutex<Vec<u8>>>);
+        impl Write for W {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let made = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || W(made.clone()))
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Switched off: no verdict, nothing dropped, no reason to give.
+            let mut d = AuxDropper::for_session(Some(false));
+            d.process(&h264(1, false, 2, 0, false));
+        });
+
+        let written = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        assert!(
+            written.is_empty(),
+            "wrote a summary it had nothing for: {:?}",
+            written
+        );
     }
 
     /// The env var is the kill switch, and off means never looking.
