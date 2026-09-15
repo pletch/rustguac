@@ -507,6 +507,24 @@ impl AuxDropper {
     pub fn wants_frame_num_gaps(&self) -> bool {
         self.state != State::Off
     }
+
+    /// Whether the auxiliary view is being removed from the wire right now.
+    ///
+    /// Read once per chunk so the browser can be told, because the browser
+    /// cannot work it out. It switches 4:4:4 combining on at the first
+    /// auxiliary view it sees and off at nothing in particular, and auxiliary
+    /// IDRs are deliberately kept -- so one of those arms the combine, and
+    /// every main view after it then pays a plane read-back, six texture
+    /// uploads and a shader pass to produce the ordinary 4:2:0 picture a
+    /// `drawImage` would have produced for nothing, waiting for a view that
+    /// will never come. Inferring it from a quiet stretch instead would be
+    /// guessing: a Windows desktop sends chroma in about one picture in eight
+    /// and the xrdp fork's `CHROMA_INTERVAL` sends it rarer still, so a
+    /// silence long enough to be evidence is also long enough to have cost
+    /// the session, and a wrong guess costs a whole-plane resync each way.
+    pub fn dropping(&self) -> bool {
+        self.state == State::Dropping
+    }
 }
 
 enum Action {

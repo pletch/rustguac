@@ -984,6 +984,49 @@ for them to be skipped. `RUSTGUAC_H264_AUX_DROP=0` is the deployment-wide kill
 switch, `=unproven` relaxes the gate for experiments. An AVC420-only host never
 reaches a verdict and is passed through borrowed, not rebuilt.
 
+**The client has to be told, because it cannot tell.** Combining is switched
+on by an auxiliary view and off by nothing in particular, and auxiliary IDRs
+are deliberately kept -- so one of those arms the combiner and every main view
+after it goes through `combineFrame()`, paying a plane read-back, six texture
+uploads and a shader pass to produce the ordinary 4:2:0 picture `drawImage()`
+produces almost free, waiting for a view that has been removed upstream.
+Measured on a Windows session with the drop active and the gate never
+contradicted: **163 pictures in 10s at 19.0ms of copying each, 31% of the main
+thread**, until `COMBINE_COPY_TRIP_SHARE` gave up 4:4:4 for a reason that was
+true and beside the point. The feature was saving bandwidth and a decode while
+*adding* client cost, which is the opposite of what it is for.
+
+So rustguac says so, as an `h264-aux` instruction carrying 1 or 0, sent when
+the state changes and at most twice a session. Not a guacd opcode -- it
+originates in the proxy, guacd never sees it, and `Guacamole.Client` ignores
+opcodes it has no handler for, so a cached client from before this behaves as
+it always did. `tests/h264-aux-instruction.mjs` pins the shape across the
+Rust/JS boundary, because both ends fail silently: a wrong opcode is *ignored*
+and leaves exactly the cost above with nothing logged anywhere.
+
+`setAuxDropped()` gates `chroma444Enabled()` **ahead of the `h264Chroma444`
+override**, which everything else there defers to. The override exists so a
+session can be compared against the other setting and there is nothing to
+compare: with the auxiliary view off the wire, combining can produce the cost
+of 4:4:4 but not the result. The lever that answers this question is the
+entry's own drop setting, one level up. Combining then stops at the next
+**main** view, through the same re-check that handles a framebuffer growing
+past its threshold, and restarts by itself at the next auxiliary view if the
+drop ever stops -- with `resyncNeeded` set, since the textures predate the gap.
+
+**Two client-side alternatives were weighed and are worse.** Standing the
+combiner down after a quiet stretch is guessing at a fact the server already
+knows: Windows sends chroma in about one picture in eight and the fork's
+`CHROMA_INTERVAL` rarer still, so a silence long enough to be evidence has
+already cost the session, a threshold short enough to be prompt takes 4:4:4
+from legitimate sessions, and every wrong guess costs a whole-plane resync on
+the way back. Routing unpaired main views to `drawImage` while combining stays
+on is exact -- `<paired>` is authoritative -- and would also pay off on the
+118-of-174 unpaired main views Windows sends naturally, but the uploaded planes
+are shared state: skipping the uploads leaves the renderer's textures stale, so
+the next paired picture must resync whole planes or refine rows that are out of
+date. On a host interleaving the two that could cost more than it saves.
+
 **Never-combine is not redundant.** It is the only 4:2:0 lever on a stream the
 gate refuses, and during the window before the gate has decided.
 
@@ -1303,3 +1346,7 @@ Ephemeral per-user Docker desktop containers. `VdiDriver` trait in `src/vdi/mod.
   -- --ignored` — runs the real dropper over a real recording and checks the
   result is a stream a client could follow, which the picture comparison above
   cannot see
+- `tests/h264-aux-instruction.mjs` — pins the `h264-aux` instruction across the
+  Rust/JS boundary. A wrong opcode is *ignored* by the client rather than
+  refused, which leaves it combining against an auxiliary view that will never
+  arrive, at a plane read-back per picture, with nothing logged at either end
