@@ -88,8 +88,7 @@ After connecting, on the Windows host: Task Manager → Performance → GPU →
 **Video Encode** should be non-zero during activity. If it reads 0%, hardware
 encoding is not engaged — check the WDDM policy first.
 
-On the rustguac host, with guacd running at trace level (`-L trace`, e.g. via
-`systemctl edit rustguac-guacd` to override `ExecStart`):
+On the rustguac host, with `GUACD_LOG_LEVEL=trace` in `/opt/rustguac/guacd.env`:
 
 ```bash
 # Which codecs the server is sending. 11 = AVC420, 14/15 = AVC444(v2).
