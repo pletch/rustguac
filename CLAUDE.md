@@ -1199,7 +1199,12 @@ old picture. `h264KeepBlackKeyframes=off` disables it.
 **It takes two conditions, and each covers the other's false positive.** The
 picture must decode >=98% black *and* guacd must have signalled that the
 surface was recreated at the size it already had (`015`, as a trailing
-`<recreated>` flag on the `h264` instruction). Content alone cannot tell a
+`<recreated>` flag on the `h264` instruction). The size is tracked per surface
+ID, not as one most-recently-deleted record: a session holds several surfaces
+and tears them down together, so `Delete 1, Delete 0, Create 0` -- an ordinary
+resize sequence seen in the field -- would have had surface 0's size
+overwritten by surface 1's, and a same-size recreation of 0 would go
+undetected whenever 0 is deleted first. Content alone cannot tell a
 blank surface from a screen that has legitimately gone black -- a blank
 screensaver, a display blanking on lock, a fade to black -- and suppressing one
 of those leaves the user's desktop on display, which in a remote-access product

@@ -600,14 +600,19 @@ everything after one, so its black picture is genuinely the new screen. The
 size is what tells the two apart, which is why the dimensions are tracked at
 all — `DeleteSurface` carries only a surface ID.
 
-The detection is deliberately narrow. The last-deleted record is consumed by
-the next `CreateSurface` whether or not it matches, so "recreated" can only
-mean a creation that directly followed a deletion; there is no timer. A delete
-of a surface whose size was never recorded leaves the record alone, because
-Windows sends the delete twice in practice and the second finds nothing to look
-up. Only an H.264 command clears the flag: after a recreation followed by a
-progressive or planar command, guacd still holds the pixels and there is
-nothing for the client to withhold.
+The size is tracked **per surface ID**, in a slot marked deleted rather than
+freed, so the size a surface had survives until that same ID is created again.
+A single most-recently-deleted record is not enough: a session holds more than
+one surface and tears them down together, so a delete of one surface overwrites
+the record of another and loses the recreation that follows. Tearing down
+surface 1 and then surface 0 before recreating 0 is an ordinary resize
+sequence, observed in the field — and with one record, a same-size recreation
+of 0 goes undetected whenever 0 is deleted first.
+
+Windows also sends the delete twice in practice; the second finds the slot
+already marked and leaves the recorded size alone. Only an H.264 command clears
+the flag: after a recreation followed by a progressive or planar command, guacd
+still holds the pixels and there is nothing for the client to withhold.
 
 **The client cannot infer this.** It can see that a picture decoded black; it
 cannot see whether that is the screen or an empty surface. Both are needed —
@@ -622,7 +627,7 @@ so a count of zero always means the server said zero.
 
 | File | Change |
 |------|--------|
-| `src/protocols/rdp/rdp.h` | Per-surface dimension table, last-deleted record, the recreation flag |
+| `src/protocols/rdp/rdp.h` | `guac_rdp_gfx_surface` slots (size plus a deleted mark) and the recreation flag |
 | `src/protocols/rdp/channels/rdpgfx.c` | Same-size detection in the `CreateSurface`/`DeleteSurface` wrappers; unreadable rects reported as `-1` |
 | `src/libguac/display-layer.c` | Carries the flag onto the queued frame; substitutes the surface rect for an unreadable list |
 | `src/libguac/display-plan.c` | Writes `<recreated>` as the trailing argument of the `h264` instruction |
