@@ -690,6 +690,28 @@
                 return window.rustguacDumpDraws(r.cx, r.cy);
             };
 
+            // Prints the H.264 decoder's session state, which the black-region
+            // counters live in: blackKeyframes[kept= blackUnarmed=
+            // armedNotBlack= armedTooSoon=]. Read against guacd's "recreated
+            // at the size it already had" line -- a session that logged one
+            // and shows armedTooSoon=0 means the flag is not reaching the
+            // client, which is otherwise silent at both ends.
+            //
+            // Exists because the same figures otherwise surface only on a tab
+            // hide of 30s or more, or behind the black probes, which are off
+            // by default. That is no way to read a counter over a soak that
+            // runs for weeks.
+            window.rustguacDecoderState = function() {
+                var decoder = client._h264Decoder;
+                if (!decoder || !decoder.describeState) {
+                    console.warn('[rustguac] no H.264 decoder on this session');
+                    return 'h264=none';
+                }
+                var state = decoder.describeState();
+                console.log('[rustguac] ' + state);
+                return state;
+            };
+
             var displayEl = document.getElementById('display');
             displayEl.appendChild(client.getDisplay().getElement());
 
