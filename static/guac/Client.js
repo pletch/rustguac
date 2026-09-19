@@ -1548,6 +1548,18 @@ Guacamole.Client = function(tunnel) {
             var paired = parameters.length > 9 + numRects * 4
                     ? parseInt(parameters[9 + numRects * 4]) !== 0 : false;
 
+            // Whether the surface this picture belongs to was just recreated
+            // at the size it already had. Such a surface is empty, so the
+            // picture describes a blank surface rather than a screen that has
+            // gone blank, and the server will go on to repaint only what it
+            // believes changed -- trusting the client to hold the rest, which
+            // under passthrough it does and guacd does not. Only the server
+            // can say this: the decoder can see that a picture came out black,
+            // not whether that is the screen or an empty surface. Trails
+            // <paired> for the same reason <paired> trails the rects.
+            var recreated = parameters.length > 10 + numRects * 4
+                    ? parseInt(parameters[10 + numRects * 4]) !== 0 : false;
+
             // Create stream to receive H.264 NAL unit data
             var stream = streams[stream_index] = new Guacamole.InputStream(guac_client, stream_index);
 
@@ -1614,7 +1626,8 @@ Guacamole.Client = function(tunnel) {
                         layer, guac_client._h264Decoder,
                         x, y, width, height,
                         bytes.buffer, isKeyFrame,
-                        parameters.length > 8 ? rects : null, view, paired
+                        parameters.length > 8 ? rects : null, view, paired,
+                        recreated
                     );
                 } catch (e) {
                     if (typeof console !== 'undefined')

@@ -43,6 +43,13 @@ if (!pairedExpr)
             + 'Client.js — if it was renamed or reshaped, update this test '
             + 'rather than deleting it');
 
+const recreatedExpr = clientSource.match(
+        /var recreated = ([\s\S]*?);\n/);
+if (!recreatedExpr)
+    throw new Error('could not find the `var recreated = ...` expression in '
+            + 'Client.js — if it was renamed or reshaped, update this test '
+            + 'rather than deleting it');
+
 const numRectsExpr = clientSource.match(
         /var numRects = (parameters\.length[^;]*);/);
 if (!numRectsExpr)
@@ -51,7 +58,9 @@ if (!numRectsExpr)
 const readPaired = new Function('parameters',
         `var numRects = ${numRectsExpr[1]};
          var paired = ${pairedExpr[1]};
-         return { numRects: numRects, paired: paired };`);
+         var recreated = ${recreatedExpr[1]};
+         return { numRects: numRects, paired: paired,
+                  recreated: recreated };`);
 
 /* ---- the encoder, as guac_h264_write_arg() writes it ---- */
 
@@ -59,7 +68,8 @@ function instruction(args) {
     return args.map((a) => `${String(a).length}.${a}`).join(',') + ';';
 }
 
-function h264Instruction({ view = 0, rects = [], paired = null, legacy = null }) {
+function h264Instruction({ view = 0, rects = [], paired = null,
+        recreated = null, legacy = null }) {
 
     const args = ['h264', 7, 1, 1, 0, 0, 1920, 1080];
 
@@ -77,6 +87,9 @@ function h264Instruction({ view = 0, rects = [], paired = null, legacy = null })
 
     if (paired !== null)
         args.push(paired ? 1 : 0);
+
+    if (recreated !== null)
+        args.push(recreated ? 1 : 0);
 
     return instruction(args);
 
@@ -101,22 +114,34 @@ const R3 = [
 ];
 
 const cases = [
-    ['no rects, paired',            { rects: [],  paired: true },  0, true],
-    ['no rects, not paired',        { rects: [],  paired: false }, 0, false],
-    ['1 rect, paired',              { rects: R1,  paired: true },  1, true],
-    ['3 rects, paired',             { rects: R3,  paired: true },  3, true],
-    ['3 rects, not paired',         { rects: R3,  paired: false }, 3, false],
-    ['aux view, 3 rects, paired=0', { view: 2, rects: R3, paired: false }, 3, false],
+    ['no rects, paired',            { rects: [],  paired: true },  0, true,  false],
+    ['no rects, not paired',        { rects: [],  paired: false }, 0, false, false],
+    ['1 rect, paired',              { rects: R1,  paired: true },  1, true,  false],
+    ['3 rects, paired',             { rects: R3,  paired: true },  3, true,  false],
+    ['3 rects, not paired',         { rects: R3,  paired: false }, 3, false, false],
+    ['aux view, 3 rects, paired=0', { view: 2, rects: R3, paired: false }, 3, false, false],
+
+    /* <recreated> trails <paired>, so it is the flag most exposed to an
+     * off-by-one: one position short and it reads <paired>, two short and it
+     * reads a rect coordinate, which is non-zero for nearly every rect. A
+     * picture wrongly marked recreated is withheld from the screen. */
+    ['no rects, recreated',         { rects: [], paired: false, recreated: true },  0, false, true],
+    ['1 rect, recreated',           { rects: R1, paired: false, recreated: true },  1, false, true],
+    ['3 rects, recreated',          { rects: R3, paired: false, recreated: true },  3, false, true],
+    ['3 rects, paired+recreated',   { rects: R3, paired: true,  recreated: true },  3, true,  true],
+    ['3 rects, recreated=0',        { rects: R3, paired: true,  recreated: false }, 3, true,  false],
+
     /* Older servers: the flag is simply absent, and must read as false rather
      * than picking up a rect coordinate. */
-    ['guacd without <paired>',      { rects: R3, paired: null },   3, false],
-    ['guacd without <numrects>',    { legacy: 'no-rects' },        0, false],
-    ['guacd without <view>',        { legacy: 'no-view' },         0, false]
+    ['guacd without <recreated>',   { rects: R3, paired: true,  recreated: null },  3, true,  false],
+    ['guacd without <paired>',      { rects: R3, paired: null },   3, false, false],
+    ['guacd without <numrects>',    { legacy: 'no-rects' },        0, false, false],
+    ['guacd without <view>',        { legacy: 'no-view' },         0, false, false]
 ];
 
 let failures = 0;
 
-for (const [name, spec, expectRects, expectPaired] of cases) {
+for (const [name, spec, expectRects, expectPaired, expectRecreated] of cases) {
 
     const text = h264Instruction(spec);
     const { params } = parse(text);
@@ -124,12 +149,14 @@ for (const [name, spec, expectRects, expectPaired] of cases) {
     /* Client.js reads `parameters` as the arguments after the opcode. */
     const got = readPaired(params);
 
-    const ok = got.numRects === expectRects && got.paired === expectPaired;
+    const ok = got.numRects === expectRects && got.paired === expectPaired
+            && got.recreated === expectRecreated;
     if (!ok) failures++;
 
     console.log(`${ok ? 'ok  ' : 'FAIL'}  ${name.padEnd(28)}`
             + ` numRects=${got.numRects} (want ${expectRects})`
-            + ` paired=${got.paired} (want ${expectPaired})`);
+            + ` paired=${got.paired} (want ${expectPaired})`
+            + ` recreated=${got.recreated} (want ${expectRecreated})`);
 
 }
 

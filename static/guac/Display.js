@@ -1034,7 +1034,7 @@ Guacamole.Display = function() {
      *     Whether an auxiliary chroma view for this same picture follows.
      */
     this.drawH264 = function(layer, decoder, x, y, width, height, nalData,
-            isKeyFrame, rects, view, paired) {
+            isKeyFrame, rects, view, paired, recreated) {
 
         var token = null;
 
@@ -1062,7 +1062,7 @@ Guacamole.Display = function() {
          * required either way, or this frame and every frame behind it stalls
          * in the queue. */
         token = decoder.decode(layer, x, y, width, height, nalData,
-                isKeyFrame, rects, unblock, view, paired);
+                isKeyFrame, rects, unblock, view, paired, recreated);
 
         decoding = false;
         if (readyDuringDecode)
