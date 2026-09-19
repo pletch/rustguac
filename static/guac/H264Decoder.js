@@ -429,23 +429,54 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 || nowMs() - framebufferChangedAt < BLACK_KEYFRAME_STABLE_MS)
             return false;
 
-        var black;
+        /* Both halves are required, and each covers the other's false
+         * positive. A screen that has legitimately gone black -- a blank
+         * screensaver, a display blanking on lock, a fade to black -- produces
+         * no surface recreation, so the flag declines it. A same-size
+         * recreation whose picture is real content is not black, so the sample
+         * declines that. Content alone suppresses a genuinely black screen and
+         * leaves the previous desktop on display; the flag alone suppresses
+         * whatever the recreation was carrying, sight unseen. */
+        var fraction;
         try {
-            black = blackFraction(snapshot);
+            fraction = blackFraction(snapshot);
         }
         catch (e) {
             return false;
         }
 
-        if (black === null || black < BLACK_KEYFRAME_FRACTION)
+        if (fraction === null)
+            return false;
+
+        var black = fraction >= BLACK_KEYFRAME_FRACTION;
+
+        if (black && !frameState.recreated) {
+
+            /* Reported rather than acted on: withholding on content alone is
+             * what the server-side flag exists to stop. One of these with no
+             * recreation logged beside it is the shape of an episode the flag
+             * does not see. */
+            diagnostic('h264_black_keyframe_unarmed', 'a keyframe decoded '
+                    + (fraction * 100).toFixed(0) + '% black arrived with '
+                    + 'the framebuffer unchanged for '
+                    + ((nowMs() - framebufferChangedAt) / 1000).toFixed(0)
+                    + 's, but no surface recreation was signalled: painted as '
+                    + 'usual', true);
+
+            return false;
+
+        }
+
+        if (!black || !frameState.recreated)
             return false;
 
         diagnostic('h264_black_keyframe_kept', 'withheld a keyframe decoded '
-                + (black * 100).toFixed(0) + '% black with the '
-                + 'framebuffer unchanged for '
+                + (fraction * 100).toFixed(0) + '% black on a surface the '
+                + 'server recreated at its existing size, with the framebuffer '
+                + 'unchanged for '
                 + ((nowMs() - framebufferChangedAt) / 1000).toFixed(0)
-                + 's: most likely Windows recreating its surface. Keeping the '
-                + 'picture on screen; h264KeepBlackKeyframes=off paints it',
+                + 's. Keeping the picture on screen; '
+                + 'h264KeepBlackKeyframes=off paints it',
                 true);
 
         return true;
@@ -1759,7 +1790,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *     null if it could not be submitted.
      */
     this.decode = function(layer, x, y, width, height, nalData, isKeyFrame,
-            rects, onReady, view, paired) {
+            rects, onReady, view, paired, recreated) {
 
         ensureDecoder(width, height, nalData);
 
@@ -1831,6 +1862,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 paint: !(rects && rects.length === 0),
                 view: view || 0,
                 paired: !!paired,
+                recreated: !!recreated,
                 onReady: onReady,
                 canvas: null,
                 settled: false,
