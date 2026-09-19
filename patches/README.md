@@ -471,3 +471,50 @@ role FreeRDP's responses are sent by static functions called directly from
 `autodetect.c`, and the public callbacks fire on *receive* or in the server
 role, with `ClientBandwidthMeasureResult` arriving only after the PDU is
 serialised. Substituting a figure means patching FreeRDP, not guacd.
+## 015-rdpgfx-same-size-recreation.patch — tell the client an empty surface from a blank screen
+
+Windows occasionally deletes and recreates its RDPGFX surface at the dimensions
+it already had, mid-session, with no resize and no `ResetGraphics`. The new
+surface is empty, so its first picture is black over the whole surface — and
+Windows then repaints only what it believes changed, trusting the client to
+hold the rest. Under H.264 passthrough the client does hold it and guacd does
+not, so the black picture must not be painted. See `sol1/rustguac#223`.
+
+A recreation that comes *with* a resize is not this: Windows repaints
+everything after one, so its black picture is genuinely the new screen. The
+size is what tells the two apart, which is why the dimensions are tracked at
+all — `DeleteSurface` carries only a surface ID.
+
+The detection is deliberately narrow. The last-deleted record is consumed by
+the next `CreateSurface` whether or not it matches, so "recreated" can only
+mean a creation that directly followed a deletion; there is no timer. A delete
+of a surface whose size was never recorded leaves the record alone, because
+Windows sends the delete twice in practice and the second finds nothing to look
+up. Only an H.264 command clears the flag: after a recreation followed by a
+progressive or planar command, guacd still holds the pixels and there is
+nothing for the client to withhold.
+
+**The client cannot infer this.** It can see that a picture decoded black; it
+cannot see whether that is the screen or an empty surface, and both are
+needed. Content alone would withhold a screen that has legitimately gone black
+— a blank screensaver, a display blanking on lock — and leave the old desktop
+showing; the flag alone would withhold whatever a recreation carried, sight
+unseen. Windows recreates its surface once on every connect, too, which the
+client's settle window declines.
+
+Separately, this corrects a hazard in `004`'s rect handling. Three conditions
+collapsed to a rect count of zero: the server genuinely declaring zero rects, a
+malformed metablock, and a failed allocation. Since zero reaches the client as
+*this picture changes nothing*, the last two would blank the display. The
+unreadable cases now report `-1` and are sent as one rect covering the surface,
+so a count of zero always means the server said zero.
+
+| File | Change |
+|------|--------|
+| `src/protocols/rdp/rdp.h` | The two original callbacks, per-surface dimension table, last-deleted record, the recreation flag |
+| `src/protocols/rdp/channels/rdpgfx.c` | `CreateSurface`/`DeleteSurface` wrappers, installed for H.264 connections with the same reinstall guard as `004`'s, doing the same-size detection; unreadable rects reported as `-1` |
+| `src/libguac/display-layer.c` | Carries the flag onto the queued frame; substitutes the surface rect for an unreadable list |
+| `src/libguac/display-plan.c` | Writes `<recreated>` as the trailing argument of the `h264` instruction |
+| `src/libguac/display-priv.h`, `src/libguac/guacamole/display.h` | Frame field and the setter's signature |
+
+Depends on `004` for the instruction and the wrapper installation it joins.
