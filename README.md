@@ -351,8 +351,10 @@ framebuffer back on every painted keyframe, which is the same cost class as the
 - **Console helpers** — `rustguacFindBlack()` locates black regions on the
   display, `rustguacDumpDraws()` reports what painted a given pixel from a ring
   of recent draws, and `rustguacDumpBlack()` does both in one call;
-  `?debug=nofit` suppresses resize requests so opening DevTools cannot repaint
-  the region being inspected.
+  `rustguacDecoderState()` prints the decoder's session state, including the
+  black-keyframe counters, which otherwise surface only on a tab hide of 30
+  seconds or behind the probes. `?debug=nofit` suppresses resize requests so
+  opening DevTools cannot repaint the region being inspected.
 
 ### Docs and tooling
 
