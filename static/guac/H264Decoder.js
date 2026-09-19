@@ -859,13 +859,19 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *   black -- a legitimate repaint that a signal-only test would have
      *   suppressed, showing stale content in its place. This is the count
      *   that says whether the content check can ever be dropped.
+     * - `armedTooSoon` is a signalled recreation the settle window declined
+     *   before the picture was even sampled. Windows recreates the surface at
+     *   its existing size as part of the ordinary connect handshake, so this
+     *   is the common case and would otherwise be invisible -- leaving the
+     *   impression that the signal never fires.
      *
      * @private
      */
     var blackKeyframeStats = {
         armedBlack     : 0,
         blackNotArmed  : 0,
-        armedNotBlack  : 0
+        armedNotBlack  : 0,
+        armedTooSoon   : 0
     };
 
     /**
@@ -905,9 +911,18 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         if (!frameState.keyFrame || override('h264KeepBlackKeyframes') === false)
             return false;
 
+        /* Counted before the sample, because this is where a connect lands:
+         * the host recreates its surface at the size it already had while the
+         * client is still fitting the display, and the picture that follows is
+         * the real screen rather than an empty surface. Withholding it is what
+         * makes a session look hung until something forces a repaint, which is
+         * why the signal alone is not a test. */
         if (!framebufferChangedAt
-                || nowMs() - framebufferChangedAt < BLACK_KEYFRAME_STABLE_MS)
+                || nowMs() - framebufferChangedAt < BLACK_KEYFRAME_STABLE_MS) {
+            if (frameState.recreated)
+                blackKeyframeStats.armedTooSoon++;
             return false;
+        }
 
         /* Both halves are required, and each covers the other's false
          * positive. A screen that has legitimately gone black -- a blank
@@ -4223,7 +4238,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 + ' syncTimeouts=' + syncTimeouts
                 + ' blackKeyframes[kept=' + blackKeyframeStats.armedBlack
                     + ' blackUnarmed=' + blackKeyframeStats.blackNotArmed
-                    + ' armedNotBlack=' + blackKeyframeStats.armedNotBlack + ']'
+                    + ' armedNotBlack=' + blackKeyframeStats.armedNotBlack
+                    + ' armedTooSoon=' + blackKeyframeStats.armedTooSoon + ']'
                 + ' holds[' + describeHolds(holdTotal, 0) + ']';
 
     };

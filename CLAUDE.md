@@ -1214,12 +1214,30 @@ secure-desktop switches, so a signal-only test would withhold a lock screen
 sight unseen, whatever it contained. Neither half is redundant until the
 trigger is known.
 
+**Measured 2026-09-19, and it settles the signal-only question.** A Windows
+host recreates its surface at the size it already had **as part of the ordinary
+connect handshake** -- three sessions, every one of them, about a second after
+the first `CreateSurface` and before the display-update negotiation settles on
+the mod-16 size (`3000x1662` created, deleted, recreated at `3000x1662`, then
+`2992x1648`). So the signal fires routinely on something that is not the fault,
+and a signal-only test would withhold the connect-time keyframe -- the exact
+failure that makes a session look hung until a resize. The settle window
+declines all of them. Nothing outside connect fired in an hour and a half of
+ordinary use, resizes included, so the fault event itself remains rare.
+
+A surface whose creation was never observed is never reported as recreated: its
+prior size is unknown, so a delete of it records nothing. That loses a genuine
+recreation of a surface that existed before the session attached, which is the
+safe direction to fail.
+
 **The soak is instrumented to decide that**, since reasoning cannot.
-`describeState()` carries three counts: `kept` (both held), `blackUnarmed` (a
+`describeState()` carries four counts: `kept` (both held), `blackUnarmed` (a
 black keyframe with no signal behind it -- non-zero means the signal misses
-episodes and the content test is still load-bearing) and `armedNotBlack` (a
+episodes and the content test is still load-bearing), `armedNotBlack` (a
 same-size recreation carrying real content -- non-zero means a signal-only test
-would have blanked it). A black keyframe with no signal is reported and
+would have blanked it) and `armedTooSoon` (a signalled recreation the settle
+window declined before sampling, which is where every connect lands and would
+otherwise be invisible). A black keyframe with no signal is reported and
 *painted*, never withheld, so `blackUnarmed` measures the gap instead of
 quietly covering it.
 
