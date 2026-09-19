@@ -146,7 +146,7 @@ A folder with `allowed_groups: ["engineering", "devops"]`:
 
 ## Group-to-role mappings
 
-Admins can configure automatic role assignment based on OIDC group membership. This is managed in the Admin page or via the API.
+Admins can configure automatic role assignment based on OIDC group membership. This is managed in the Admin page, via the API, or with the `map-group` CLI command.
 
 ### How it works
 
@@ -164,6 +164,31 @@ Admins can configure automatic role assignment based on OIDC group membership. T
 | `support` | operator |
 
 A user with groups `["engineering", "support"]` would get `poweruser` (the higher of the two matching roles).
+
+### Managing mappings from the CLI
+
+```bash
+# Map a group to a role
+rustguac map-group --group sysadmin --role admin
+
+# Change the role an existing group maps to
+rustguac map-group --group sysadmin --role poweruser --force
+
+# Roles must be one of: admin, poweruser, operator, viewer
+```
+
+Each OIDC group can hold only one mapping. Running `map-group` against a group that is already mapped to a *different* role leaves the existing mapping untouched and exits non-zero, so an unattended provisioning run cannot silently change who has access:
+
+```
+$ rustguac map-group --group sysadmin --role admin
+Group 'sysadmin' is already mapped to role 'poweruser'. Re-run with --force to change it to 'admin'.
+```
+
+Add `--force` to change it. Mapping a group to the role it already has is a no-op and exits zero, so repeated runs of the same provisioning script are safe.
+
+Mappings are applied during OIDC login, not at the moment you create them. A user who is already signed in keeps their current role until their next login. This cuts both ways: granting a role does not take effect immediately, and neither does lowering one, so to revoke access straight away change the mapping *and* disable the user or end their sessions.
+
+Mappings created this way are identical to those made in the Admin page or through the API, and are listed alongside them.
 
 ## User API tokens
 
@@ -210,12 +235,11 @@ rustguac set-role --email user@example.com --role poweruser
 # Disable a user (blocks login)
 rustguac disable-user --email user@example.com
 
-# Re-enable a user
-rustguac enable-user --email user@example.com
-
 # Delete a user
 rustguac delete-user --email user@example.com
 ```
+
+Re-enabling a disabled user is done from the Admin page or the API (`POST /api/users/{email}/enable`); there is no `enable-user` subcommand. Bear that in mind before disabling your own account from the shell.
 
 ## Admin (API key) management CLI
 
@@ -242,3 +266,34 @@ rustguac rotate-key --name myadmin
 # Delete
 rustguac delete-admin --name myadmin
 ```
+
+## CLI audit log
+
+CLI commands act on the database directly, so they never pass through the authenticated API and its audit trail. Without a record of their own, a role grant or an account deletion made from a shell would leave no trace at all. The admin, user-role and group-mapping commands above therefore write to the `cli_audit_log` table.
+
+| Recorded | Never recorded |
+|----------|----------------|
+| The action, its target, and a timestamp | API keys |
+| Non-sensitive detail, such as the role granted or whether an IP allowlist and expiry were set | Passwords |
+| The operating system user who ran the command | Full field values |
+
+The actor is taken from `SUDO_USER` when present, so an action run through `sudo` is attributed to the person who ran it rather than to `root`, falling back to `USER` then `LOGNAME`. Only successful actions are recorded; a command that fails validation or finds nothing to change writes no entry.
+
+There is no UI for this log yet. Read it with `sqlite3`:
+
+```bash
+sqlite3 -header -column /opt/rustguac/data/rustguac.db \
+  "SELECT created_at, os_user, action, target, details
+     FROM cli_audit_log ORDER BY id DESC LIMIT 20;"
+```
+
+```
+created_at           os_user  action       target  details
+-------------------  -------  -----------  ------  ------------------------------
+2026-09-19 04:11:02  dave     map_group    staff   role=viewer
+2026-09-19 04:11:05  dave     remap_group  staff   from=viewer to=admin
+2026-09-19 04:11:07  dave     add_admin    ops     ip_allowlist=true expiry=false
+2026-09-19 04:11:09  dave     rotate_key   ops
+```
+
+Entries are subject to the same retention cleanup as the API audit logs and are removed after 90 days.
