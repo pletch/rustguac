@@ -37,14 +37,40 @@ for arg in "$@"; do
         --deps-only)   DEPS_ONLY=1 ;;
         --no-tls)      NO_TLS=1 ;;
         --hostname=*)  TLS_HOSTNAME="${arg#--hostname=}" ;;
+        # An alias for the environment variable rather than a second switch
+        # reaching the same place, so there is one thing to read when the
+        # answer looks wrong. Set here, it also wins over an inherited
+        # RUSTGUAC_DRIVE_SETUP=yes, which is the precedence an explicit flag
+        # should have.
+        --no-drive)    RUSTGUAC_DRIVE_SETUP=no ;;
         -h|--help)
-            echo "Usage: sudo $0 [--deps-only|--no-deps] [--no-tls] [--hostname=FQDN]"
+            echo "Usage: sudo $0 [--deps-only|--no-deps] [--no-tls] [--no-drive]"
+            echo "                        [--hostname=FQDN]"
             echo ""
             echo "Options:"
             echo "  --deps-only       Only install system packages, then exit"
             echo "  --no-deps         Skip apt install (assume packages already present)"
             echo "  --no-tls          Skip TLS certificate generation (plain HTTP only)"
+            echo "  --no-drive        Skip the encrypted drive prompt (same as"
+            echo "                    RUSTGUAC_DRIVE_SETUP=no)"
             echo "  --hostname=FQDN   Hostname for TLS certificate (default: system hostname)"
+            echo ""
+            echo "Environment:"
+            echo "  The encrypted drive for RDP file transfer is the only part of this"
+            echo "  installer that asks a question. It is skipped on its own when the"
+            echo "  container already exists, when cryptsetup is missing, or when stdin"
+            echo "  is not a terminal; these answer it otherwise."
+            echo ""
+            echo "  RUSTGUAC_DRIVE_SETUP    yes|no — answer the prompt without a terminal"
+            echo "  RUSTGUAC_DRIVE_SIZE     LUKS container size (default: 4G)"
+            echo "  RUSTGUAC_DRIVE_MOUNT    Mount point (default: /mnt/rustguac-drives)"
+            echo "  RUSTGUAC_LUKS_DEVICE    Container path (default: PREFIX/drives.luks)"
+            echo "  RUSTGUAC_LUKS_NAME      dm-crypt mapper name (default: rustguac-drives)"
+            echo ""
+            echo "  Settings for guacd itself belong in PREFIX/guacd.env, which is"
+            echo "  created once and never overwritten; the unit files are rewritten on"
+            echo "  every run, so anything set in them directly is lost at the next"
+            echo "  install."
             exit 0
             ;;
     esac
