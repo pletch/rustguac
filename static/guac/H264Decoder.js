@@ -847,6 +847,28 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     var BLACK_KEYFRAME_STABLE_MS = 5000;
 
     /**
+     * Counts of the three outcomes the combined test can produce, reported on
+     * disconnect. They exist to answer, from real sessions rather than from
+     * reasoning, which half of the test is load-bearing:
+     *
+     * - `armedBlack` is the intended case, and how often this fires at all.
+     * - `blackNotArmed` is a black picture with no recreation behind it.
+     *   Non-zero means the server-side signal misses episodes and the content
+     *   test still carries the feature.
+     * - `armedNotBlack` is a same-size recreation whose picture was *not*
+     *   black -- a legitimate repaint that a signal-only test would have
+     *   suppressed, showing stale content in its place. This is the count
+     *   that says whether the content check can ever be dropped.
+     *
+     * @private
+     */
+    var blackKeyframeStats = {
+        armedBlack     : 0,
+        blackNotArmed  : 0,
+        armedNotBlack  : 0
+    };
+
+    /**
      * Whether a keyframe about to be painted should be withheld instead,
      * leaving the picture already on screen in place.
      *
@@ -887,6 +909,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 || nowMs() - framebufferChangedAt < BLACK_KEYFRAME_STABLE_MS)
             return false;
 
+        /* Both halves are required, and each covers the other's false
+         * positive. A screen that has legitimately gone black -- a blank
+         * screensaver, a display blanking on lock, a fade to black -- produces
+         * no surface recreation, so the flag declines it. A same-size
+         * recreation whose picture is real content is not black, so the sample
+         * declines that. Content alone suppresses a genuinely black screen and
+         * leaves the previous desktop on display; the flag alone suppresses
+         * whatever the recreation was carrying, sight unseen. */
         var sample;
         try {
             sample = sampleGrid(snapshot, 0, 0, snapshot.width, snapshot.height);
@@ -895,15 +925,47 @@ Guacamole.H264Decoder = function H264Decoder(display) {
             return false;
         }
 
-        if (!sample || sample.black < BLACK_KEYFRAME_FRACTION)
+        if (!sample)
             return false;
 
+        var black = sample.black >= BLACK_KEYFRAME_FRACTION;
+
+        if (frameState.recreated && !black)
+            blackKeyframeStats.armedNotBlack++;
+
+        if (black && !frameState.recreated) {
+
+            blackKeyframeStats.blackNotArmed++;
+
+            /* Reported rather than acted on. Withholding here is what the
+             * server-side flag was introduced to stop doing, and a count of
+             * these is the evidence for whether the flag sees every episode.
+             * If this stays at zero across real use, the content test is
+             * confirmation only; if it does not, the signal is incomplete and
+             * this is the shape of what it misses. */
+            diagnostic('h264_black_keyframe_unarmed', 'a keyframe decoded '
+                    + (sample.black * 100).toFixed(0) + '% black arrived with '
+                    + 'the framebuffer unchanged for '
+                    + ((nowMs() - framebufferChangedAt) / 1000).toFixed(0)
+                    + 's, but no surface recreation was signalled: painted as '
+                    + 'usual', true);
+
+            return false;
+
+        }
+
+        if (!black || !frameState.recreated)
+            return false;
+
+        blackKeyframeStats.armedBlack++;
+
         diagnostic('h264_black_keyframe_kept', 'withheld a keyframe decoded '
-                + (sample.black * 100).toFixed(0) + '% black with the '
-                + 'framebuffer unchanged for '
+                + (sample.black * 100).toFixed(0) + '% black on a surface the '
+                + 'server recreated at its existing size, with the framebuffer '
+                + 'unchanged for '
                 + ((nowMs() - framebufferChangedAt) / 1000).toFixed(0)
-                + 's: most likely Windows recreating its surface. Keeping the '
-                + 'picture on screen; h264KeepBlackKeyframes=off paints it',
+                + 's. Keeping the picture on screen; '
+                + 'h264KeepBlackKeyframes=off paints it',
                 true);
 
         return true;
@@ -3625,7 +3687,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *     null if it could not be submitted.
      */
     this.decode = function(layer, x, y, width, height, nalData, isKeyFrame,
-            rects, onReady, view, paired) {
+            rects, onReady, view, paired, recreated) {
 
         ensureDecoder(width, height, nalData);
 
@@ -3697,6 +3759,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 paint: !(rects && rects.length === 0),
                 view: view || 0,
                 paired: !!paired,
+                recreated: !!recreated,
                 onReady: onReady,
                 canvas: null,
                 settled: false,
@@ -4158,6 +4221,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 + ' lastKeyframePaint=' + ago(counts.lastKeyframePaintAt)
                 + ' watchdog=' + watchdogFires
                 + ' syncTimeouts=' + syncTimeouts
+                + ' blackKeyframes[kept=' + blackKeyframeStats.armedBlack
+                    + ' blackUnarmed=' + blackKeyframeStats.blackNotArmed
+                    + ' armedNotBlack=' + blackKeyframeStats.armedNotBlack + ']'
                 + ' holds[' + describeHolds(holdTotal, 0) + ']';
 
     };

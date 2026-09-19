@@ -1184,12 +1184,39 @@ a resize, after which Windows repaints everything. The new surface is empty, its
 first keyframe (full-screen rect) decodes black, and Windows then repaints only
 what it thinks changed. It is the same Windows behaviour as sol1/rustguac#118,
 whose reporter proved that `SuppressOutput` off/on and `RefreshRect` do **not**
-make Windows re-stream the surface -- so do not try that again. #118 was fixed by
-re-sending pixels the client side already had; under passthrough those are in
-the browser, so `keepPictureOverBlackKeyframe()` withholds a keyframe decoded
->=98% black when the framebuffer has kept its size for 5s (decoded for its
-references, not painted; `h264_black_keyframe_kept`), and Windows' partial
-repaint lands on the old picture. `h264KeepBlackKeyframes=off` disables it.
+make Windows re-stream the surface -- so do not try that again. Nor is marking
+the layer dirty a way out: `005` does that, shipped as the #118 fix in v1.7.0,
+and was retracted a day later as not curing the symptom, with `RefreshRect`
+suspected of *amplifying* it. What actually closed #118 is not on the record --
+`005` has not changed since it was added, and the likeliest candidate is the
+guacd uplift that landed between the retraction and the close. **Every prior
+attempt tried to make something repaint. This one refuses to.** The browser
+still holds the correct picture when the black keyframe arrives, so
+`keepPictureOverBlackKeyframe()` withholds it (decoded for its references, not
+painted; `h264_black_keyframe_kept`) and Windows' partial repaint lands on the
+old picture. `h264KeepBlackKeyframes=off` disables it.
+
+**It takes two conditions, and each covers the other's false positive.** The
+picture must decode >=98% black *and* guacd must have signalled that the
+surface was recreated at the size it already had (`015`, as a trailing
+`<recreated>` flag on the `h264` instruction). Content alone cannot tell a
+blank surface from a screen that has legitimately gone black -- a blank
+screensaver, a display blanking on lock, a fade to black -- and suppressing one
+of those leaves the user's desktop on display, which in a remote-access product
+is the wrong way to be wrong. The signal alone is no better: the trigger for
+the recreation is still unidentified, and the leading candidates in #223 are
+secure-desktop switches, so a signal-only test would withhold a lock screen
+sight unseen, whatever it contained. Neither half is redundant until the
+trigger is known.
+
+**The soak is instrumented to decide that**, since reasoning cannot.
+`describeState()` carries three counts: `kept` (both held), `blackUnarmed` (a
+black keyframe with no signal behind it -- non-zero means the signal misses
+episodes and the content test is still load-bearing) and `armedNotBlack` (a
+same-size recreation carrying real content -- non-zero means a signal-only test
+would have blanked it). A black keyframe with no signal is reported and
+*painted*, never withheld, so `blackUnarmed` measures the gap instead of
+quietly covering it.
 
 Both budgets are per minute and global, so a looping page cannot fill a disk.
 guacd defaults to `-L info` and rustguac to `RUST_LOG=info`, so all of it lands
