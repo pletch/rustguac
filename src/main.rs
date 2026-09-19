@@ -88,6 +88,18 @@ enum Command {
         name: String,
     },
 
+    /// Map an OIDC group to a role (admin, poweruser, operator, viewer)
+    MapGroup {
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        role: String,
+        /// Re-map a group that already has a mapping, changing its role.
+        /// Without this a group with an existing mapping is left untouched.
+        #[arg(long)]
+        force: bool,
+    },
+
     /// Rotate an admin's API key (generates new key, invalidates old)
     RotateKey {
         #[arg(long)]
@@ -217,6 +229,9 @@ async fn main() {
         Some(Command::DisableAdmin { name }) => cmd_disable_admin(&database, &name),
         Some(Command::EnableAdmin { name }) => cmd_enable_admin(&database, &name),
         Some(Command::DeleteAdmin { name }) => cmd_delete_admin(&database, &name),
+        Some(Command::MapGroup { group, role, force }) => {
+            cmd_map_group(&database, &group, &role, force)
+        }
         Some(Command::RotateKey { name }) => cmd_rotate_key(&database, &name),
         Some(Command::GenerateCert {
             hostname,
@@ -262,6 +277,30 @@ async fn main() {
     }
 }
 
+/// Best-effort identity of whoever invoked the CLI, for the audit trail.
+/// `SUDO_USER` is checked first so an action taken through sudo is attributed to
+/// the person who ran it rather than to root.
+fn cli_actor() -> String {
+    std::env::var("SUDO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Record a successful CLI administrative action.
+///
+/// A failure to write the audit row is reported but deliberately does not fail
+/// the command: the action has already been applied, and exiting non-zero here
+/// would misreport it as having not happened.
+fn audit_cli(database: &Db, action: &str, target: &str, details: Option<&str>) {
+    if let Err(e) = db::log_cli_event(database, &cli_actor(), action, Some(target), details) {
+        eprintln!(
+            "Warning: action succeeded but audit log write failed: {}",
+            e
+        );
+    }
+}
+
 fn cmd_add_admin(database: &Db, name: &str, allowed_ips: Option<&str>, expires: Option<&str>) {
     match db::add_admin(database, name, allowed_ips, expires) {
         Ok(key) => {
@@ -269,6 +308,14 @@ fn cmd_add_admin(database: &Db, name: &str, allowed_ips: Option<&str>, expires: 
             println!("API Key: {}", key);
             println!();
             println!("Store this key securely — it cannot be retrieved again.");
+            // Headline only: whether the optional restrictions were applied,
+            // never the key itself.
+            let details = format!(
+                "ip_allowlist={} expiry={}",
+                allowed_ips.is_some(),
+                expires.is_some()
+            );
+            audit_cli(database, "add_admin", name, Some(&details));
         }
         Err(e) => {
             eprintln!("Error creating admin: {}", e);
@@ -309,7 +356,10 @@ fn cmd_list_admins(database: &Db) {
 
 fn cmd_disable_admin(database: &Db, name: &str) {
     match db::disable_admin(database, name) {
-        Ok(true) => println!("Admin '{}' disabled.", name),
+        Ok(true) => {
+            println!("Admin '{}' disabled.", name);
+            audit_cli(database, "disable_admin", name, None);
+        }
         Ok(false) => {
             eprintln!("Admin '{}' not found.", name);
             std::process::exit(1);
@@ -323,7 +373,10 @@ fn cmd_disable_admin(database: &Db, name: &str) {
 
 fn cmd_enable_admin(database: &Db, name: &str) {
     match db::enable_admin(database, name) {
-        Ok(true) => println!("Admin '{}' enabled.", name),
+        Ok(true) => {
+            println!("Admin '{}' enabled.", name);
+            audit_cli(database, "enable_admin", name, None);
+        }
         Ok(false) => {
             eprintln!("Admin '{}' not found.", name);
             std::process::exit(1);
@@ -337,7 +390,10 @@ fn cmd_enable_admin(database: &Db, name: &str) {
 
 fn cmd_delete_admin(database: &Db, name: &str) {
     match db::delete_admin(database, name) {
-        Ok(true) => println!("Admin '{}' deleted.", name),
+        Ok(true) => {
+            println!("Admin '{}' deleted.", name);
+            audit_cli(database, "delete_admin", name, None);
+        }
         Ok(false) => {
             eprintln!("Admin '{}' not found.", name);
             std::process::exit(1);
@@ -356,6 +412,7 @@ fn cmd_rotate_key(database: &Db, name: &str) {
             println!("New API Key: {}", key);
             println!();
             println!("Store this key securely — it cannot be retrieved again.");
+            audit_cli(database, "rotate_key", name, None);
         }
         Ok(None) => {
             eprintln!("Admin '{}' not found.", name);
@@ -436,7 +493,15 @@ fn cmd_set_role(database: &Db, email: &str, role: &str) {
         std::process::exit(1);
     }
     match db::set_user_role(database, email, role) {
-        Ok(true) => println!("User '{}' role set to '{}'.", email, role),
+        Ok(true) => {
+            println!("User '{}' role set to '{}'.", email, role);
+            audit_cli(
+                database,
+                "set_user_role",
+                email,
+                Some(&format!("role={}", role)),
+            );
+        }
         Ok(false) => {
             eprintln!("User '{}' not found.", email);
             std::process::exit(1);
@@ -450,7 +515,10 @@ fn cmd_set_role(database: &Db, email: &str, role: &str) {
 
 fn cmd_disable_user(database: &Db, email: &str) {
     match db::disable_user(database, email) {
-        Ok(true) => println!("User '{}' disabled.", email),
+        Ok(true) => {
+            println!("User '{}' disabled.", email);
+            audit_cli(database, "disable_user", email, None);
+        }
         Ok(false) => {
             eprintln!("User '{}' not found.", email);
             std::process::exit(1);
@@ -464,10 +532,86 @@ fn cmd_disable_user(database: &Db, email: &str) {
 
 fn cmd_delete_user(database: &Db, email: &str) {
     match db::delete_user(database, email) {
-        Ok(true) => println!("User '{}' deleted.", email),
+        Ok(true) => {
+            println!("User '{}' deleted.", email);
+            audit_cli(database, "delete_user", email, None);
+        }
         Ok(false) => {
             eprintln!("User '{}' not found.", email);
             std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_map_group(database: &Db, group: &str, role: &str, force: bool) {
+    if !["admin", "poweruser", "operator", "viewer"].contains(&role) {
+        eprintln!("Role must be admin, poweruser, operator, or viewer.");
+        std::process::exit(1);
+    }
+
+    // `oidc_group` is UNIQUE, so a second mapping for the same group fails on
+    // the constraint. Look first so an existing mapping produces an actionable
+    // message (and an explicit --force re-map) rather than a raw SQL error.
+    // This mirrors the API, which answers 409 rather than 500 on a duplicate.
+    let existing = match db::list_group_mappings(database) {
+        Ok(mappings) => mappings.into_iter().find(|m| m.oidc_group == group),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Some(current) = existing {
+        if current.role == role {
+            println!("Group '{}' is already mapped to role '{}'.", group, role);
+            return;
+        }
+        if !force {
+            eprintln!(
+                "Group '{}' is already mapped to role '{}'. \
+                 Re-run with --force to change it to '{}'.",
+                group, current.role, role
+            );
+            std::process::exit(1);
+        }
+        match db::update_group_mapping(database, current.id, group, role) {
+            Ok(true) => {
+                println!(
+                    "Group '{}' re-mapped from role '{}' to '{}'.",
+                    group, current.role, role
+                );
+                audit_cli(
+                    database,
+                    "remap_group",
+                    group,
+                    Some(&format!("from={} to={}", current.role, role)),
+                );
+            }
+            Ok(false) => {
+                eprintln!("Mapping for group '{}' disappeared before update.", group);
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    match db::create_group_mapping(database, group, role) {
+        Ok(_) => {
+            println!("Group '{}' mapped to role '{}'.", group, role);
+            audit_cli(
+                database,
+                "map_group",
+                group,
+                Some(&format!("role={}", role)),
+            );
         }
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -1390,6 +1534,10 @@ fn rewrite_branding(html: &str, site_title: &str, logo_url: Option<&str>) -> Str
 
 #[cfg(test)]
 mod tests {
+    // Aliased: a bare `Command` here would shadow the clap `Command` enum that
+    // `use super::*` brings into scope.
+    use assert_cmd::Command as CargoBin;
+
     use super::*;
 
     #[test]
@@ -1471,5 +1619,140 @@ mod tests {
             saw_429,
             "no requests were throttled — rate-limit not applied"
         );
+    }
+    /// Scratch directory for a CLI test, removed on drop so a panicking test
+    /// leaves nothing behind. Named per test because cargo runs tests as
+    /// threads in one process, so a pid-only name would collide.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("rustguac-cli-{}-{}", name, std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            std::fs::write(path.join("config.toml"), "db_path = \"./rustguac.db\"\n")
+                .expect("write config");
+            ScratchDir(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn db(&self) -> Db {
+            db::init_db(&self.0.join("rustguac.db")).expect("open database")
+        }
+
+        /// Runs the CLI against this scratch dir, returning the assertion so
+        /// callers can require success or failure.
+        fn run(&self, args: &[&str]) -> assert_cmd::assert::Assert {
+            let mut cmd = CargoBin::cargo_bin("rustguac").unwrap();
+            cmd.current_dir(self.path())
+                .args(["--config", "config.toml"])
+                .args(args)
+                .assert()
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn cli_map_group() {
+        let dir = ScratchDir::new("map-group");
+        dir.run(&["map-group", "--group", "superhumans", "--role", "admin"])
+            .success();
+
+        let mappings = db::list_group_mappings(&dir.db()).expect("list group mappings");
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].oidc_group, "superhumans");
+        assert_eq!(mappings[0].role, "admin");
+    }
+
+    #[test]
+    fn cli_map_group_rejects_unknown_role() {
+        let dir = ScratchDir::new("map-group-bad-role");
+        dir.run(&["map-group", "--group", "superhumans", "--role", "root"])
+            .failure();
+
+        assert!(
+            db::list_group_mappings(&dir.db())
+                .expect("list group mappings")
+                .is_empty(),
+            "an invalid role must not create a mapping"
+        );
+    }
+
+    /// A duplicate must fail with guidance rather than a raw UNIQUE constraint
+    /// error, and must leave the existing role untouched.
+    #[test]
+    fn cli_map_group_duplicate_needs_force() {
+        let dir = ScratchDir::new("map-group-dup");
+        dir.run(&["map-group", "--group", "staff", "--role", "viewer"])
+            .success();
+
+        let assert = dir
+            .run(&["map-group", "--group", "staff", "--role", "admin"])
+            .failure();
+        let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+        assert!(
+            stderr.contains("--force"),
+            "duplicate should point at --force, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("UNIQUE"),
+            "duplicate should not surface a raw SQL error, got: {stderr}"
+        );
+
+        let mappings = db::list_group_mappings(&dir.db()).expect("list group mappings");
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].role, "viewer", "role must be unchanged");
+    }
+
+    #[test]
+    fn cli_map_group_force_remaps() {
+        let dir = ScratchDir::new("map-group-force");
+        dir.run(&["map-group", "--group", "staff", "--role", "viewer"])
+            .success();
+        dir.run(&[
+            "map-group",
+            "--group",
+            "staff",
+            "--role",
+            "admin",
+            "--force",
+        ])
+        .success();
+
+        let mappings = db::list_group_mappings(&dir.db()).expect("list group mappings");
+        assert_eq!(mappings.len(), 1, "force must re-map, not add a second row");
+        assert_eq!(mappings[0].role, "admin");
+    }
+
+    /// Mapping a group to a role is a privilege grant, so it must leave an
+    /// audit trail even when done from a shell instead of the API.
+    #[test]
+    fn cli_map_group_is_audited() {
+        let dir = ScratchDir::new("map-group-audit");
+        dir.run(&["map-group", "--group", "staff", "--role", "admin"])
+            .success();
+
+        let database = dir.db();
+        let conn = database.lock().unwrap();
+        let (action, target, details): (String, String, String) = conn
+            .query_row(
+                "SELECT action, target, details FROM cli_audit_log ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("an audit row should exist");
+
+        assert_eq!(action, "map_group");
+        assert_eq!(target, "staff");
+        assert_eq!(details, "role=admin");
     }
 }

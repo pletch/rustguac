@@ -255,7 +255,17 @@ pub fn init_db(path: &Path) -> rusqlite::Result<Db> {
             created_at  TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_ab_audit_created ON addressbook_audit_log(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_ab_audit_user ON addressbook_audit_log(user_email);",
+        CREATE INDEX IF NOT EXISTS idx_ab_audit_user ON addressbook_audit_log(user_email);
+
+        CREATE TABLE IF NOT EXISTS cli_audit_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            os_user    TEXT NOT NULL,
+            action     TEXT NOT NULL,
+            target     TEXT,
+            details    TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cli_audit_created ON cli_audit_log(created_at DESC);",
     )?;
 
     // Migration: add oidc_groups column if it doesn't exist
@@ -1090,7 +1100,11 @@ pub fn cleanup_old_audit_log(db: &Db, retain_days: u32) -> rusqlite::Result<usiz
         "DELETE FROM addressbook_audit_log WHERE created_at < datetime('now', ?1)",
         params![&modifier],
     )?;
-    Ok(tok + ab)
+    let cli = conn.execute(
+        "DELETE FROM cli_audit_log WHERE created_at < datetime('now', ?1)",
+        params![&modifier],
+    )?;
+    Ok(tok + ab + cli)
 }
 
 // ── Connections (address book) audit log ──
@@ -1125,6 +1139,34 @@ pub fn log_addressbook_event(
             ip_addr,
             details
         ],
+    )?;
+    Ok(())
+}
+
+// ── CLI audit log ──
+
+/// Record an administrative action performed through the CLI.
+///
+/// CLI commands run locally with direct database access, so they bypass the
+/// API's authenticated audit trail entirely; without this a role grant or an
+/// account deletion made from a shell leaves no record at all.
+///
+/// `target` names what was acted on (an admin name, a user email, an OIDC
+/// group). `details` is free-form and, like the other audit logs, must stay a
+/// headline: never API keys, passwords, or full field values (see
+/// feedback_audit_log_scope.md).
+pub fn log_cli_event(
+    db: &Db,
+    os_user: &str,
+    action: &str,
+    target: Option<&str>,
+    details: Option<&str>,
+) -> rusqlite::Result<()> {
+    let conn = db.lock().unwrap();
+    conn.execute(
+        "INSERT INTO cli_audit_log (os_user, action, target, details)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![os_user, action, target, details],
     )?;
     Ok(())
 }

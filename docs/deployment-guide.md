@@ -215,16 +215,14 @@ This enables AVC 4:4:4, 60 FPS, desktop composition, and GPU encoding.
 Add to `config.toml`:
 
 ```toml
+# Top-level key, so it must appear before the first [section] header
+auth_session_ttl_secs = 28800    # OIDC auth session cookie TTL (default 86400, 24h)
+
 [oidc]
 issuer_url = "https://your-idp.example.com"
 client_id = "rustguac"
 redirect_uri = "https://console.example.com/auth/callback"
 groups_claim = "groups"
-session_ttl_secs = 28800    # 8 hours
-
-[oidc.group_role_mappings]
-"RemoteConsoleAdmins" = "admin"
-"RemoteConsoleUsers" = "operator"
 ```
 
 Set the client secret in `/opt/rustguac/env`:
@@ -234,6 +232,17 @@ echo 'OIDC_CLIENT_SECRET=your-secret-here' | sudo tee -a /opt/rustguac/env
 sudo chmod 600 /opt/rustguac/env
 sudo systemctl restart rustguac
 ```
+
+Group-to-role mappings are stored in the database rather than in `config.toml`. Create them with the CLI once the service is running:
+
+```bash
+/opt/rustguac/bin/rustguac --config /opt/rustguac/config.toml \
+    map-group --group RemoteConsoleAdmins --role admin
+/opt/rustguac/bin/rustguac --config /opt/rustguac/config.toml \
+    map-group --group RemoteConsoleUsers --role operator
+```
+
+They can also be managed in the Admin page or through the API. See [Group-to-role mappings](roles-and-access-control.md#group-to-role-mappings).
 
 See [integrations.md](integrations.md) for provider-specific guides (Authentik, JumpCloud, Entra ID, etc.).
 
