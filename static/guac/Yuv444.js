@@ -331,17 +331,37 @@ Guacamole.Yuv444Renderer = function Yuv444Renderer() {
         '        V = unfilter(V, vR + vD + vRD);',
         '    }',
 
-        /* YUV to RGB. BT.709 at full range, matching the coefficients FreeRDP
-         * decodes these streams with (prim_internal.h: 403, 475, 48, 120 over
-         * 256, with no 16 offset on Y). Using limited-range or BT.601 here
-         * would tint the whole session. */
+        /* YUV to RGB: BT.709 at full range, unconditionally.
+         *
+         * Not read from the decoded frame, which is the tempting thing to do
+         * and gets it wrong. MS-RDPEGFX defines the ARGB-to-AYUV transform as
+         * full-range BT.709, and every host that feeds this shader encodes to
+         * it -- read out of their SPS rather than assumed: Windows writes
+         * video_full_range_flag=1, the xrdp fork writes it with a complete
+         * BT.709 description, and stock xrdp omits the block entirely while
+         * naming its own conversion XRDP_yuv444_709fr.
+         *
+         * What the *browser* reports for those streams is another matter.
+         * Chrome's hardware decoder ignores a bare range flag with no colour
+         * description beside it, and reports limited for a host that plainly
+         * declared full. Adopting that here would expand 16-235 to 0-255 on
+         * full-range samples: blacks crushed to zero, whites clipped, chroma
+         * over-saturated by 255/224.
+         *
+         * The cost of hardcoding is that the 4:2:0 path disagrees. That
+         * picture never reaches this shader -- the browser draws the
+         * VideoFrame itself and applies whatever colour space it decided on --
+         * so a session can render 4:4:4 correctly and 4:2:0 crushed. That is
+         * the lesser of the two errors: one path right beats both wrong, and
+         * the real repair is upstream of the browser, in completing the host's
+         * SPS so that nothing has to guess. */
         '    float u = U - 0.50196078;',  /* 128/255 */
         '    float v = V - 0.50196078;',
 
         '    vec3 rgb = vec3(',
-        '        Y + 1.57421875 * v,',
-        '        Y - 0.18750000 * u - 0.46875000 * v,',
-        '        Y + 1.85546875 * u);',
+        '        Y + 1.5748 * v,',
+        '        Y - 0.187324 * u - 0.468124 * v,',
+        '        Y + 1.8556 * u);',
 
         '    fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);',
         '}'
