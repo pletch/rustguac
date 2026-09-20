@@ -1230,23 +1230,34 @@ prior size is unknown, so a delete of it records nothing. That loses a genuine
 recreation of a surface that existed before the session attached, which is the
 safe direction to fail.
 
-**A backgrounded tab is a suspect for the trigger, and `h264SyncDelay` is how
-to test it without one.** The first mid-session episode caught in the act
+**A backgrounded tab looked like the trigger and is not, at least not by the
+route that suggested it.** The first mid-session episode caught in the act
 (2026-09-19, 704s after the framebuffer settled) followed two tab hides, the
 second ending eight seconds before the recreation, on a session carrying
-`syncTimeouts=10` and `flush max 1299ms` -- figures a hidden tab manufactures,
-since Chrome clamps `setTimeout` to a second when hidden and the sync gate's
-timer is one. guacd reads that inflated round trip as processing lag and `012`
-holds the RDPGFX frame acknowledgement by it, so the *server* sees a client
-that has stopped acking. Upstream carries no `012`, which is one explanation
-for why nobody else reports this. Reproducing it through the browser is
-unreliable -- DevTools attached, audio playing, or a hide shorter than Chrome's
-five-minute grace all leave the tab at full speed, and none of that is visible
-from the page -- so `h264SyncDelay` holds every sync by a fixed number of
-milliseconds instead, putting the same condition on a dial. Read through
-`override()`, so a window global sweeps 200ms/1s/5s without a reload, capped at
-10s, and named in `describeState()` so a session running with it on cannot be
-mistaken for one that is genuinely slow.
+`syncTimeouts=10` and `flush max 1299ms` -- figures a hidden tab manufactures
+rather than suffers, since Chrome clamps `setTimeout` to a second when a tab is
+hidden and the sync gate's timer is one. The chain that suggested itself was:
+inflated round trip, read by guacd as processing lag, holding the RDPGFX frame
+acknowledgement, until Windows treats the client as gone.
+
+**`012` cannot produce that, and the number that says so is
+`GUAC_RDP_H264_ACK_MAX_DELAY_DEFAULT` (400ms).** However far behind a client
+claims to be, the hold is clamped there, so no configuration of this deployment
+can make Windows wait longer than 400ms for a frame acknowledgement. Tested by
+holding every sync response by five seconds: `lag` reads ~5000, `since_last` is
+the Windows-to-guacd frame interval and stays around 20ms, so the clamp bites
+and `012` holds at its full cap on essentially every frame -- Windows dropped
+to roughly 2.5 frames a second and the session was painful to type into, and
+**no surface recreation followed**. That is the worst this deployment can
+inflict, sustained, so the mechanism is ruled out at the settings actually run.
+Raising the cap would test a condition the field never sees.
+
+What that experiment does *not* reproduce is a client that stops **draining**
+the socket rather than merely acking late -- which would close the TCP window,
+block rustguac's send and guacd's write, and stop acknowledgements entirely
+with no cap involved. That is the only route left that survives the 400ms
+clamp, and it competes with the simpler reading that one episode eight seconds
+after a resume was a coincidence.
 
 **The soak is instrumented to decide that**, since reasoning cannot.
 `describeState()` carries four counts: `kept` (both held), `blackUnarmed` (a
