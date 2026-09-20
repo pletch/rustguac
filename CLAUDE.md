@@ -1230,6 +1230,24 @@ prior size is unknown, so a delete of it records nothing. That loses a genuine
 recreation of a surface that existed before the session attached, which is the
 safe direction to fail.
 
+**A backgrounded tab is a suspect for the trigger, and `h264SyncDelay` is how
+to test it without one.** The first mid-session episode caught in the act
+(2026-09-19, 704s after the framebuffer settled) followed two tab hides, the
+second ending eight seconds before the recreation, on a session carrying
+`syncTimeouts=10` and `flush max 1299ms` -- figures a hidden tab manufactures,
+since Chrome clamps `setTimeout` to a second when hidden and the sync gate's
+timer is one. guacd reads that inflated round trip as processing lag and `012`
+holds the RDPGFX frame acknowledgement by it, so the *server* sees a client
+that has stopped acking. Upstream carries no `012`, which is one explanation
+for why nobody else reports this. Reproducing it through the browser is
+unreliable -- DevTools attached, audio playing, or a hide shorter than Chrome's
+five-minute grace all leave the tab at full speed, and none of that is visible
+from the page -- so `h264SyncDelay` holds every sync by a fixed number of
+milliseconds instead, putting the same condition on a dial. Read through
+`override()`, so a window global sweeps 200ms/1s/5s without a reload, capped at
+10s, and named in `describeState()` so a session running with it on cannot be
+mistaken for one that is genuinely slow.
+
 **The soak is instrumented to decide that**, since reasoning cannot.
 `describeState()` carries four counts: `kept` (both held), `blackUnarmed` (a
 black keyframe with no signal behind it -- non-zero means the signal misses

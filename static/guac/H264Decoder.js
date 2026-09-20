@@ -4156,7 +4156,74 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *     2.2 syncs/s with no holds while the screen stopped updating. Reported
      *     beside the hold in `sync_hold`.
      */
+    /**
+     * The largest artificial sync delay that will be honoured, in ms.
+     *
+     * A knob that makes a session deliberately worse needs a ceiling: set by
+     * hand in a console, a stray keystroke turns 500 into 500000 and the
+     * session is unreachable by the same route it was broken from.
+     *
+     * @private
+     * @constant
+     */
+    var MAX_SYNC_DELAY_MS = 10000;
+
+    /**
+     * Milliseconds to hold every sync acknowledgement by, on top of whatever
+     * the decode backlog already costs. Zero unless `h264SyncDelay` asks for
+     * it, and a diagnostic knob only.
+     *
+     * guacd measures the round trip of its `sync` as the client's processing
+     * lag, and the frame-ack back-pressure patch holds the RDPGFX frame
+     * acknowledgement by it -- so this is the one lever that makes the *server*
+     * see a slow client without needing one. A backgrounded tab produces the
+     * same effect through timer throttling, but only when the browser agrees
+     * to throttle it: DevTools attached, audio playing, or a hide shorter than
+     * Chrome's five-minute grace all leave the tab running at full speed, and
+     * none of that is visible from here. This is the same condition on a dial.
+     *
+     * Read through override(), so `window.__h264SyncDelay = 1000` takes effect
+     * on the next sync without a reload -- which is what makes a sweep across
+     * several values possible in one session.
+     *
+     * @private
+     * @returns {!number}
+     */
+    function syncDelayMs() {
+
+        var value = override('h264SyncDelay');
+
+        /* Booleans first: override() turns 'on' into true, which Number()
+         * would read as a one-millisecond delay -- a knob that looks off,
+         * measures as on, and explains nothing. */
+        if (typeof value === 'boolean')
+            return 0;
+
+        /* Coerced rather than type-checked, because the usual way to set this
+         * is by hand in a console, where a quoted number is the likelier
+         * typo than a wrong type. */
+        var ms = Number(value);
+        if (!isFinite(ms) || ms <= 0)
+            return 0;
+
+        return Math.min(ms, MAX_SYNC_DELAY_MS);
+
+    }
+
     this.waitForPending = function(callback, flushMs) {
+
+        /* Injected, so it is applied to the callback rather than folded into
+         * the hold measurements: the statistics should keep reporting what the
+         * client actually cost, not what was added to it. describeState()
+         * names the delay instead, so a session running with the knob on
+         * cannot be mistaken for one that is genuinely slow. */
+        var injected = syncDelayMs();
+        if (injected > 0) {
+            var realCallback = callback;
+            callback = function() {
+                setTimeout(realCallback, injected);
+            };
+        }
 
         /* Charged to the mode the ack was held under, which is the one whose
          * cost is being measured -- a combine switched off mid-hold still
@@ -4236,6 +4303,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 + ' lastKeyframePaint=' + ago(counts.lastKeyframePaintAt)
                 + ' watchdog=' + watchdogFires
                 + ' syncTimeouts=' + syncTimeouts
+                + (syncDelayMs() ? ' SYNCDELAY=' + syncDelayMs() + 'ms' : '')
                 + ' blackKeyframes[kept=' + blackKeyframeStats.armedBlack
                     + ' blackUnarmed=' + blackKeyframeStats.blackNotArmed
                     + ' armedNotBlack=' + blackKeyframeStats.armedNotBlack
