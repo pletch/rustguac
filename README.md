@@ -182,6 +182,8 @@ the measurement work that made the browser-side combine affordable.
   to 4:2:0), `h264ChromaFilter` (off, or a 0-255 threshold; default 30),
   `h264CombineMaxPixels` (the 4K prior above), `h264CopyBands` (off copies
   whole planes), `h264FullRange` (force the decoder's range),
+  `h264SyncDelay` (milliseconds to hold every sync acknowledgement by, for
+  reproducing a slow client on demand; capped at 10s, off unless set),
   `h264BlackProbes` (on re-enables the black-region probing, off by default
   since its causes were found and fixed — the keyframe probe read back the
   whole framebuffer), `h264KeepBlackKeyframes` (off stops withholding a
