@@ -49,6 +49,16 @@ jobs:
       - name: Build
         run: $HOME/.cargo/bin/cargo build --release
 
+      - name: Test
+        # Debug profile deliberately, not --release: debug_assertions and
+        # integer overflow checks are compiled in, and both are switched off
+        # in a release build. The wire-protocol parser and the session
+        # bookkeeping are exactly where an overflow would otherwise pass
+        # silently. Until now nothing here ran the suite at all, so the
+        # regression tests guarding past data-loss and access-control bugs
+        # were never exercised on a PR.
+        run: $HOME/.cargo/bin/cargo test
+
       - name: Security audit
         # Ignored advisories + rationale live in .cargo/audit.toml so new
         # advisories on the same crates still surface.
