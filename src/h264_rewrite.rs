@@ -34,7 +34,8 @@ enum State {
     Undecided,
     /// This stream's SPS needs a description, and each one is rewritten.
     Rewriting,
-    /// This stream needs nothing. Nothing is examined again — which is the
+    /// This stream needs no colour work. Unless it also needs its reordering
+    /// bounded or the gaps flag set, nothing is examined again — which is the
     /// case for xrdp, for any host that already describes its colour, and for
     /// every session with no passthrough at all.
     PassThrough,
@@ -48,6 +49,9 @@ pub enum Edit {
     /// `gaps_in_frame_num_value_allowed_flag` set, ahead of the auxiliary
     /// view being dropped.
     FrameNumGaps,
+    /// `bitstream_restriction` added, declaring no picture reordering on a
+    /// stream whose POC type already guarantees it.
+    NoReordering,
 }
 
 impl Edit {
@@ -66,22 +70,36 @@ impl Edit {
                 "for the pictures the auxiliary view drop removes rather than ",
                 "failing on the holes they leave"
             ),
+            Edit::NoReordering => concat!(
+                "declaring max_num_reorder_frames=0 in the SPS: the stream's ",
+                "POC type 2 already means output order is decode order, but ",
+                "without bitstream_restriction Chrome's decoder holds a whole ",
+                "DPB of pictures before painting any"
+            ),
         }
     }
 }
 
 /// Edits the SPS of one session's H.264 stream, in flight.
 ///
-/// Two independent edits share this pass because both need the same thing --
+/// Three independent edits share this pass because all need the same thing --
 /// the SPS located inside a base64 video blob -- and decoding every keyframe's
-/// blob twice to make them separately would be work for nothing:
+/// blob once per edit would be work for nothing:
 ///
 /// * a colour description, where the host declares a range without one
-///   (`crate::h264_sps`), and
+///   (`crate::h264_sps`),
+/// * a bound of zero on picture reordering, where the POC type guarantees it
+///   and the VUI does not say so (`crate::h264_sps::declare_no_reordering`),
+///   and
 /// * permission to skip `frame_num` values, when `crate::h264_aux_drop` is
 ///   about to start removing pictures that consume them.
 pub struct SpsRewriter {
     state: State,
+    /// Whether this stream's SPS leaves reordering unbounded where it could
+    /// say otherwise. Decided at the first SPS, beside `state`, and kept
+    /// separate from it: the colour and the reorder bound are independent,
+    /// and NVENC needs the second with the first already complete.
+    bound_reordering: bool,
     /// Whether to set `gaps_in_frame_num_value_allowed_flag`. Driven per chunk
     /// by the dropper, which turns it on before it drops anything.
     allow_gaps: bool,
@@ -114,6 +132,7 @@ impl SpsRewriter {
     pub fn new() -> Self {
         Self {
             state: State::Undecided,
+            bound_reordering: false,
             allow_gaps: false,
             pending_edits: Vec::new(),
             made: Vec::new(),
@@ -151,10 +170,10 @@ impl SpsRewriter {
     /// untouched: a blob that cannot be parsed is passed through, never
     /// dropped, since losing one loses a picture.
     pub fn rewrite(&mut self, text: &str) -> Option<String> {
-        // PassThrough means no colour work, which used to end the scan for the
-        // life of the session. It cannot any more: a stream needing no colour
-        // fix may still need the gaps flag.
-        if self.state == State::PassThrough && !self.allow_gaps {
+        // PassThrough means no colour work, which is not the same as no work:
+        // a stream needing no colour fix may still need its reordering bounded
+        // or the gaps flag set.
+        if self.state == State::PassThrough && !self.bound_reordering && !self.allow_gaps {
             return None;
         }
 
@@ -257,17 +276,27 @@ impl SpsRewriter {
             } else {
                 State::PassThrough
             };
+            self.bound_reordering = crate::h264_sps::reordering_unbounded(&bytes[sps.clone()]);
         }
 
-        // Both edits, in either combination. Each returns None when it has
-        // nothing to do -- an SPS that already describes its colour, or that
-        // already permits gaps -- so an SPS needing neither rebuilds nothing.
+        // Every edit, in any combination. Each returns None when it has
+        // nothing to do -- an SPS that already describes its colour, bounds
+        // its reordering or permits gaps -- so an SPS needing none of them
+        // rebuilds nothing.
         let mut edited: Option<Vec<u8>> = None;
 
         if self.state == State::Rewriting {
             edited = crate::h264_sps::complete_colour_signalling(&bytes[sps.clone()]);
             if edited.is_some() {
                 self.note(Edit::ColourDescription);
+            }
+        }
+
+        if self.bound_reordering {
+            let current = edited.as_deref().unwrap_or(&bytes[sps.clone()]);
+            if let Some(bounded) = crate::h264_sps::declare_no_reordering(current) {
+                edited = Some(bounded);
+                self.note(Edit::NoReordering);
             }
         }
 
@@ -372,6 +401,49 @@ mod tests {
             r.take_edits().is_empty(),
             "each edit is reported once a session"
         );
+    }
+
+    /// The head of an NVENC keyframe (SPS, PPS, the start of an IDR slice):
+    /// colour complete, POC type 2, no `bitstream_restriction`.
+    const NVENC: &str = "AAAAAWdNQDKVkALwDR5awFuAgICgAAB9AAAdTBCAAAAAAWjrjyAAAAABZbgEJ/5vXw==";
+
+    /// A stream needing no colour work is still examined for the reorder
+    /// bound, and every keyframe's SPS gets it -- a decoder rebuilt at a later
+    /// keyframe reads that SPS, not the first.
+    #[test]
+    fn an_nvenc_stream_is_bounded_on_every_keyframe() {
+        let mut r = SpsRewriter::new();
+        r.rewrite("4.h264,1.7,1.0,1.0;");
+
+        let first = r.rewrite(&blob(7, NVENC)).expect("rewritten");
+        assert_eq!(r.take_edits(), vec![Edit::NoReordering]);
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload_of(&first))
+            .unwrap();
+        let sps = crate::h264_sps::find_sps_range(&bytes).unwrap();
+        assert!(!crate::h264_sps::reordering_unbounded(&bytes[sps]));
+        assert_eq!(decoded_signal(&payload_of(&first)), decoded_signal(NVENC));
+        assert!(
+            bytes.ends_with(&[0, 0, 0, 1, 0x65, 0xb8, 0x04, 0x27, 0xfe, 0x6f, 0x5f]),
+            "the slice after the SPS is untouched"
+        );
+
+        assert!(
+            r.rewrite(&blob(7, NVENC)).is_some(),
+            "and the next keyframe"
+        );
+        assert!(r.take_edits().is_empty());
+    }
+
+    /// A stream that already bounds its reordering, or cannot, is left alone.
+    #[test]
+    fn a_stream_needing_nothing_is_still_passed_through() {
+        let mut r = SpsRewriter::new();
+        r.rewrite("4.h264,1.7,1.0,1.0;");
+        assert_eq!(r.rewrite(&blob(7, COMPLETE)), None, "x264, POC type 0");
+        assert_eq!(r.state, State::PassThrough);
+        assert!(!r.bound_reordering);
     }
 
     #[test]

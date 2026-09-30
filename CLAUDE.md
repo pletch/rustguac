@@ -176,6 +176,17 @@ of the rewrite and keep the original stream; `?h264FullRange=on` is the lever
 for playback and for any host whose declaration cannot be believed. Full detail
 in `docs/rdp-h264.md`.
 
+**An SPS without `bitstream_restriction` freezes Chrome's hardware decoder
+for a DPB's worth of pictures** unless it is High-family with
+`constraint_set3`; Chromium has no shortcut for POC type 2. NVENC at its
+defaults sends exactly that (Main, POC 2, no restriction), so every picture
+came out five late, past the 1000ms decode watchdog on an idle desktop, and
+nothing was painted -- a white or frozen screen from a stream mstsc and ffmpeg
+decode perfectly. `declare_no_reordering` in `src/h264_sps.rs` adds
+`max_num_reorder_frames=0` where POC type 2 already guarantees it, and nowhere
+else. The tell is `avg_lag_ms` near 1000 with `frames_abandoned` and no decode
+error. Detail in `docs/rdp-h264.md`.
+
 **AVC444 is two 4:2:0 streams, not High 4:4:4 Predictive profile.**
 `RFX_AVC444_BITMAP_STREAM` [encapsulates two
 `RFX_AVC420_BITMAP_STREAM`s](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/8131c1bc-1af8-4907-a05a-f72f4581160f),
