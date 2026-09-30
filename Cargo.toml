@@ -96,3 +96,6 @@ pulldown-cmark = "0.13"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+# Integration tests read the SQLite the CLI wrote. Already a runtime
+# dependency, so this adds nothing new to the tree.
+rusqlite = { version = "0.40", features = ["bundled"] }
