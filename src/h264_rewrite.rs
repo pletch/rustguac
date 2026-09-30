@@ -34,18 +34,77 @@ enum State {
     Undecided,
     /// This stream's SPS needs a description, and each one is rewritten.
     Rewriting,
-    /// This stream needs nothing. Nothing is examined again — which is the
+    /// This stream needs no colour work. Unless it also needs its reordering
+    /// bounded, nothing is examined again — which is the
     /// case for xrdp, for any host that already describes its colour, and for
     /// every session with no passthrough at all.
     PassThrough,
 }
 
-/// Splices a colour description into the SPS of one session's H.264 stream.
+/// One of the two edits `SpsRewriter` makes, for the caller to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edit {
+    /// A colour description spliced in beside a range the host declared bare.
+    ColourDescription,
+    /// `bitstream_restriction` added, declaring no picture reordering on a
+    /// stream whose POC type already guarantees it.
+    NoReordering,
+}
+
+impl Edit {
+    /// What to say the first time this edit is made. Phrased for the journal,
+    /// where it sits beside the `H.264 colour:` line describing what the host
+    /// sent and, later, the browser's own report of what it made of it.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Edit::ColourDescription => concat!(
+                "splicing a BT.709 description into the SPS, which Chrome's ",
+                "hardware decoder needs before it will act on the range the ",
+                "host declared"
+            ),
+            Edit::NoReordering => concat!(
+                "declaring max_num_reorder_frames=0 in the SPS: the stream's ",
+                "POC type 2 already means output order is decode order, but ",
+                "without bitstream_restriction Chrome's decoder holds a whole ",
+                "DPB of pictures before painting any"
+            ),
+        }
+    }
+}
+
+/// Edits the SPS of one session's H.264 stream, in flight.
+///
+/// Two independent edits share this pass because both need the same thing --
+/// the SPS located inside a base64 video blob -- and decoding every keyframe's
+/// blob once per edit would be work for nothing:
+///
+/// * a colour description, where the host declares a range without one
+///   (`crate::h264_sps`), and
+/// * a bound of zero on picture reordering, where the POC type guarantees it
+///   and the VUI does not say so (`crate::h264_sps::declare_no_reordering`).
 pub struct SpsRewriter {
     state: State,
     /// What the stream's first SPS declared about colour, as the host sent
     /// it, until the caller takes it to log. See `take_wire_colour`.
     wire_colour: Option<String>,
+    /// Whether this stream's SPS leaves reordering unbounded where it could
+    /// say otherwise. Decided at the first SPS, beside `state`, and kept
+    /// separate from it: the colour and the reorder bound are independent,
+    /// and NVENC needs the second with the first already complete.
+    bound_reordering: bool,
+    /// Edits actually made and not yet reported.
+    ///
+    /// Held rather than inferred from `rewrite()` returning `Some`: with two
+    /// independent edits sharing the pass that answers "something changed",
+    /// not "the colour description was added". An NVENC host, whose SPS
+    /// already describes its colour and needs only its reordering bounded,
+    /// would be logged as having a description spliced into it -- a line that
+    /// is false, about the one subject where the wire log and the browser's
+    /// report are meant to be read against each other.
+    pending_edits: Vec<Edit>,
+    /// Edits already reported once, so a stream carrying a keyframe a minute
+    /// does not repeat them.
+    made: Vec<Edit>,
     /// Stream indices opened by an `h264` instruction. `audio` is deliberately
     /// not tracked: its blobs are not video and decoding them to look for a
     /// start code would be work for nothing.
@@ -63,6 +122,9 @@ impl SpsRewriter {
         Self {
             state: State::Undecided,
             wire_colour: None,
+            bound_reordering: false,
+            pending_edits: Vec::new(),
+            made: Vec::new(),
             h264_streams: HashSet::new(),
         }
     }
@@ -76,6 +138,21 @@ impl SpsRewriter {
         self.wire_colour.take()
     }
 
+    /// The edits made since this was last called, each reported once for the
+    /// life of the session. Empty on all but a couple of chunks.
+    pub fn take_edits(&mut self) -> Vec<Edit> {
+        std::mem::take(&mut self.pending_edits)
+    }
+
+    /// Records an edit the first time it is made, so the caller can say what
+    /// happened rather than that something did.
+    fn note(&mut self, edit: Edit) {
+        if !self.made.contains(&edit) {
+            self.made.push(edit);
+            self.pending_edits.push(edit);
+        }
+    }
+
     /// Rewrites the SPS in any video blob in `text`, returning the new run of
     /// instructions — or `None` when nothing needed changing, which is the
     /// common case and copies nothing.
@@ -85,7 +162,9 @@ impl SpsRewriter {
     /// untouched: a blob that cannot be parsed is passed through, never
     /// dropped, since losing one loses a picture.
     pub fn rewrite(&mut self, text: &str) -> Option<String> {
-        if self.state == State::PassThrough {
+        // PassThrough means no colour work, which is not the same as no work:
+        // a stream needing no colour fix may still need its reordering bounded.
+        if self.state == State::PassThrough && !self.bound_reordering {
             return None;
         }
 
@@ -189,13 +268,30 @@ impl SpsRewriter {
             } else {
                 State::PassThrough
             };
+            self.bound_reordering = crate::h264_sps::reordering_unbounded(&bytes[sps.clone()]);
         }
 
-        if self.state != State::Rewriting {
-            return None;
+        // Both edits, in either combination. Each returns None when it has
+        // nothing to do -- an SPS that already describes its colour or bounds
+        // its reordering -- so an SPS needing neither rebuilds nothing.
+        let mut edited: Option<Vec<u8>> = None;
+
+        if self.state == State::Rewriting {
+            edited = crate::h264_sps::complete_colour_signalling(&bytes[sps.clone()]);
+            if edited.is_some() {
+                self.note(Edit::ColourDescription);
+            }
         }
 
-        let spliced = crate::h264_sps::complete_colour_signalling(&bytes[sps.clone()])?;
+        if self.bound_reordering {
+            let current = edited.as_deref().unwrap_or(&bytes[sps.clone()]);
+            if let Some(bounded) = crate::h264_sps::declare_no_reordering(current) {
+                edited = Some(bounded);
+                self.note(Edit::NoReordering);
+            }
+        }
+
+        let spliced = edited?;
 
         let mut rebuilt = Vec::with_capacity(bytes.len() + spliced.len());
         rebuilt.extend_from_slice(&bytes[..sps.start]);
@@ -241,6 +337,85 @@ mod tests {
             .decode(payload)
             .expect("valid base64");
         crate::h264_sps::find_sps(&bytes).expect("an SPS")
+    }
+
+    /// The two edits are independent, and the caller reports what was
+    /// actually done. Inferring it from "something changed" would tell an
+    /// NVENC session -- whose SPS describes its colour completely and needs
+    /// only its reordering bounded -- that a BT.709 description was being
+    /// spliced into it, which points whoever reads the journal at a colour
+    /// fault that is not there.
+    #[test]
+    fn it_says_which_edit_it_made() {
+        let mut r = SpsRewriter::new();
+        r.rewrite("4.h264,1.7,1.0,1.0;");
+        assert!(
+            r.rewrite(&blob(7, NVENC)).is_some(),
+            "the reordering is bounded"
+        );
+        assert_eq!(
+            r.take_edits(),
+            vec![Edit::NoReordering],
+            "a complete description is not spliced into"
+        );
+
+        let mut r = SpsRewriter::new();
+        r.rewrite("4.h264,1.7,1.0,1.0;");
+        assert!(
+            r.rewrite(&blob(7, BARE)).is_some(),
+            "the description is added"
+        );
+        assert_eq!(r.take_edits(), vec![Edit::ColourDescription]);
+
+        // Said once, however many keyframes follow.
+        r.rewrite(&blob(7, BARE));
+        assert!(
+            r.take_edits().is_empty(),
+            "each edit is reported once a session"
+        );
+    }
+
+    /// The head of an NVENC keyframe (SPS, PPS, the start of an IDR slice):
+    /// colour complete, POC type 2, no `bitstream_restriction`.
+    const NVENC: &str = "AAAAAWdNQDKVkALwDR5awFuAgICgAAB9AAAdTBCAAAAAAWjrjyAAAAABZbgEJ/5vXw==";
+
+    /// A stream needing no colour work is still examined for the reorder
+    /// bound, and every keyframe's SPS gets it -- a decoder rebuilt at a later
+    /// keyframe reads that SPS, not the first.
+    #[test]
+    fn an_nvenc_stream_is_bounded_on_every_keyframe() {
+        let mut r = SpsRewriter::new();
+        r.rewrite("4.h264,1.7,1.0,1.0;");
+
+        let first = r.rewrite(&blob(7, NVENC)).expect("rewritten");
+        assert_eq!(r.take_edits(), vec![Edit::NoReordering]);
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload_of(&first))
+            .unwrap();
+        let sps = crate::h264_sps::find_sps_range(&bytes).unwrap();
+        assert!(!crate::h264_sps::reordering_unbounded(&bytes[sps]));
+        assert_eq!(decoded_signal(&payload_of(&first)), decoded_signal(NVENC));
+        assert!(
+            bytes.ends_with(&[0, 0, 0, 1, 0x65, 0xb8, 0x04, 0x27, 0xfe, 0x6f, 0x5f]),
+            "the slice after the SPS is untouched"
+        );
+
+        assert!(
+            r.rewrite(&blob(7, NVENC)).is_some(),
+            "and the next keyframe"
+        );
+        assert!(r.take_edits().is_empty());
+    }
+
+    /// A stream that already bounds its reordering, or cannot, is left alone.
+    #[test]
+    fn a_stream_needing_nothing_is_still_passed_through() {
+        let mut r = SpsRewriter::new();
+        r.rewrite("4.h264,1.7,1.0,1.0;");
+        assert_eq!(r.rewrite(&blob(7, COMPLETE)), None, "x264, POC type 0");
+        assert_eq!(r.state, State::PassThrough);
+        assert!(!r.bound_reordering);
     }
 
     #[test]

@@ -118,24 +118,29 @@ impl ColourSignal {
 }
 
 /// Reads bits big-endian, with the exp-Golomb codings the SPS is written in.
-struct BitReader<'a> {
+///
+/// Shared with `crate::h264_refs`, which reads slice headers out of the same
+/// streams: the two parsers walk different syntax structures but the same
+/// bit-level codings, and a second copy of these four methods is a second
+/// place for an off-by-one to live.
+pub(crate) struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
 
-    fn bit(&mut self) -> Option<u32> {
+    pub(crate) fn bit(&mut self) -> Option<u32> {
         let byte = self.data.get(self.pos >> 3)?;
         let bit = (byte >> (7 - (self.pos & 7))) & 1;
         self.pos += 1;
         Some(u32::from(bit))
     }
 
-    fn bits(&mut self, count: u32) -> Option<u32> {
+    pub(crate) fn bits(&mut self, count: u32) -> Option<u32> {
         // Every field read here is at most 32 bits wide; a wider read is a bug
         // in the caller rather than something to handle.
         debug_assert!(count <= 32);
@@ -147,7 +152,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Unsigned exp-Golomb.
-    fn ue(&mut self) -> Option<u32> {
+    pub(crate) fn ue(&mut self) -> Option<u32> {
         let mut zeros = 0u32;
         while self.bit()? == 0 {
             zeros += 1;
@@ -164,7 +169,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Signed exp-Golomb.
-    fn se(&mut self) -> Option<i32> {
+    pub(crate) fn se(&mut self) -> Option<i32> {
         let k = self.ue()?;
         Some(if k % 2 == 0 {
             -((k / 2) as i32)
@@ -175,7 +180,7 @@ impl<'a> BitReader<'a> {
 }
 
 /// Strips emulation prevention bytes: 00 00 03 in the payload means 00 00.
-fn unescape(nal: &[u8]) -> Vec<u8> {
+pub(crate) fn unescape(nal: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(nal.len());
     let mut i = 0;
     while i < nal.len() {
@@ -194,7 +199,7 @@ fn unescape(nal: &[u8]) -> Vec<u8> {
 /// Parses the colour signalling out of one SPS NAL payload (without its header
 /// byte). Returns None if the SPS is malformed or truncated.
 pub fn parse_sps(payload: &[u8]) -> Option<ColourSignal> {
-    parse_rbsp(&unescape(payload)).map(|(signal, _)| signal)
+    parse_rbsp(&unescape(payload)).map(|parsed| parsed.signal)
 }
 
 /// Where colour signalling can be spliced into an SPS, and what is missing.
@@ -216,15 +221,12 @@ enum SpliceSite {
     Nowhere,
 }
 
-/// Parses an unescaped SPS, also reporting the bit position of
-/// `colour_description_present_flag` — which is where a description has to be
-/// spliced in, and is not recoverable from the parsed values.
+/// Walks an SPS RBSP from its first byte up to `log2_max_frame_num_minus4`.
 ///
-/// The position is `None` when the walk never reached that flag, which is the
-/// case for an SPS with no VUI or no `video_signal_type`.
-fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
-    let mut r = BitReader::new(rbsp);
-
+/// The high-profile chroma format and the optional scaling lists are the
+/// fiddliest part of the walk, and the part whose cost of being wrong is
+/// silent: everything after it would still parse, just from the wrong bits.
+fn skip_sps_prefix(r: &mut BitReader) -> Option<()> {
     let profile_idc = r.bits(8)?;
     r.bits(8)?; // constraint flags + reserved
     r.bits(8)?; // level_idc
@@ -263,6 +265,98 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
         }
     }
 
+    Some(())
+}
+
+/// Where `bitstream_restriction` can be added to an SPS that lacks it.
+///
+/// Only ever offered for `pic_order_cnt_type` 2, where the SPS itself
+/// guarantees that output order is decode order -- so declaring no reordering
+/// asserts nothing the stream has not already said. See
+/// `declare_no_reordering`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReorderSite {
+    /// `vui_parameters_present_flag` is 0 and sits at this bit: a whole VUI
+    /// has to be written, empty but for the restriction.
+    NoVui(usize),
+    /// `bitstream_restriction_flag` is 0 and sits at this bit.
+    Flag(usize),
+    /// Nothing to add -- already bounded, a POC type that can reorder, or a
+    /// VUI this walk could not get to the end of.
+    Nowhere,
+}
+
+/// What one SPS says, and the places it can be edited.
+struct Parsed {
+    signal: ColourSignal,
+    splice: SpliceSite,
+    reorder: ReorderSite,
+    max_num_ref_frames: u32,
+}
+
+/// Walks `hrd_parameters()`, which sits between the timing info and the
+/// bitstream restriction and has to be passed to reach it.
+fn skip_hrd(r: &mut BitReader) -> Option<()> {
+    let cpb_cnt = r.ue()? + 1;
+    // Bounded by the standard at 32; anything larger is corrupt input.
+    if cpb_cnt > 32 {
+        return None;
+    }
+    r.bits(4)?; // bit_rate_scale
+    r.bits(4)?; // cpb_size_scale
+    for _ in 0..cpb_cnt {
+        r.ue()?; // bit_rate_value_minus1
+        r.ue()?; // cpb_size_value_minus1
+        r.bit()?; // cbr_flag
+    }
+    r.bits(5)?; // initial_cpb_removal_delay_length_minus1
+    r.bits(5)?; // cpb_removal_delay_length_minus1
+    r.bits(5)?; // dpb_output_delay_length_minus1
+    r.bits(5)?; // time_offset_length
+    Some(())
+}
+
+/// Walks the VUI from `chroma_loc_info_present_flag` to
+/// `bitstream_restriction_flag`, returning that flag's bit position if it is
+/// clear, or `None` if it is set or the VUI cannot be read that far.
+fn unrestricted_flag_bit(r: &mut BitReader) -> Option<usize> {
+    if r.bit()? == 1 {
+        r.ue()?; // chroma_sample_loc_type_top_field
+        r.ue()?; // chroma_sample_loc_type_bottom_field
+    }
+    if r.bit()? == 1 {
+        r.bits(32)?; // num_units_in_tick
+        r.bits(32)?; // time_scale
+        r.bit()?; // fixed_frame_rate_flag
+    }
+    let nal_hrd = r.bit()? == 1;
+    if nal_hrd {
+        skip_hrd(r)?;
+    }
+    let vcl_hrd = r.bit()? == 1;
+    if vcl_hrd {
+        skip_hrd(r)?;
+    }
+    if nal_hrd || vcl_hrd {
+        r.bit()?; // low_delay_hrd_flag
+    }
+    r.bit()?; // pic_struct_present_flag
+
+    let at = r.pos;
+    (r.bit()? == 0).then_some(at)
+}
+
+/// Parses an unescaped SPS, also reporting the bit position of
+/// `colour_description_present_flag` — which is where a description has to be
+/// spliced in, and is not recoverable from the parsed values.
+///
+/// The position is `None` when the walk never reached that flag, which is the
+/// case for an SPS with no VUI or no `video_signal_type`.
+fn parse_rbsp(rbsp: &[u8]) -> Option<Parsed> {
+    let mut r = BitReader::new(rbsp);
+
+    skip_sps_prefix(&mut r)?;
+
     r.ue()?; // log2_max_frame_num_minus4
     let pic_order_cnt_type = r.ue()?;
     if pic_order_cnt_type == 0 {
@@ -282,7 +376,7 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
         }
     }
 
-    r.ue()?; // max_num_ref_frames
+    let max_num_ref_frames = r.ue()?;
     r.bit()?; // gaps_in_frame_num_value_allowed_flag
     r.ue()?; // pic_width_in_mbs_minus1
     r.ue()?; // pic_height_in_map_units_minus1
@@ -297,10 +391,16 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
         r.ue()?; // frame_crop_bottom_offset
     }
 
+    // POC type 2 derives picture order from decode order, so output order is
+    // decode order -- the one case where the SPS itself proves that nothing
+    // is reordered, and so the only one where saying so is safe.
+    let can_bound_reordering = pic_order_cnt_type == 2;
+
+    let vui_flag_bit = r.pos;
     if r.bit()? == 0 {
         // vui_parameters_present_flag = 0
-        return Some((
-            ColourSignal {
+        return Some(Parsed {
+            signal: ColourSignal {
                 vui_present: false,
                 video_signal_type_present: false,
                 full_range: false,
@@ -308,8 +408,14 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
                 transfer: None,
                 matrix: None,
             },
-            SpliceSite::Nowhere,
-        ));
+            splice: SpliceSite::Nowhere,
+            reorder: if can_bound_reordering {
+                ReorderSite::NoVui(vui_flag_bit)
+            } else {
+                ReorderSite::Nowhere
+            },
+            max_num_ref_frames,
+        });
     }
 
     if r.bit()? == 1 {
@@ -324,10 +430,10 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
     }
 
     let signal_type_flag_bit = r.pos;
-    if r.bit()? == 0 {
+    let (signal, splice) = if r.bit()? == 0 {
         // video_signal_type_present_flag = 0 -- the whole block is missing,
         // which is what stock xrdp's x264 defaults produce.
-        return Some((
+        (
             ColourSignal {
                 vui_present: true,
                 video_signal_type_present: false,
@@ -337,38 +443,53 @@ fn parse_rbsp(rbsp: &[u8]) -> Option<(ColourSignal, SpliceSite)> {
                 matrix: None,
             },
             SpliceSite::SignalType(signal_type_flag_bit),
-        ));
-    }
-
-    r.bits(3)?; // video_format
-    let full_range = r.bit()? == 1;
-
-    let description_flag_bit = r.pos;
-    let (primaries, transfer, matrix) = if r.bit()? == 1 {
-        (
-            Some(r.bits(8)? as u8),
-            Some(r.bits(8)? as u8),
-            Some(r.bits(8)? as u8),
         )
     } else {
-        (None, None, None)
+        r.bits(3)?; // video_format
+        let full_range = r.bit()? == 1;
+
+        let description_flag_bit = r.pos;
+        let (primaries, transfer, matrix) = if r.bit()? == 1 {
+            (
+                Some(r.bits(8)? as u8),
+                Some(r.bits(8)? as u8),
+                Some(r.bits(8)? as u8),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        (
+            ColourSignal {
+                vui_present: true,
+                video_signal_type_present: true,
+                full_range,
+                primaries,
+                transfer,
+                matrix,
+            },
+            if primaries.is_some() {
+                SpliceSite::Nowhere
+            } else {
+                SpliceSite::Description(description_flag_bit)
+            },
+        )
     };
 
-    Some((
-        ColourSignal {
-            vui_present: true,
-            video_signal_type_present: true,
-            full_range,
-            primaries,
-            transfer,
-            matrix,
-        },
-        if primaries.is_some() {
-            SpliceSite::Nowhere
-        } else {
-            SpliceSite::Description(description_flag_bit)
-        },
-    ))
+    // The colour is settled by here; the rest of the VUI only matters to the
+    // reordering edit, so a VUI that cannot be walked to its end costs that
+    // edit and nothing else.
+    let reorder = match unrestricted_flag_bit(&mut r) {
+        Some(at) if can_bound_reordering => ReorderSite::Flag(at),
+        _ => ReorderSite::Nowhere,
+    };
+
+    Some(Parsed {
+        signal,
+        splice,
+        reorder,
+        max_num_ref_frames,
+    })
 }
 
 /// Writes bits big-endian, for splicing an SPS back together.
@@ -400,6 +521,14 @@ impl BitWriter {
         for i in (0..count).rev() {
             self.bit((value >> i) & 1);
         }
+    }
+
+    /// Unsigned exp-Golomb, for values well short of `u32::MAX`.
+    fn ue(&mut self, value: u32) {
+        let coded = value + 1;
+        let width = 32 - coded.leading_zeros();
+        self.bits_of(0, width - 1);
+        self.bits_of(coded, width);
     }
 }
 
@@ -456,7 +585,7 @@ fn escape(rbsp: &[u8]) -> Vec<u8> {
 /// is the value the decoder was already assuming.
 pub fn complete_colour_signalling(payload: &[u8]) -> Option<Vec<u8>> {
     let rbsp = unescape(payload);
-    let (_, site) = parse_rbsp(&rbsp)?;
+    let site = parse_rbsp(&rbsp)?.splice;
 
     let mut w = BitWriter::new(rbsp.len() + 8);
     let mut r = BitReader::new(&rbsp);
@@ -490,6 +619,84 @@ pub fn complete_colour_signalling(payload: &[u8]) -> Option<Vec<u8>> {
     // The flag being replaced, then everything after it verbatim. The tail
     // includes rbsp_trailing_bits; shifting it is harmless, since the stop bit
     // travels with it and trailing zeroes are padding either way.
+    r.bit()?;
+    while let Some(bit) = r.bit() {
+        w.bit(bit);
+    }
+
+    Some(escape(&w.data))
+}
+
+/// Whether `declare_no_reordering` has anything to do for this SPS payload.
+pub fn reordering_unbounded(payload: &[u8]) -> bool {
+    parse_rbsp(&unescape(payload)).is_some_and(|p| p.reorder != ReorderSite::Nowhere)
+}
+
+/// Adds `bitstream_restriction` declaring `max_num_reorder_frames` 0 to an SPS
+/// whose POC type already guarantees it, returning the rewritten NAL payload.
+///
+/// **Without it Chrome holds a whole DPB of pictures before painting one.**
+/// Its decoder (`H264Decoder::UpdateMaxNumReorderFrames()` in
+/// `media/gpu/h264_decoder.cc`) takes the reorder depth from
+/// `bitstream_restriction` when present, as zero for the High-family profiles
+/// with `constraint_set3_flag`, and as the full DPB otherwise -- with no
+/// shortcut for POC type 2, which is what makes the answer knowable. NVENC
+/// writes exactly that shape (Main, `constraint_set1` only, POC type 2, a VUI
+/// without the restriction), and at 2992x1648 level 5.0 the DPB is five
+/// pictures: every picture emerged five pictures late, past the client's
+/// 1000ms watchdog on an idle desktop, and nothing was ever painted. mstsc
+/// decodes it without delay; ffmpeg does too.
+///
+/// The fields beside the reorder depth are the values the standard infers
+/// when the block is absent (E.2.1), so they claim nothing new.
+/// `max_dec_frame_buffering` is `max_num_ref_frames`: with no reordering only
+/// references stay in the DPB, which is what the xrdp fork's VA-API encoder
+/// declares.
+///
+/// Returns `None` when the SPS is malformed or there is nothing to do.
+pub fn declare_no_reordering(payload: &[u8]) -> Option<Vec<u8>> {
+    let rbsp = unescape(payload);
+    let parsed = parse_rbsp(&rbsp)?;
+
+    let at = match parsed.reorder {
+        ReorderSite::Nowhere => return None,
+        ReorderSite::NoVui(at) | ReorderSite::Flag(at) => at,
+    };
+
+    let mut w = BitWriter::new(rbsp.len() + 8);
+    let mut r = BitReader::new(&rbsp);
+
+    for _ in 0..at {
+        w.bit(r.bit()?);
+    }
+
+    // The flag being replaced -- vui_parameters_present_flag or
+    // bitstream_restriction_flag -- now set.
+    w.bit(1);
+
+    if let ReorderSite::NoVui(_) = parsed.reorder {
+        // An otherwise empty VUI: every flag up to the restriction clear,
+        // which is what an absent VUI already meant.
+        w.bit(0); // aspect_ratio_info_present_flag
+        w.bit(0); // overscan_info_present_flag
+        w.bit(0); // video_signal_type_present_flag
+        w.bit(0); // chroma_loc_info_present_flag
+        w.bit(0); // timing_info_present_flag
+        w.bit(0); // nal_hrd_parameters_present_flag
+        w.bit(0); // vcl_hrd_parameters_present_flag
+        w.bit(0); // pic_struct_present_flag
+        w.bit(1); // bitstream_restriction_flag
+    }
+
+    w.bit(1); // motion_vectors_over_pic_boundaries_flag
+    w.ue(2); // max_bytes_per_pic_denom
+    w.ue(1); // max_bits_per_mb_denom
+    w.ue(15); // log2_max_mv_length_horizontal
+    w.ue(15); // log2_max_mv_length_vertical
+    w.ue(0); // max_num_reorder_frames
+    w.ue(parsed.max_num_ref_frames); // max_dec_frame_buffering
+
+    // Everything after the flag verbatim, rbsp_trailing_bits included.
     r.bit()?;
     while let Some(bit) = r.bit() {
         w.bit(bit);
@@ -536,7 +743,7 @@ pub fn find_sps_range(annexb: &[u8]) -> Option<std::ops::Range<usize>> {
     None
 }
 
-fn next_start_code(data: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn next_start_code(data: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i + 3 <= data.len() {
         if data[i] == 0 && data[i + 1] == 0 && (data[i + 2] == 1 || data[i + 2] == 3) {
@@ -782,10 +989,201 @@ mod tests {
         }
     }
 
+    /// NVENC's SPS as the xrdp fork's accel-assist sent it (2026-09-30): Main,
+    /// `constraint_set1` only, level 5.0, POC type 2, three reference frames,
+    /// a full-range BT.709 description and timing info -- and no
+    /// `bitstream_restriction`, the shape Chrome holds a DPB of pictures for.
+    const NVENC_UNRESTRICTED: &[u8] = &[
+        0x4d, 0x40, 0x32, 0x95, 0x90, 0x02, 0xf0, 0x0d, 0x1e, 0x5a, 0xc0, 0x5b, 0x80, 0x80, 0x80,
+        0xa0, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x1d, 0x4c, 0x10, 0x80,
+    ];
+
+    /// The xrdp fork's VA-API SPS from the same day: High, POC type 2, and a
+    /// `bitstream_restriction` already declaring no reordering.
+    const VAAPI_RESTRICTED: &[u8] = &[
+        0x64, 0x00, 0x34, 0xac, 0xb4, 0x01, 0x78, 0x06, 0x8f, 0x2d, 0x4d, 0xc0, 0x40, 0x40, 0x41,
+        0xe1, 0x10, 0x8d, 0x40,
+    ];
+
+    /// `NVENC_UNRESTRICTED` cut off after `frame_cropping`, with
+    /// `vui_parameters_present_flag` clear: the no-VUI shape, which no encoder
+    /// in the field sends but which the edit has to handle all the same.
+    fn nvenc_without_vui() -> Vec<u8> {
+        let rbsp = unescape(NVENC_UNRESTRICTED);
+        let at = {
+            let mut r = BitReader::new(&rbsp);
+            skip_sps_prefix(&mut r).unwrap();
+            r.ue().unwrap(); // log2_max_frame_num_minus4
+            assert_eq!(r.ue().unwrap(), 2, "POC type");
+            r.ue().unwrap(); // max_num_ref_frames
+            r.bit().unwrap(); // gaps
+            r.ue().unwrap();
+            r.ue().unwrap();
+            if r.bit().unwrap() == 0 {
+                r.bit().unwrap();
+            }
+            r.bit().unwrap();
+            if r.bit().unwrap() == 1 {
+                for _ in 0..4 {
+                    r.ue().unwrap();
+                }
+            }
+            r.pos
+        };
+        let mut r = BitReader::new(&rbsp);
+        let mut w = BitWriter::new(rbsp.len());
+        for _ in 0..at {
+            w.bit(r.bit().unwrap());
+        }
+        w.bit(0); // vui_parameters_present_flag
+        w.bit(1); // rbsp_stop_one_bit
+        escape(&w.data)
+    }
+
+    #[test]
+    fn only_an_unrestricted_poc_type_2_stream_is_bounded() {
+        assert!(reordering_unbounded(NVENC_UNRESTRICTED));
+        assert!(reordering_unbounded(&nvenc_without_vui()));
+
+        // Already restricted.
+        assert!(!reordering_unbounded(VAAPI_RESTRICTED));
+        assert!(declare_no_reordering(VAAPI_RESTRICTED).is_none());
+
+        // x264 at its defaults uses POC type 0, which can reorder: declaring
+        // otherwise would be a claim the stream has not made.
+        for sps in [
+            FULL_RANGE_COMPLETE,
+            NO_SIGNAL_TYPE,
+            FULL_RANGE_NO_DESCRIPTION,
+        ] {
+            assert!(!reordering_unbounded(sps));
+            assert!(declare_no_reordering(sps).is_none());
+        }
+    }
+
+    #[test]
+    fn bounding_reordering_leaves_the_colour_alone() {
+        let before = parse_sps(NVENC_UNRESTRICTED).expect("parses");
+        let rewritten = declare_no_reordering(NVENC_UNRESTRICTED).expect("rewritten");
+        assert_eq!(parse_sps(&rewritten), Some(before));
+
+        // Idempotent.
+        assert!(declare_no_reordering(&rewritten).is_none());
+
+        for sps in [
+            rewritten,
+            declare_no_reordering(&nvenc_without_vui()).unwrap(),
+        ] {
+            for window in sps.windows(3) {
+                assert!(
+                    window != [0, 0, 0] && window != [0, 0, 1] && window != [0, 0, 2],
+                    "unescaped sequence in the rewritten SPS: {sps:02x?}"
+                );
+            }
+        }
+    }
+
+    /// The restriction lands where ffmpeg reads it, with the values the
+    /// standard would otherwise infer, and nothing else in the SPS moves --
+    /// in both shapes. Checked against ffmpeg rather than by parsing it back
+    /// here: a bit offset wrong in the writer and the reader alike agrees with
+    /// itself perfectly.
+    #[test]
+    fn declaring_no_reordering_matches_ffmpegs_reading() {
+        use std::process::Command;
+
+        if Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("SKIP: needs ffmpeg");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("rustguac-reorder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Field name to value, from a trace of an Annex B stream holding only
+        // this SPS.
+        let fields = |payload: &[u8], name: &str| -> Vec<(String, String)> {
+            let path = dir.join(name);
+            let mut annexb = vec![0, 0, 0, 1, 0x67];
+            annexb.extend_from_slice(payload);
+            std::fs::write(&path, &annexb).expect("write");
+            let out = Command::new("ffmpeg")
+                .args(["-v", "trace", "-f", "h264", "-i"])
+                .arg(&path)
+                .args(["-c", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"])
+                .output()
+                .expect("ffmpeg");
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .filter(|l| l.starts_with("[trace_headers"))
+                .filter_map(|l| {
+                    let mut words = l.split_once("] ")?.1.split_whitespace();
+                    let _bit = words.next()?;
+                    let name = words.next()?.to_owned();
+                    let value = words.last()?.to_owned();
+                    Some((name, value))
+                })
+                .collect()
+        };
+        let get = |fields: &[(String, String)], name: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+        };
+
+        for (label, sps) in [
+            ("vui", NVENC_UNRESTRICTED.to_vec()),
+            ("novui", nvenc_without_vui()),
+        ] {
+            let before = fields(&sps, &format!("{label}-in.264"));
+            let after = fields(
+                &declare_no_reordering(&sps).expect("rewritten"),
+                &format!("{label}-out.264"),
+            );
+
+            for (name, want) in [
+                ("vui_parameters_present_flag", "1"),
+                ("bitstream_restriction_flag", "1"),
+                ("motion_vectors_over_pic_boundaries_flag", "1"),
+                ("max_bytes_per_pic_denom", "2"),
+                ("max_bits_per_mb_denom", "1"),
+                ("log2_max_mv_length_horizontal", "15"),
+                ("log2_max_mv_length_vertical", "15"),
+                ("max_num_reorder_frames", "0"),
+                ("max_dec_frame_buffering", "3"),
+            ] {
+                assert_eq!(get(&after, name).as_deref(), Some(want), "{label}: {name}");
+            }
+
+            // Everything the original said, it still says. The trailing bits
+            // are padding to a byte boundary and change with the length.
+            for (name, value) in &before {
+                if name == "vui_parameters_present_flag"
+                    || name == "bitstream_restriction_flag"
+                    || name.starts_with("rbsp_")
+                {
+                    continue;
+                }
+                assert_eq!(
+                    get(&after, name).as_ref(),
+                    Some(value),
+                    "{label}: {name} moved"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Truncation must end the parse, not spin or panic. Every prefix of a
     /// real SPS is tried, since a short read can cut anywhere.
     #[test]
     fn truncation_is_not_fatal() {
+        for len in 0..NVENC_UNRESTRICTED.len() {
+            let _ = parse_sps(&NVENC_UNRESTRICTED[..len]);
+            let _ = declare_no_reordering(&NVENC_UNRESTRICTED[..len]);
+        }
         for len in 0..FULL_RANGE_COMPLETE.len() {
             let _ = parse_sps(&FULL_RANGE_COMPLETE[..len]);
         }

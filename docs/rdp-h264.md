@@ -218,8 +218,9 @@ what the encoder actually produced. It fixes both render paths and every
 client, including third-party ones, and needs no configuration.
 
 Cheap by construction: the first SPS decides. A stream that already carries a
-description is never examined again, so xrdp and every non-passthrough session
-pay one check per connection and nothing after it.
+description, and bounds its reordering (below), is never examined again, so
+xrdp and every non-passthrough session pay one check per connection and nothing
+after it.
 
 BT.709 is not a guess — MS-RDPEGFX defines the transform as BT.709, and Chrome
 already reported `bt709` for these streams, so the value is the one the decoder
@@ -285,6 +286,46 @@ Outcomes and fixes:
   localStorage). The console then logs `(FORCED -- frame reported limited)`.
 * **`usable`, and the client reports the matching range** — the colour is
   right, and a picture that still looks wrong is not a range problem.
+
+## Picture reordering: a frozen or white screen from an NVENC host
+
+**Chrome's hardware decoder holds pictures back unless the SPS says it need
+not**, and one encoder's defaults say nothing. Chromium's `H264Decoder`
+(`UpdateMaxNumReorderFrames()`, `media/gpu/h264_decoder.cc`) takes the reorder
+depth from the VUI's `bitstream_restriction` when present, as zero for the
+High-family profiles carrying `constraint_set3_flag`, and as the whole DPB
+otherwise. It has no shortcut for `pic_order_cnt_type` 2, even though that POC
+type is the stream stating that output order is decode order.
+
+NVENC left at its defaults, as the xrdp fork's accel-assist first used it,
+writes exactly the shape that falls through: Main profile, `constraint_set1`
+only, POC type 2, a VUI with timing info and no restriction. At 2992x1648 and
+level 5.0 the DPB is five pictures, so every picture emerged five pictures
+late. On an idle desktop that is past the client's 1000ms decode watchdog,
+which gives the frame up and discards it when it does arrive -- so nothing was
+ever painted, and the session showed guacd's white connect-time fill or froze
+on whatever came before. mstsc and ffmpeg decode the same stream without delay,
+and the recording decodes perfectly, which is what makes this look like a
+rustguac fault.
+
+What gives it away is the timing, not the picture: `frames_abandoned` lines in
+the browser console with no decode error beside them, and a recording ffmpeg
+decodes cleanly.
+
+**`src/h264_sps.rs` adds the restriction on the way past**
+(`declare_no_reordering`), and only where the stream has already guaranteed
+the answer: POC type 2 and no `bitstream_restriction`. `max_num_reorder_frames`
+is 0 and `max_dec_frame_buffering` is `max_num_ref_frames`, which is what the
+fork's VA-API encoder declares; the remaining fields are the values the
+standard infers when the block is absent, so they claim nothing new. POC types
+0 and 1 are left alone -- reordering is possible there, and declaring
+otherwise would be a guess about the host. An SPS with no VUI gets an empty one
+carrying only the restriction. `declaring_no_reordering_matches_ffmpegs_reading`
+checks both shapes against ffmpeg, field by field. The journal says
+`declaring max_num_reorder_frames=0 in the SPS` once per session when it fires.
+
+Encoders can say it themselves -- NVENC's `bitstreamRestrictionFlag` -- and the
+edit then finds nothing to do.
 
 ## Recording
 
