@@ -67,6 +67,16 @@ the measurement work that made the browser-side combine affordable.
   every launch and relaunch, so a hand-added query param does not survive a
   reconnect, and the window global is read once per decoder generation rather
   than per frame.
+- **Picture reordering** (`src/h264_sps.rs`) — Chrome's hardware decoder holds
+  a whole DPB of pictures before painting any unless the SPS bounds reordering
+  with `bitstream_restriction` (or is High-family with `constraint_set3`), and
+  it has no shortcut for `pic_order_cnt_type` 2, the POC type that already says
+  output order is decode order. NVENC at its defaults sends exactly that shape,
+  and at 2992x1648 every picture came out five late -- past the client's
+  decode watchdog on an idle desktop, so nothing was ever painted and the
+  session sat white or frozen on a stream mstsc and ffmpeg decode perfectly.
+  This fork adds `max_num_reorder_frames=0` on the wire where POC type 2
+  guarantees it, and nowhere else.
 - **Per-connection AVC444 request** (`patches/013-rdp-avc420-only.patch`) —
   which H.264 codecs are offered, per entry: **AVC444 + AVC420** (the server
   chooses), **AVC444 + AVC420, never combined**, **AVC444 + AVC420, chroma
