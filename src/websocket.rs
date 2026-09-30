@@ -541,12 +541,11 @@ async fn guacd_to_ws(
     // send path below stays the byte-for-byte passthrough it has always been.
     let mut splitter = binary_blobs.then(crate::binary_blob::BlobSplitter::new);
 
-    let mut sps_rewritten = false;
-
     // Gives a host that declares its colour range without describing its
-    // colourimetry the shape Chrome's hardware decoder will act on. Costs
-    // nothing once the stream's first SPS has been seen and found not to need
-    // it, which is every host but Windows. See crate::h264_rewrite.
+    // colourimetry the shape Chrome's hardware decoder will act on, and bounds
+    // picture reordering where the POC type already guarantees there is none.
+    // Costs nothing once the stream's first SPS has been seen and found to
+    // need neither. See crate::h264_rewrite.
     let mut sps_rewriter = crate::h264_rewrite::SpsRewriter::new();
 
     loop {
@@ -599,20 +598,9 @@ async fn guacd_to_ws(
         }
 
         // Splice a colour description into the SPS where the host left one
-        // out.
+        // out, and bound its reordering where the POC type allows.
         let text = match sps_rewriter.rewrite(&text) {
-            Some(rewritten) => {
-                if !sps_rewritten {
-                    sps_rewritten = true;
-                    tracing::info!(
-                        session_id = %session_id,
-                        "H.264 colour: splicing a BT.709 description into the SPS, \
-                         which Chrome's hardware decoder needs before it will act \
-                         on the range the host declared"
-                    );
-                }
-                rewritten
-            }
+            Some(rewritten) => rewritten,
             None => text,
         };
 
@@ -624,6 +612,16 @@ async fn guacd_to_ws(
         // limited or says full beside an unspecified description.
         if let Some(line) = sps_rewriter.take_wire_colour() {
             tracing::info!(session_id = %session_id, "H.264 colour: {}", line);
+        }
+
+        // Which edit was made, rather than that one was. The two are
+        // independent and a stream can need either alone: an NVENC host
+        // describes its colour completely and needs only its reordering
+        // bounded, and reporting that as a colour splice sends whoever reads
+        // it looking at the colour of a picture that is fine. Each is said once
+        // per session.
+        for edit in sps_rewriter.take_edits() {
+            tracing::info!(session_id = %session_id, "H.264: {}", edit.describe());
         }
 
         // The recording above saw the text form; only what goes to the
