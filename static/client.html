@@ -1880,6 +1880,46 @@
                 client.sendMouseState(e.state, true);
             });
 
+            // Show the remote pointer image as the browser's own pointer, and
+            // only fall back to the display's software cursor layer where CSS
+            // cursors are unsupported. Guacamole.Display puts that layer in
+            // the DOM from construction, so without this handover both are
+            // drawn: the browser's arrow, composited by the OS, and the
+            // software one, moved by the page on each mousemove -- which
+            // overlap at rest and visibly separate during fast movement,
+            // further the busier the main thread.
+            //
+            // Not Guacamole.Mouse.setCursor(), which declares the image at one
+            // image pixel per CSS pixel: under Native Resolution the display
+            // is scaled by 1/devicePixelRatio, and a host scaling its UI sends
+            // a pointer image to match, so that would draw it at twice its
+            // size. image-set() declares its density instead, from the
+            // display's scale, so it lands at one image pixel per framebuffer
+            // pixel like everything else on screen. The hotspot is then in CSS
+            // pixels. Re-applied from scaleDisplay(), since the scale changes
+            // under a pointer that does not.
+            var remoteCursor = null;
+            function applyRemoteCursor() {
+                if (!remoteCursor) return;
+                var display = client.getDisplay();
+                var el = display.getElement();
+                var scale = display.getScale();
+                var url = 'url(' + remoteCursor.url + ')';
+                el.style.cursor = '';
+                if (Math.abs(scale - 1) > 0.01)
+                    el.style.cursor = 'image-set(' + url + ' ' + (1 / scale) + 'x) '
+                        + Math.round(remoteCursor.x * scale) + ' '
+                        + Math.round(remoteCursor.y * scale) + ', auto';
+                if (!el.style.cursor)
+                    el.style.cursor = url + ' ' + remoteCursor.x + ' '
+                        + remoteCursor.y + ', auto';
+                display.showCursor(!el.style.cursor);
+            }
+            client.getDisplay().oncursor = function(canvas, x, y) {
+                remoteCursor = { url: canvas.toDataURL('image/png'), x: x, y: y };
+                applyRemoteCursor();
+            };
+
             // Auto-scale display. When a multi-monitor layout is active, the
             // main window shows only monitor 0 (always at the origin of the
             // combined framebuffer); the other heads are available as pop-out
@@ -1932,6 +1972,7 @@
                     // Offset display to the right when left panel is open
                     displayEl.style.marginLeft = anyPanelOpen ? '380px' : '0';
                 }
+                applyRemoteCursor();
             }
 
             client.getDisplay().onresize = function() { scaleDisplay(); };
