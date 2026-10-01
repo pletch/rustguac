@@ -50,7 +50,7 @@ The install script configures both sides automatically.
 
 ## Network allowlists (SSRF protection)
 
-All session targets are validated against CIDR allowlists before connections are made. Hostnames are resolved and every returned IP must match at least one allowed CIDR range.
+All session targets are validated against CIDR allowlists before connections are made. A hostname passes when it resolves to at least one address inside an allowed range; addresses outside the allowlist are ignored, so a dual-stack host whose IPv6 address is not listed still works over IPv4.
 
 ```toml
 ssh_allowed_networks = ["127.0.0.0/8", "::1/128", "10.0.0.0/8"]
@@ -60,6 +60,19 @@ web_allowed_networks = ["127.0.0.0/8", "::1/128"]
 ```
 
 **Default: localhost only** — all four default to `["127.0.0.0/8", "::1/128"]`, preventing SSRF attacks out of the box.
+
+What each list covers:
+
+| List | Checked |
+|------|---------|
+| `ssh_allowed_networks` | SSH targets. For ad-hoc sessions from non-admins, also the first jump host (rustguac dials it directly) and the SSH host-key probe |
+| `rdp_allowed_networks` | RDP targets |
+| `vnc_allowed_networks` | VNC and SPICE targets. For ad-hoc sessions from non-admins, also the Proxmox VE API URL and the SPICE proxy that Proxmox returns |
+| `web_allowed_networks` | The host in a web session's starting URL |
+
+Jump hosts and Proxmox clusters in connection entries, and in sessions created by admins, are not checked: admins configure those, and bastions and clusters commonly sit outside the target networks. The extra checks stop a poweruser from using an ad-hoc session or the host-key probe to reach arbitrary addresses.
+
+SSH and VNC connections are made to the address that was checked rather than to the hostname, so a name cannot resolve to an allowed address for the check and to another address for the connection. RDP, SPICE and web sessions keep the hostname, because TLS certificate names and Kerberos need it; for those, a user who controls a hostname's DNS could in principle answer differently between the check and the connection. Where that matters, use IP addresses in connection entries and keep the RDP list narrow. Targets reached through jump hosts are resolved by the bastion, so only the first jump host is checked locally.
 
 ## Authentication
 

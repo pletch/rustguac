@@ -27,9 +27,11 @@ pub async fn create_session(
     headers: axum::http::HeaderMap,
     identity: Option<Extension<AuthIdentity>>,
     trusted: Option<Extension<TrustedProxies>>,
-    Json(req): Json<CreateSessionRequest>,
+    Json(mut req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     let identity = identity.map(|Extension(id)| id);
+    // Ad-hoc targets from anyone below admin get every network fence.
+    req.fence_all_targets = !identity.as_ref().is_some_and(|id| id.has_role("admin"));
     let caller_name = identity
         .as_ref()
         .map(|id| id.display_name().to_string())
@@ -2588,6 +2590,7 @@ pub struct ConnectRequest {
 
 /// POST /api/ssh/probe-host-key — Probe an SSH server to retrieve its host key.
 pub async fn ssh_probe_host_key(
+    State(manager): State<AppState>,
     identity: Option<Extension<AuthIdentity>>,
     axum::Json(body): axum::Json<ProbeHostKeyRequest>,
 ) -> impl IntoResponse {
@@ -2604,7 +2607,31 @@ pub async fn ssh_probe_host_key(
     }
 
     let port = body.port.unwrap_or(22);
-    match crate::tunnel::probe_host_key(&body.hostname, port).await {
+    // The probe is a raw TCP + SSH key exchange to a caller-chosen host. For
+    // a poweruser it is fenced like an SSH session and dialled at the checked
+    // address; unchecked it is a port scanner and banner grabber for anything
+    // rustguac can reach (guacd, Vault, metadata services). Admins probe
+    // freely, since they configure jump hosts outside the allowlists.
+    let is_admin = matches!(&identity, Some(Extension(id)) if id.has_role("admin"));
+    let dial = if is_admin {
+        body.hostname.clone()
+    } else {
+        match crate::session::allowed_address(
+            &body.hostname,
+            port,
+            &manager.config().ssh_allowed_networks,
+        ) {
+            Ok(ip) => crate::session::dial_host(ip),
+            Err(e) => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    };
+    match crate::tunnel::probe_host_key(&dial, port).await {
         Ok(host_key) => {
             let fingerprint = crate::tunnel::fingerprint_openssh_key(&host_key)
                 .unwrap_or_else(|_| "unknown".into());
@@ -2811,6 +2838,7 @@ pub async fn ab_connect_entry(
         proxmox_verify_tls: ab_entry.proxmox_verify_tls,
         max_monitors: ab_entry.max_monitors,
         owner: None,
+        fence_all_targets: false,
     };
 
     let proxies = trusted.map(|Extension(t)| t.0).unwrap_or_default();
@@ -4632,6 +4660,7 @@ pub async fn quick_connect(
             proxmox_verify_tls: None,
             max_monitors: None,
             owner: None,
+            fence_all_targets: false,
         };
 
         tracing::info!(
@@ -4752,6 +4781,7 @@ pub async fn quick_connect(
         proxmox_verify_tls: None,
         max_monitors: None,
         owner: None,
+        fence_all_targets: false,
     };
 
     match manager.create_session(create_req, admin_name).await {

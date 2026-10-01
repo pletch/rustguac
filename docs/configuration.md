@@ -48,9 +48,9 @@ CIDR ranges controlling which hosts sessions can connect to. All default to loca
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `ssh_allowed_networks` | `["127.0.0.0/8", "::1/128"]` | Allowed SSH targets |
+| `ssh_allowed_networks` | `["127.0.0.0/8", "::1/128"]` | Allowed SSH targets (plus first jump hosts and host-key probes for non-admin ad-hoc use) |
 | `rdp_allowed_networks` | `["127.0.0.0/8", "::1/128"]` | Allowed RDP targets |
-| `vnc_allowed_networks` | `["127.0.0.0/8", "::1/128"]` | Allowed VNC targets |
+| `vnc_allowed_networks` | `["127.0.0.0/8", "::1/128"]` | Allowed VNC and SPICE targets (plus Proxmox VE API and SPICE proxy hosts for non-admin ad-hoc use) |
 | `web_allowed_networks` | `["127.0.0.0/8", "::1/128"]` | Allowed web session URL hosts |
 
 ## Trusted proxies

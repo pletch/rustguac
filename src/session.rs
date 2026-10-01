@@ -186,6 +186,12 @@ pub struct CreateSessionRequest {
     /// its creator and the only identity that may connect to it first.
     /// Admin callers only; handled by the API handler, never set internally.
     pub owner: Option<String>,
+    /// Set by the API for ad-hoc sessions from non-admin callers: also fence
+    /// the first jump host and Proxmox endpoints with the network
+    /// allowlists. Connection entries and admins are trusted to name their
+    /// own bastions and clusters. Never read from the request body.
+    #[serde(skip)]
+    pub fence_all_targets: bool,
 }
 
 /// Session status in the lifecycle.
@@ -462,7 +468,28 @@ fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16), Sess
 }
 
 /// Check that a host resolves to an IP within the allowed CIDR networks.
+///
+/// Passes if ANY resolved address is allowed. Callers that can connect by
+/// address should use [`allowed_address`] and dial the address it returns,
+/// since a hostname re-resolved later (by guacd, say) can give a different
+/// answer than it gave here.
 fn check_allowed_network(host: &str, port: u16, allowed: &[String]) -> Result<(), SessionError> {
+    allowed_address(host, port, allowed).map(|_| ())
+}
+
+/// Resolve `host` and return the first address inside the allowlist.
+///
+/// Dialling this address, rather than handing the hostname on, pins the
+/// connection to what was actually checked. Otherwise a hostname whose DNS
+/// the caller controls could resolve to an allowed address for the check and
+/// to an internal one (guacd, Vault, a metadata service) for the connection.
+/// Addresses outside the allowlist are ignored rather than rejected, so a
+/// dual-stack host whose IPv6 address is not listed still works over IPv4.
+pub(crate) fn allowed_address(
+    host: &str,
+    port: u16,
+    allowed: &[String],
+) -> Result<std::net::IpAddr, SessionError> {
     let networks: Vec<IpNetwork> = allowed
         .iter()
         .filter_map(|s| s.parse::<IpNetwork>().ok())
@@ -477,7 +504,7 @@ fn check_allowed_network(host: &str, port: u16, allowed: &[String]) -> Result<()
     // Try parsing host as an IP address directly first
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if networks.iter().any(|net| net.contains(ip)) {
-            return Ok(());
+            return Ok(ip);
         }
         return Err(SessionError::ValidationError(format!(
             "host {} is not in the allowed network list",
@@ -500,16 +527,25 @@ fn check_allowed_network(host: &str, port: u16, allowed: &[String]) -> Result<()
         )));
     }
 
-    for addr in &addrs {
-        if networks.iter().any(|net| net.contains(addr.ip())) {
-            return Ok(());
-        }
-    }
+    addrs
+        .iter()
+        .map(|a| a.ip())
+        .find(|ip| networks.iter().any(|net| net.contains(*ip)))
+        .ok_or_else(|| {
+            SessionError::ValidationError(format!(
+                "host '{}' resolves to addresses not in the allowed network list",
+                host
+            ))
+        })
+}
 
-    Err(SessionError::ValidationError(format!(
-        "host '{}' resolves to addresses not in the allowed network list",
-        host
-    )))
+/// An address formatted for a `host:port` string (IPv6 in brackets), as
+/// the SSH tunnel and probe code builds its dial address that way.
+pub(crate) fn dial_host(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    }
 }
 
 impl Session {
@@ -719,6 +755,7 @@ impl SessionManager {
         // needs them to tunnel its PVE API + SPICE-proxy connections in-branch,
         // and the generic tunnel setup after the match uses them for the other
         // session types.
+        let fence_all_targets = req.fence_all_targets;
         let jump_hops: Vec<tunnel::JumpHost> = if let Some(hops) = req.jump_hosts {
             hops
         } else if let Some(ref jh) = req.jump_host {
@@ -737,6 +774,20 @@ impl SessionManager {
         } else {
             Vec::new()
         };
+        // rustguac dials the first jump host itself, so for an untrusted
+        // caller it is fenced by the SSH allowlist like any SSH target, and
+        // pinned to the checked address. Later hops are dialled from inside
+        // the chain and resolve from the bastion's point of view.
+        let mut jump_hops = jump_hops;
+        if let Some(first) = jump_hops.first_mut().filter(|_| fence_all_targets) {
+            let ip = allowed_address(
+                &first.hostname,
+                first.port,
+                &self.config.ssh_allowed_networks,
+            )
+            .map_err(|e| SessionError::ValidationError(format!("jump host: {e}")))?;
+            first.hostname = dial_host(ip);
+        }
         // Tunnels the Proxmox branch establishes in-branch (PVE API + SPICE
         // proxy hops); merged into the session's tunnel list after the match.
         let mut proxmox_tunnels: Vec<tunnel::SshTunnel> = Vec::new();
@@ -759,7 +810,14 @@ impl SessionManager {
                 let port = req.port.unwrap_or(22);
                 let username = req.username.clone().unwrap_or_default();
 
-                check_allowed_network(&hostname, port, &self.config.ssh_allowed_networks)?;
+                let vetted = allowed_address(&hostname, port, &self.config.ssh_allowed_networks)?;
+                // With jump hosts the bastion resolves the target, so keep
+                // the name; otherwise guacd dials the address checked above.
+                let connect_host = if jump_hops.is_empty() {
+                    vetted.to_string()
+                } else {
+                    hostname.clone()
+                };
 
                 tracing::info!(
                     session_id = %session_id,
@@ -841,7 +899,7 @@ impl SessionManager {
                         (path, expanded, create)
                     });
                 let params = guacd::ConnectionParams::Ssh(guacd::SshParams {
-                    hostname: hostname.clone(),
+                    hostname: connect_host,
                     port,
                     username: username.clone(),
                     password: req.password.clone(),
@@ -974,7 +1032,12 @@ impl SessionManager {
                 let port = req.port.unwrap_or(5900);
                 let username = req.username.clone().unwrap_or_default();
 
-                check_allowed_network(&hostname, port, &self.config.vnc_allowed_networks)?;
+                let vetted = allowed_address(&hostname, port, &self.config.vnc_allowed_networks)?;
+                let connect_host = if jump_hops.is_empty() {
+                    vetted.to_string()
+                } else {
+                    hostname.clone()
+                };
 
                 tracing::info!(
                     session_id = %session_id,
@@ -984,7 +1047,7 @@ impl SessionManager {
                 );
 
                 let params = guacd::ConnectionParams::Vnc(guacd::VncParams {
-                    hostname: hostname.clone(),
+                    hostname: connect_host,
                     port,
                     password: req.password.clone(),
                     color_depth: req.color_depth,
@@ -1058,6 +1121,17 @@ impl SessionManager {
                 }
                 let verify_tls = req.proxmox_verify_tls.unwrap_or(false);
 
+                // rustguac calls the PVE API itself and guacd then dials the
+                // SPICE proxy that API names, so for an untrusted caller both
+                // are fenced by the same allowlist as direct SPICE. Through
+                // jump hosts they resolve at the bastion and the first hop is
+                // checked instead.
+                if fence_all_targets && jump_hops.is_empty() {
+                    let (api_host, api_port) = parse_host_port(&pve_url, 8006)?;
+                    check_allowed_network(&api_host, api_port, &self.config.vnc_allowed_networks)
+                        .map_err(|e| SessionError::ValidationError(format!("Proxmox API: {e}")))?;
+                }
+
                 // Join the token id and secret into PVE's "id=secret" form. If
                 // the secret is empty, treat the id as already-joined (lenient:
                 // allows pasting a full "id=secret" into the id field).
@@ -1118,6 +1192,17 @@ impl SessionManager {
                     .map_err(|e| {
                         SessionError::ValidationError(format!("Proxmox SPICE broker failed: {e}"))
                     })?;
+                if fence_all_targets && jump_hops.is_empty() {
+                    let (proxy_host, proxy_port) = parse_host_port(&cfg.proxy, 3128)?;
+                    check_allowed_network(
+                        &proxy_host,
+                        proxy_port,
+                        &self.config.vnc_allowed_networks,
+                    )
+                    .map_err(|e| {
+                        SessionError::ValidationError(format!("Proxmox SPICE proxy: {e}"))
+                    })?;
+                }
                 tracing::info!(
                     session_id = %session_id,
                     node = %node,
@@ -2895,6 +2980,92 @@ mod tests {
         assert!(check_allowed_network("10.1.1.1", 22, &cidrs).is_ok());
         assert!(check_allowed_network("192.168.1.1", 22, &cidrs).is_ok());
         assert!(check_allowed_network("172.16.0.1", 22, &cidrs).is_err());
+    }
+
+    /// The fence flag is server-set; a request body must not switch it off.
+    #[test]
+    fn fence_flag_is_never_read_from_json() {
+        let req: CreateSessionRequest = serde_json::from_value(serde_json::json!({
+            "session_type": "ssh",
+            "hostname": "127.0.0.1",
+            "fence_all_targets": true,
+        }))
+        .unwrap();
+        assert!(!req.fence_all_targets);
+    }
+
+    fn fenced_request(extra: serde_json::Value) -> CreateSessionRequest {
+        let mut body = serde_json::json!({ "hostname": "127.0.0.1" });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let mut req: CreateSessionRequest = serde_json::from_value(body).unwrap();
+        req.fence_all_targets = true;
+        req
+    }
+
+    /// H5: a non-admin ad-hoc session cannot use a jump host outside the SSH
+    /// allowlist to make rustguac dial an arbitrary address.
+    #[tokio::test]
+    async fn fenced_jump_host_outside_allowlist_refused() {
+        let mgr = new_manager_for_tests();
+        let req = fenced_request(serde_json::json!({
+            "session_type": "ssh",
+            "jump_host": "192.0.2.10",
+        }));
+        match mgr.create_session(req, "pu@example.com".into()).await {
+            Err(SessionError::ValidationError(msg)) => {
+                assert!(msg.contains("jump host"), "got: {msg}")
+            }
+            other => panic!(
+                "expected jump host refusal, got {:?}",
+                other.map(|i| i.session_id)
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn fenced_proxmox_api_outside_allowlist_refused() {
+        let mgr = new_manager_for_tests();
+        let req = fenced_request(serde_json::json!({
+            "session_type": "proxmox",
+            "proxmox_url": "https://192.0.2.20:8006",
+            "proxmox_vmid": 100,
+        }));
+        match mgr.create_session(req, "pu@example.com".into()).await {
+            Err(SessionError::ValidationError(msg)) => {
+                assert!(msg.contains("Proxmox API"), "got: {msg}")
+            }
+            other => panic!(
+                "expected Proxmox refusal, got {:?}",
+                other.map(|i| i.session_id)
+            ),
+        }
+    }
+
+    #[test]
+    fn test_allowed_address_returns_literal() {
+        let ip = allowed_address("10.1.2.3", 22, &["10.0.0.0/8".into()]).unwrap();
+        assert_eq!(ip.to_string(), "10.1.2.3");
+    }
+
+    /// A dual-stack name with only one family allowed still resolves to the
+    /// allowed address instead of failing.
+    #[test]
+    fn test_allowed_address_skips_disallowed_family() {
+        let ip = allowed_address("localhost", 22, &["127.0.0.0/8".into()]).unwrap();
+        assert!(ip.is_ipv4() && ip.is_loopback(), "got {ip}");
+    }
+
+    #[test]
+    fn test_allowed_address_rejects_when_none_allowed() {
+        assert!(allowed_address("localhost", 22, &["10.0.0.0/8".into()]).is_err());
+    }
+
+    #[test]
+    fn test_dial_host_brackets_ipv6() {
+        assert_eq!(dial_host("10.0.0.1".parse().unwrap()), "10.0.0.1");
+        assert_eq!(dial_host("::1".parse().unwrap()), "[::1]");
     }
 
     #[test]
