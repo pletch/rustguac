@@ -229,6 +229,7 @@ The `jump_hosts` array defines an ordered chain of SSH bastion hops. Each hop co
 | `height` | integer | All | Display height in pixels |
 | `dpi` | integer | All | Display DPI |
 | `banner` | string | All | Banner message shown before session starts |
+| `owner` | string | All | Create the session on behalf of this user (their login email). Admin callers only, see [Creating a session for someone else](#creating-a-session-for-someone-else) |
 
 **SPICE fields** (`session_type: spice`, direct connection to a SPICE server):
 
@@ -276,13 +277,33 @@ The token needs `VM.Console` (and `VM.Audit` for node auto-detect) on the target
   "status": "pending",
   "client_url": "/client/550e8400-e29b-41d4-a716-446655440000",
   "ws_url": "/ws/550e8400-e29b-41d4-a716-446655440000",
-  "share_url": "/client/550e8400-e29b-41d4-a716-446655440000?token=abc123"
+  "share_url": "/client/550e8400-e29b-41d4-a716-446655440000?token=abc123",
+  "share_url_readonly": "/client/550e8400-e29b-41d4-a716-446655440000?token=def456"
 }
 ```
 
 - `client_url` opens the session in the built-in client (see [Connecting to a session](#connecting-to-a-session)).
 - `ws_url` is the raw WebSocket endpoint for a custom client.
-- `share_url` is present only when sharing is allowed; its `token` lets a second viewer **join** an active session (it is not owner access).
+- `share_url` is present only when sharing is allowed; its `token` lets a second viewer **join** an active session with keyboard, mouse and clipboard control (it is not owner access).
+- `share_url_readonly` is present whenever `share_url` is. It joins the same session view-only: guacd ignores that participant's keyboard, mouse and clipboard input. It is a separate token, so the recipient cannot turn it into the control link.
+- Both share URLs are shown only to the session's creator and to admins.
+
+### Creating a session for someone else
+
+A backend that creates sessions with an API key and then opens them in a user's own browser (where the user is logged in through OIDC) must name that user as the session's `owner`:
+
+```json
+{
+  "session_type": "ssh",
+  "hostname": "10.0.0.5",
+  "owner": "engineer@example.com"
+}
+```
+
+- The session is recorded as created by `owner`, so session history and reports name the person rather than the API key.
+- Only `owner` can make the first connection to the session (see [Owner vs. join](#owner-vs-join)). The match is on the login email, ignoring case.
+- `owner` is accepted from admin callers only (API keys are always admin). Anyone else gets `403`.
+- Without `owner`, the session belongs to the caller, as before.
 
 ### `GET /api/sessions`
 
@@ -296,6 +317,27 @@ Get session details. Requires **operator** role or higher.
 
 Terminate a session. Requires **operator** role or higher. Non-admins can only delete their own sessions.
 
+### `POST /api/sessions/:id/shadow`
+
+Mint a short-lived token that lets an admin join another user's **active** session. Requires **admin** role. The body is optional:
+
+```json
+{ "read_only": true }
+```
+
+`read_only` defaults to `false` (keyboard and mouse control). With `true` the admin watches without being able to type or click.
+
+```json
+{
+  "url": "/client/550e8400-e29b-41d4-a716-446655440000?token=...",
+  "expires_at": "2026-10-01T04:10:00+00:00",
+  "ttl_seconds": 600,
+  "read_only": true
+}
+```
+
+The token is valid for 10 minutes and every use is written to the audit log. A session whose owner has not connected yet returns `409`: the owner must connect first.
+
 ### `GET /api/sessions/:id/banner`
 
 Get session banner text. Authenticates via share token (not credentials). Used for the ephemeral keypair banner display.
@@ -306,10 +348,10 @@ Creating a session (`POST /api/sessions`) only opens the connection to the targe
 
 ### Owner vs. join
 
-- The **first** connection to a freshly created session is the **owner** connection. It requires an authenticated identity with the **operator** role or higher.
-- A **share token** (`share_url`) only lets a second viewer **join** a session that is already active. It is not an identity and cannot open the owner connection.
+- The **first** connection to a freshly created session is the **owner** connection. It requires an authenticated identity with the **operator** role or higher that is the session's creator: the caller that created it, or the `owner` it was created for. No other user can make it, admins included.
+- A **share token** (`share_url` or `share_url_readonly`) or an admin **shadow token** only lets another viewer **join** a session that is already active. It is not an identity and cannot open the owner connection.
 
-If the owner connection is not authenticated, rustguac rejects the WebSocket with `403`, no browser attaches, and guacd eventually reports `User is not responding` (its timeout for a session whose client never arrived, roughly 15 seconds after creation). If you see `User is not responding`, the browser did not connect as an authenticated owner.
+If the owner connection is not authenticated, or is authenticated as someone other than the creator, rustguac rejects the WebSocket with `403`, no browser attaches, and guacd eventually reports `User is not responding` (its timeout for a session whose client never arrived, roughly 15 seconds after creation). If you see `User is not responding`, the browser did not connect as the session's authenticated owner. A backend that creates sessions with an API key for a user who then connects with their own login must set `owner` (see [Creating a session for someone else](#creating-a-session-for-someone-else)).
 
 ### Authenticating the owner connection
 
@@ -339,7 +381,7 @@ The ticket is valid for 30 seconds, may be used once, and inherits the caller's 
 When the browser has no rustguac login of its own (no OIDC cookie), a backend that holds an API key can still hand off a ready-to-open session without exposing that key to the browser:
 
 1. `POST /api/sessions` (Bearer API key) to create the session.
-2. `POST /api/ws-ticket` (Bearer API key) to mint a ticket.
+2. `POST /api/ws-ticket` (Bearer API key) to mint a ticket. The ticket carries the API key's identity, which is the session's creator, so the owner connection is accepted. Do not set `owner` in this flow: the ticket would then belong to someone other than the owner and be refused.
 3. Send the browser to `client_url?ticket=<ticket>` (i.e. `/client/{id}?ticket=wst_...`).
 
 The single-use, 30-second ticket is safe to place in a URL; the durable API key never leaves the backend. Because guacd drops a session whose client has not attached within ~15 seconds, mint the ticket and open the browser promptly after creating the session (on a reload, mint a fresh ticket).

@@ -91,16 +91,34 @@ pub async fn ws_handler(
         }
     }
 
-    // Check if this is an owner connection (session is Pending)
+    // Check if this is an owner connection (session is Pending). The first
+    // connection to a pending session takes its guacd stream, already logged
+    // in to the target, so only the session's creator may make it. There is
+    // deliberately no admin bypass: admins watch a live session through a
+    // shadow token instead, and an admin "rescuing" a pending session would
+    // be indistinguishable from hijacking it.
     let is_owner = manager.is_session_pending(session_id).await;
 
     if is_owner {
-        // Owner path: require authenticated identity with operator+ role
+        let creator = manager.get_session_creator(session_id).await;
         match &identity {
-            Some(id) if id.has_role("operator") => {
-                // Authorized — proceed
+            Some(id) if id.has_role("operator") && is_session_owner(id, creator.as_deref()) => {}
+            Some(id) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    client_ip = %ip,
+                    identity = %id.display_name(),
+                    "Owner connection refused: not the session's creator"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    axum::Json(
+                        json!({"error": "only the user who created this session can connect to it before it starts"}),
+                    ),
+                )
+                    .into_response();
             }
-            _ => {
+            None => {
                 tracing::warn!(session_id = %session_id, client_ip = %ip, "Unauthorized owner connection attempt");
                 return (
                     StatusCode::FORBIDDEN,
@@ -121,6 +139,7 @@ pub async fn ws_handler(
             handle_ws(
                 manager,
                 session_id,
+                is_owner,
                 query.token,
                 socket,
                 ip,
@@ -131,19 +150,26 @@ pub async fn ws_handler(
         .into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_ws(
     manager: Arc<SessionManager>,
     session_id: Uuid,
+    owner_verified: bool,
     token: Option<String>,
     ws: WebSocket,
     client_addr: IpAddr,
     identity_name: Option<String>,
     database: Option<Db>,
 ) {
-    // Try to take the guacd stream (owner/first connection)
-    let (guacd_stream, cancel) = if let Some((stream, cancel)) =
+    // Try to take the guacd stream (owner/first connection). Only a
+    // connection that passed the owner check at upgrade time may, so the
+    // stream can never go to a caller who was vetted as a joiner.
+    let owned = if owner_verified {
         manager.take_guacd_stream(session_id).await
-    {
+    } else {
+        None
+    };
+    let (guacd_stream, cancel) = if let Some((stream, cancel)) = owned {
         let identity_str = identity_name.as_deref().unwrap_or("unknown");
         tracing::info!(session_id = %session_id, client_ip = %client_addr, identity = %identity_str, "Session owner connected");
         (stream, cancel)
@@ -164,8 +190,11 @@ async fn handle_ws(
                 tracing::warn!(session_id = %session_id, client_ip = %client_addr, "Share token rejected");
                 return;
             }
-            ShareTokenValidation::Owner => {}
-            ShareTokenValidation::Shadow { issued_by } => {
+            ShareTokenValidation::Owner | ShareTokenValidation::OwnerReadOnly => {}
+            ShareTokenValidation::Shadow {
+                issued_by,
+                read_only,
+            } => {
                 // Audit every shadow-token use (not just the mint). A leaked
                 // token remains reusable within its TTL, but each reuse is
                 // now visible in token_audit_log with the connecting IP.
@@ -173,7 +202,10 @@ async fn handle_ws(
                     let db_clone = db.clone();
                     let ip_str = client_addr.to_string();
                     let issued_by = issued_by.clone();
-                    let details = format!("session_id={}, issued_by={}", session_id, issued_by);
+                    let details = format!(
+                        "session_id={}, issued_by={}, read_only={}",
+                        session_id, issued_by, read_only
+                    );
                     let _ = tokio::task::spawn_blocking(move || {
                         if let Err(e) = db::log_token_event(
                             &db_clone,
@@ -198,9 +230,10 @@ async fn handle_ws(
             }
         }
 
-        match manager.join_session(session_id).await {
+        let read_only = validation.is_read_only();
+        match manager.join_session(session_id, read_only).await {
             Ok((stream, cancel)) => {
-                tracing::info!(session_id = %session_id, client_ip = %client_addr, "Viewer connected via share token");
+                tracing::info!(session_id = %session_id, client_ip = %client_addr, read_only, "Viewer connected via share token");
                 (stream, cancel)
             }
             Err(e) => {
@@ -584,6 +617,17 @@ async fn ws_to_guacd(
 /// If either value is missing or empty, the request is allowed — matches
 /// the prior `unwrap_or("")` behaviour where axum had no header and no
 /// CSWSH signal. The caller must still ensure auth is enforced separately.
+/// Whether `identity` is the creator of a session. Emails are compared
+/// without regard to ASCII case, since an identity provider and an API
+/// client sending `owner` on someone's behalf may capitalise the same
+/// address differently.
+pub(crate) fn is_session_owner(identity: &AuthIdentity, creator: Option<&str>) -> bool {
+    match creator {
+        Some(c) => !c.is_empty() && identity.display_name().eq_ignore_ascii_case(c),
+        None => false,
+    }
+}
+
 pub(crate) fn origin_host_matches(origin: &str, host: &str) -> bool {
     let origin_host = origin
         .trim_start_matches("https://")
@@ -602,6 +646,64 @@ pub(crate) fn origin_host_matches(origin: &str, host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user(email: &str, role: &str) -> AuthIdentity {
+        AuthIdentity::User {
+            email: email.into(),
+            role: role.into(),
+            groups: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn owner_is_creator() {
+        assert!(is_session_owner(
+            &user("alice@example.com", "operator"),
+            Some("alice@example.com")
+        ));
+    }
+
+    #[test]
+    fn owner_match_ignores_ascii_case() {
+        assert!(is_session_owner(
+            &user("Alice@Example.com", "operator"),
+            Some("alice@example.com")
+        ));
+    }
+
+    /// H3: another user, even an admin, must not claim a pending session.
+    #[test]
+    fn non_creator_is_not_owner_even_if_admin() {
+        assert!(!is_session_owner(
+            &user("bob@example.com", "operator"),
+            Some("alice@example.com")
+        ));
+        assert!(!is_session_owner(
+            &user("root@example.com", "admin"),
+            Some("alice@example.com")
+        ));
+        assert!(!is_session_owner(
+            &AuthIdentity::ApiKey("ops-key".into()),
+            Some("alice@example.com")
+        ));
+    }
+
+    #[test]
+    fn api_key_owns_its_own_session() {
+        assert!(is_session_owner(
+            &AuthIdentity::ApiKey("ops-key".into()),
+            Some("ops-key")
+        ));
+    }
+
+    #[test]
+    fn unknown_or_empty_creator_has_no_owner() {
+        assert!(!is_session_owner(&user("a@example.com", "admin"), None));
+        assert!(!is_session_owner(
+            &AuthIdentity::ApiKey(String::new()),
+            Some("")
+        ));
+    }
 
     #[test]
     fn origin_match_same_hostname_no_ports() {

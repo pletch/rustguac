@@ -43,7 +43,7 @@ rustguac and Apache Guacamole share the same foundation:
 | **Network allowlists** | Not supported | CIDR allowlists per protocol |
 | **Rate limiting** | Not built-in | Per-IP, per-endpoint (tower_governor) |
 | **Reverse proxy integration** | Generic | HAProxy + Knocknoc examples |
-| **Session sharing** | Connection sharing | Share tokens (read-only or collaborative) |
+| **Session sharing** | Connection sharing | Share links (view-only or collaborative) |
 | **Clipboard control** | Not per-connection | Per-entry disable copy/paste |
 | **Web session autofill** | Not supported | Native Chromium autofill from Vault credentials |
 | **Web domain allowlist** | Not supported | Per-entry domain restriction via --host-rules |

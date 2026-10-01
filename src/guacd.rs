@@ -451,12 +451,17 @@ pub async fn connect_and_handshake(
 /// Opens a new TCP connection to guacd and sends `select` with the connection_id
 /// instead of a protocol name. guacd routes this to the existing session process,
 /// allowing multiple users to share the same session.
+///
+/// `read_only` is enforced by guacd itself: settings are parsed per joining
+/// user, and every protocol skips installing that user's key, mouse and
+/// clipboard handlers when its `read-only` arg is true.
 pub async fn join_connection(
     guacd_addr: &str,
     connection_id: &str,
     width: u32,
     height: u32,
     dpi: u32,
+    read_only: bool,
     tls: Option<&tokio_rustls::TlsConnector>,
 ) -> Result<GuacdStream, GuacdError> {
     let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(guacd_addr))
@@ -497,15 +502,7 @@ pub async fn join_connection(
 
     tracing::debug!("Join args: {:?}", args_instruction.args);
 
-    // For joining, send empty values for all args (the connection is already configured)
-    let arg_values: Vec<String> = args_instruction
-        .args
-        .iter()
-        .map(|name| match name.as_str() {
-            "read-only" => "false".into(),
-            _ => String::new(),
-        })
-        .collect();
+    let arg_values = join_arg_values(&args_instruction.args, read_only);
 
     // Send handshake instructions (joining user — h264 inherited from session)
     send_handshake(&mut stream, width, height, dpi, false).await?;
@@ -528,6 +525,19 @@ pub async fn join_connection(
     tracing::info!("Joined existing connection {}", connection_id);
 
     Ok(stream)
+}
+
+/// Values for a joining user's `connect`. Everything is left empty because
+/// the connection is already configured, except `read-only`, which guacd
+/// applies to this user alone.
+fn join_arg_values(arg_names: &[String], read_only: bool) -> Vec<String> {
+    arg_names
+        .iter()
+        .map(|name| match name.as_str() {
+            "read-only" => if read_only { "true" } else { "false" }.into(),
+            _ => String::new(),
+        })
+        .collect()
 }
 
 /// Optionally wrap a TCP stream in TLS. Returns a boxed GuacdStream.
@@ -647,3 +657,24 @@ impl std::fmt::Display for GuacdError {
 }
 
 impl std::error::Error for GuacdError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn join_args_read_write_by_default() {
+        let got = join_arg_values(&names(&["VERSION_1_5_0", "hostname", "read-only"]), false);
+        assert_eq!(got, vec!["", "", "false"]);
+    }
+
+    #[test]
+    fn join_args_read_only() {
+        let got = join_arg_values(&names(&["hostname", "read-only", "port"]), true);
+        assert_eq!(got, vec!["", "true", ""]);
+    }
+}

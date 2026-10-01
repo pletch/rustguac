@@ -849,7 +849,7 @@
                     Allow session sharing
                 </label>
                 <div class="field-hint">
-                    When enabled, users can generate a read-only Share URL for active sessions of this entry.
+                    When enabled, users can share active sessions of this entry with a view-only link or a link that also gives control.
                     Off by default — admins opt in per entry.
                 </div>
                 <label style="text-transform:none;letter-spacing:0;cursor:pointer;margin-top:0.8em">
@@ -918,16 +918,21 @@
         <div class="modal">
             <h3>Share Session</h3>
             <p style="color:var(--text-muted);font-size:var(--fz-sm);margin:0 0 var(--s-3) 0">
-                Send this URL to someone to let them join your session as a read-only viewer.
+                Send one of these URLs to someone to let them join your session.
             </p>
-            <label>Share URL</label>
+            <label>View only</label>
+            <div class="share-url-box">
+                <code id="share-modal-url-ro"></code>
+                <button type="button" class="btn-add share-modal-copy" data-copy-from="share-modal-url-ro">Copy</button>
+            </div>
+            <label style="margin-top:var(--s-3)">View and control</label>
             <div class="share-url-box">
                 <code id="share-modal-url"></code>
-                <button type="button" id="share-modal-copy" class="btn-add">Copy</button>
+                <button type="button" class="btn-add share-modal-copy" data-copy-from="share-modal-url">Copy</button>
             </div>
             <div class="share-warning">
                 <span class="share-warning-icon">&#9888;</span>
-                Anyone with this link and network access to this server can watch the session until it ends.
+                Anyone with a link and network access to this server can join until the session ends. The control link also lets them type and use the mouse and clipboard.
             </div>
             <div class="modal-actions">
                 <button class="btn-cancel" id="share-modal-close">Close</button>
@@ -1420,9 +1425,10 @@
         }
 
         // ── Share session modal ─────────────────────────────
-        function openShareModal(url) {
-            var box = document.getElementById('share-modal-url');
-            box.textContent = url;
+        function openShareModal(url, urlReadOnly) {
+            document.getElementById('share-modal-url').textContent = url;
+            var box = document.getElementById('share-modal-url-ro');
+            box.textContent = urlReadOnly;
             document.getElementById('share-modal').classList.add('active');
             // Auto-select the URL so Ctrl-C just works
             try {
@@ -1456,16 +1462,15 @@
             }
         }
         (function wireShareModal() {
-            var copyBtn = document.getElementById('share-modal-copy');
-            if (copyBtn) {
+            document.querySelectorAll('.share-modal-copy').forEach(function(copyBtn) {
                 copyBtn.addEventListener('click', function() {
-                    var url = document.getElementById('share-modal-url').textContent;
+                    var url = document.getElementById(copyBtn.getAttribute('data-copy-from')).textContent;
                     copyToClipboard(url, function() {
                         copyBtn.textContent = 'Copied';
                         setTimeout(function() { copyBtn.textContent = 'Copy'; }, 2000);
                     });
                 });
-            }
+            });
             var closeBtn = document.getElementById('share-modal-close');
             if (closeBtn) closeBtn.addEventListener('click', closeShareModal);
             var overlay = document.getElementById('share-modal');
@@ -1521,9 +1526,10 @@
                     var name = s.entry_display_name || s.hostname || s.url || '?';
                     var typeBadge = '<span class="type-badge type-' + escapeHtml(s.session_type) + '">' + escapeHtml(s.session_type) + '</span>';
                     var shareUrl = s.share_url ? (window.location.origin + s.share_url) : '';
+                    var shareUrlRo = s.share_url_readonly ? (window.location.origin + s.share_url_readonly) : '';
                     var actionsHtml = '<div class="card-actions">';
-                    if (shareUrl) {
-                        actionsHtml += '<button type="button" class="btn-add" data-share-url="' + escapeAttr(shareUrl) + '" title="Copy a URL to let someone watch this session">Share</button>';
+                    if (shareUrl && shareUrlRo) {
+                        actionsHtml += '<button type="button" class="btn-add" data-share-url="' + escapeAttr(shareUrl) + '" data-share-url-ro="' + escapeAttr(shareUrlRo) + '" title="Get a link to let someone join this session">Share</button>';
                     }
                     actionsHtml += '<button type="button" class="btn-add btn-danger" data-terminate="' + escapeAttr(s.session_id) + '" data-name="' + escapeAttr(name) + '" title="End this session now">Terminate</button>';
                     actionsHtml += '</div>';
@@ -1536,7 +1542,7 @@
                     if (shareBtn) {
                         shareBtn.addEventListener('click', function(ev) {
                             ev.stopPropagation();
-                            openShareModal(shareBtn.getAttribute('data-share-url'));
+                            openShareModal(shareBtn.getAttribute('data-share-url'), shareBtn.getAttribute('data-share-url-ro'));
                         });
                     }
                     var termBtn = card.querySelector('[data-terminate]');

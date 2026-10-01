@@ -182,6 +182,10 @@ pub struct CreateSessionRequest {
     /// is told `secondary-monitors = max_monitors - 1`, which it advertises to
     /// the client. Default 1 (single monitor).
     pub max_monitors: Option<u32>,
+    /// Create the session on behalf of this user (their email). They become
+    /// its creator and the only identity that may connect to it first.
+    /// Admin callers only; handled by the API handler, never set internally.
+    pub owner: Option<String>,
 }
 
 /// Session status in the lifecycle.
@@ -210,6 +214,11 @@ pub struct SessionInfo {
     pub client_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub share_url: Option<String>,
+    /// View-only counterpart of `share_url`: a separate token, so a
+    /// recipient cannot upgrade it to control by editing the URL. Present
+    /// exactly when `share_url` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_url_readonly: Option<String>,
     pub ws_url: String,
     pub hostname: String,
     pub username: String,
@@ -250,6 +259,9 @@ pub struct Session {
     pub guacd_stream: Option<GuacdStream>,
     pub connection_id: String,
     pub share_token: String,
+    /// Second share token whose joins are read-only (guacd drops their
+    /// keyboard, mouse and clipboard input).
+    pub share_token_ro: String,
     pub width: u32,
     pub height: u32,
     pub active_connections: u32,
@@ -310,6 +322,8 @@ pub struct ShadowToken {
     pub token_hash: String,
     pub issued_by: String,
     pub expires_at: DateTime<Utc>,
+    /// Joins with this token are view-only.
+    pub read_only: bool,
 }
 
 /// Result of validating a share-or-shadow token. Callers use this to tell
@@ -319,13 +333,28 @@ pub struct ShadowToken {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ShareTokenValidation {
     Invalid,
+    /// The session's read/write share token.
     Owner,
-    Shadow { issued_by: String },
+    /// The session's read-only share token.
+    OwnerReadOnly,
+    Shadow {
+        issued_by: String,
+        read_only: bool,
+    },
 }
 
 impl ShareTokenValidation {
     pub fn is_valid(&self) -> bool {
         !matches!(self, ShareTokenValidation::Invalid)
+    }
+
+    /// Whether a join made with this token must be view-only.
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            ShareTokenValidation::OwnerReadOnly => true,
+            ShareTokenValidation::Shadow { read_only, .. } => *read_only,
+            ShareTokenValidation::Owner | ShareTokenValidation::Invalid => false,
+        }
     }
 }
 
@@ -493,6 +522,11 @@ impl Session {
             client_url: format!("/client/{}", self.id),
             share_url: if self.share_allowed {
                 Some(format!("/client/{}?token={}", self.id, self.share_token))
+            } else {
+                None
+            },
+            share_url_readonly: if self.share_allowed {
+                Some(format!("/client/{}?token={}", self.id, self.share_token_ro))
             } else {
                 None
             },
@@ -1645,6 +1679,7 @@ impl SessionManager {
             guacd_stream,
             connection_id,
             share_token: generate_share_token(),
+            share_token_ro: generate_share_token(),
             width,
             height,
             active_connections: 0,
@@ -1785,9 +1820,11 @@ impl SessionManager {
 
     /// Join an active session by opening a new guacd connection.
     /// Returns a new GuacdStream and the session's cancellation token.
+    /// A `read_only` join sees the session but guacd ignores its input.
     pub async fn join_session(
         &self,
         id: Uuid,
+        read_only: bool,
     ) -> Result<(GuacdStream, CancellationToken), SessionError> {
         let (connection_id, width, height, cancel) = {
             let sessions = self.sessions.read().await;
@@ -1810,6 +1847,7 @@ impl SessionManager {
             width,
             height,
             96,
+            read_only,
             self.guacd_tls.as_ref(),
         )
         .await
@@ -1825,7 +1863,7 @@ impl SessionManager {
             session.active_connections += 1;
         }
 
-        tracing::info!(session_id = %id, "Viewer joined session");
+        tracing::info!(session_id = %id, read_only, "Viewer joined session");
         Ok((stream, cancel))
     }
 
@@ -1841,6 +1879,7 @@ impl SessionManager {
         let session = session.lock().await;
         check_share_token_match(
             &session.share_token,
+            &session.share_token_ro,
             &session.shadow_tokens,
             token,
             Utc::now(),
@@ -1850,15 +1889,24 @@ impl SessionManager {
     /// Mint a new short-lived (10 min) shadow token for a session.
     /// Returns the raw token (hand to admin once) and its expiry.
     /// Expired tokens on the session are pruned on mint.
+    ///
+    /// Refuses a session whose owner has not connected yet. The WebSocket
+    /// handler hands a pending session's stream to whoever connects first,
+    /// before any token is looked at, so a shadow link to a pending session
+    /// would make the admin its owner and lock the real owner out.
     pub async fn mint_shadow_token(
         &self,
         id: Uuid,
         issued_by: &str,
-    ) -> Option<(String, DateTime<Utc>)> {
+        read_only: bool,
+    ) -> Result<(String, DateTime<Utc>), SessionError> {
         use sha2::{Digest, Sha256};
         let sessions = self.sessions.read().await;
-        let session = sessions.get(&id)?;
+        let session = sessions.get(&id).ok_or(SessionError::NotFound)?;
         let mut session = session.lock().await;
+        if session.status != SessionStatus::Active {
+            return Err(SessionError::NotActive);
+        }
 
         let now = Utc::now();
         session.shadow_tokens.retain(|t| t.expires_at > now);
@@ -1872,8 +1920,9 @@ impl SessionManager {
             token_hash: hash,
             issued_by: issued_by.to_string(),
             expires_at,
+            read_only,
         });
-        Some((raw, expires_at))
+        Ok((raw, expires_at))
     }
 
     /// Decrement active connection count when a WebSocket disconnects.
@@ -2318,11 +2367,13 @@ pub enum SessionError {
 }
 
 /// Pure token-matching helper — constant-time comparison of a provided
-/// token against the owner's long-lived `share_token` and the in-memory
-/// set of short-lived admin shadow tokens. Factored out so the logic is
-/// unit-testable without spinning up a full `SessionManager`.
+/// token against the session's long-lived share tokens (read/write and
+/// read-only) and the in-memory set of short-lived admin shadow tokens.
+/// Factored out so the logic is unit-testable without spinning up a full
+/// `SessionManager`.
 pub(crate) fn check_share_token_match(
     share_token: &str,
+    share_token_ro: &str,
     shadow_tokens: &[ShadowToken],
     provided: &str,
     now: DateTime<Utc>,
@@ -2336,6 +2387,10 @@ pub(crate) fn check_share_token_match(
     let expected = Sha256::digest(share_token.as_bytes());
     if bool::from(expected.ct_eq(&provided_digest)) {
         return ShareTokenValidation::Owner;
+    }
+    let expected_ro = Sha256::digest(share_token_ro.as_bytes());
+    if bool::from(expected_ro.ct_eq(&provided_digest)) {
+        return ShareTokenValidation::OwnerReadOnly;
     }
 
     // 2. Short-lived admin shadow tokens (sha256 compared to the
@@ -2353,6 +2408,7 @@ pub(crate) fn check_share_token_match(
         {
             return ShareTokenValidation::Shadow {
                 issued_by: t.issued_by.clone(),
+                read_only: t.read_only,
             };
         }
     }
@@ -2438,27 +2494,28 @@ mod tests {
             token_hash: hex::encode(Sha256::digest(raw.as_bytes())),
             issued_by: issued_by.to_string(),
             expires_at,
+            read_only: false,
         }
     }
 
     #[test]
     fn share_token_owner_match() {
         let now = Utc::now();
-        let v = check_share_token_match("owner-secret", &[], "owner-secret", now);
+        let v = check_share_token_match("owner-secret", "ro-secret", &[], "owner-secret", now);
         assert_eq!(v, ShareTokenValidation::Owner);
     }
 
     #[test]
     fn share_token_wrong_returns_invalid() {
         let now = Utc::now();
-        let v = check_share_token_match("owner-secret", &[], "wrong", now);
+        let v = check_share_token_match("owner-secret", "ro-secret", &[], "wrong", now);
         assert_eq!(v, ShareTokenValidation::Invalid);
     }
 
     #[test]
     fn share_token_empty_provided_invalid() {
         let now = Utc::now();
-        let v = check_share_token_match("owner-secret", &[], "", now);
+        let v = check_share_token_match("owner-secret", "ro-secret", &[], "", now);
         assert_eq!(v, ShareTokenValidation::Invalid);
     }
 
@@ -2470,11 +2527,12 @@ mod tests {
             "admin@example.com",
             now + chrono::Duration::minutes(5),
         );
-        let v = check_share_token_match("owner-secret", &[shadow], "shadow-raw", now);
+        let v = check_share_token_match("owner-secret", "ro-secret", &[shadow], "shadow-raw", now);
         assert_eq!(
             v,
             ShareTokenValidation::Shadow {
-                issued_by: "admin@example.com".into()
+                issued_by: "admin@example.com".into(),
+                read_only: false,
             }
         );
     }
@@ -2483,7 +2541,7 @@ mod tests {
     fn share_token_expired_shadow_rejected() {
         let now = Utc::now();
         let expired = make_shadow("shadow-raw", "admin", now - chrono::Duration::minutes(1));
-        let v = check_share_token_match("owner-secret", &[expired], "shadow-raw", now);
+        let v = check_share_token_match("owner-secret", "ro-secret", &[expired], "shadow-raw", now);
         assert_eq!(v, ShareTokenValidation::Invalid);
     }
 
@@ -2492,7 +2550,13 @@ mod tests {
         // Boundary: expires_at <= now must reject.
         let now = Utc::now();
         let at_boundary = make_shadow("shadow-raw", "admin", now);
-        let v = check_share_token_match("owner-secret", &[at_boundary], "shadow-raw", now);
+        let v = check_share_token_match(
+            "owner-secret",
+            "ro-secret",
+            &[at_boundary],
+            "shadow-raw",
+            now,
+        );
         assert_eq!(v, ShareTokenValidation::Invalid);
     }
 
@@ -2504,11 +2568,12 @@ mod tests {
         let b = make_shadow("bbb", "admin2", ttl);
         let c = make_shadow("ccc", "admin3", ttl);
         let shadows = vec![a, b, c];
-        let v = check_share_token_match("owner", &shadows, "bbb", now);
+        let v = check_share_token_match("owner", "ro-secret", &shadows, "bbb", now);
         assert_eq!(
             v,
             ShareTokenValidation::Shadow {
-                issued_by: "admin2".into()
+                issued_by: "admin2".into(),
+                read_only: false,
             }
         );
     }
@@ -2519,18 +2584,51 @@ mod tests {
         // the owner path takes precedence (owner is checked first).
         let now = Utc::now();
         let shadow = make_shadow("collide", "admin", now + chrono::Duration::minutes(5));
-        let v = check_share_token_match("collide", &[shadow], "collide", now);
+        let v = check_share_token_match("collide", "ro-secret", &[shadow], "collide", now);
         assert_eq!(v, ShareTokenValidation::Owner);
     }
 
     #[test]
     fn share_token_validation_is_valid_helper() {
         assert!(ShareTokenValidation::Owner.is_valid());
+        assert!(ShareTokenValidation::OwnerReadOnly.is_valid());
         assert!(ShareTokenValidation::Shadow {
-            issued_by: "x".into()
+            issued_by: "x".into(),
+            read_only: false,
         }
         .is_valid());
         assert!(!ShareTokenValidation::Invalid.is_valid());
+    }
+
+    #[test]
+    fn share_token_readonly_match() {
+        let now = Utc::now();
+        let v = check_share_token_match("owner-secret", "ro-secret", &[], "ro-secret", now);
+        assert_eq!(v, ShareTokenValidation::OwnerReadOnly);
+        assert!(v.is_read_only());
+    }
+
+    #[test]
+    fn share_token_read_write_is_not_read_only() {
+        let now = Utc::now();
+        let v = check_share_token_match("owner-secret", "ro-secret", &[], "owner-secret", now);
+        assert!(!v.is_read_only());
+    }
+
+    #[test]
+    fn share_token_read_only_shadow_carries_flag() {
+        let now = Utc::now();
+        let mut shadow = make_shadow("shadow-raw", "admin", now + chrono::Duration::minutes(5));
+        shadow.read_only = true;
+        let v = check_share_token_match("owner-secret", "ro-secret", &[shadow], "shadow-raw", now);
+        assert_eq!(
+            v,
+            ShareTokenValidation::Shadow {
+                issued_by: "admin".into(),
+                read_only: true,
+            }
+        );
+        assert!(v.is_read_only());
     }
 
     // ── SessionManager async tests (in-memory, no disk/browser/guacd) ──
@@ -2551,6 +2649,7 @@ mod tests {
             guacd_stream: None,
             connection_id: "conn-test".into(),
             share_token: share_token.to_string(),
+            share_token_ro: format!("{share_token}-ro"),
             width: 1024,
             height: 768,
             active_connections: 0,
@@ -2617,7 +2716,7 @@ mod tests {
         let id = insert_session(&mgr, seed_test_session("owner-secret")).await;
 
         let (raw, expires_at) = mgr
-            .mint_shadow_token(id, "admin@example.com")
+            .mint_shadow_token(id, "admin@example.com", false)
             .await
             .expect("mint");
         assert!(expires_at > Utc::now());
@@ -2627,8 +2726,12 @@ mod tests {
 
         // Shadow validates and returns the issuer.
         match mgr.validate_share_token(id, &raw).await {
-            ShareTokenValidation::Shadow { issued_by } => {
-                assert_eq!(issued_by, "admin@example.com")
+            ShareTokenValidation::Shadow {
+                issued_by,
+                read_only,
+            } => {
+                assert_eq!(issued_by, "admin@example.com");
+                assert!(!read_only);
             }
             other => panic!("expected Shadow variant, got {:?}", other),
         }
@@ -2641,7 +2744,10 @@ mod tests {
         let mgr = new_manager_for_tests();
         let id_a = insert_session(&mgr, seed_test_session("owner-a")).await;
         let id_b = insert_session(&mgr, seed_test_session("owner-b")).await;
-        let (raw, _) = mgr.mint_shadow_token(id_a, "admin").await.expect("mint");
+        let (raw, _) = mgr
+            .mint_shadow_token(id_a, "admin", false)
+            .await
+            .expect("mint");
         assert_eq!(
             mgr.validate_share_token(id_b, &raw).await,
             ShareTokenValidation::Invalid
@@ -2658,6 +2764,7 @@ mod tests {
             token_hash: "deadbeef".into(),
             issued_by: "stale".into(),
             expires_at: Utc::now() - chrono::Duration::hours(1),
+            read_only: false,
         });
         mgr.sessions
             .write()
@@ -2665,12 +2772,74 @@ mod tests {
             .insert(id, Arc::new(Mutex::new(session)));
 
         // Mint pruning is documented on mint_shadow_token.
-        let _ = mgr.mint_shadow_token(id, "admin").await.unwrap();
+        let _ = mgr.mint_shadow_token(id, "admin", false).await.unwrap();
 
         let sessions = mgr.sessions.read().await;
         let guard = sessions.get(&id).unwrap().lock().await;
         assert_eq!(guard.shadow_tokens.len(), 1, "expired should be pruned");
         assert_ne!(guard.shadow_tokens[0].issued_by, "stale");
+    }
+
+    #[tokio::test]
+    async fn manager_readonly_share_token_validates() {
+        let mgr = new_manager_for_tests();
+        let id = insert_session(&mgr, seed_test_session("owner-secret")).await;
+        let v = mgr.validate_share_token(id, "owner-secret-ro").await;
+        assert_eq!(v, ShareTokenValidation::OwnerReadOnly);
+    }
+
+    #[test]
+    fn session_info_exposes_both_share_urls_only_when_allowed() {
+        let mut session = seed_test_session("rw");
+        let info = session.info();
+        assert_eq!(
+            info.share_url.as_deref(),
+            Some(format!("/client/{}?token=rw", session.id).as_str())
+        );
+        assert_eq!(
+            info.share_url_readonly.as_deref(),
+            Some(format!("/client/{}?token=rw-ro", session.id).as_str())
+        );
+
+        session.share_allowed = false;
+        let info = session.info();
+        assert!(info.share_url.is_none());
+        assert!(info.share_url_readonly.is_none());
+    }
+
+    #[tokio::test]
+    async fn manager_mint_read_only_shadow() {
+        let mgr = new_manager_for_tests();
+        let id = insert_session(&mgr, seed_test_session("owner")).await;
+        let (raw, _) = mgr.mint_shadow_token(id, "admin", true).await.unwrap();
+        assert!(mgr.validate_share_token(id, &raw).await.is_read_only());
+    }
+
+    /// H3: shadowing a session nobody has connected to yet would make the
+    /// admin its owner (the stream goes to the first connection), so mint
+    /// must refuse it.
+    #[tokio::test]
+    async fn manager_mint_refuses_pending_session() {
+        let mgr = new_manager_for_tests();
+        let mut seed = seed_test_session("owner");
+        seed.status = SessionStatus::Pending;
+        let id = insert_session(&mgr, seed).await;
+        assert!(matches!(
+            mgr.mint_shadow_token(id, "admin", false).await,
+            Err(SessionError::NotActive)
+        ));
+        let sessions = mgr.sessions.read().await;
+        let guard = sessions.get(&id).unwrap().lock().await;
+        assert!(guard.shadow_tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_mint_unknown_session_not_found() {
+        let mgr = new_manager_for_tests();
+        assert!(matches!(
+            mgr.mint_shadow_token(Uuid::new_v4(), "admin", false).await,
+            Err(SessionError::NotFound)
+        ));
     }
 
     #[tokio::test]

@@ -30,7 +30,7 @@ pub async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     let identity = identity.map(|Extension(id)| id);
-    let admin_name = identity
+    let caller_name = identity
         .as_ref()
         .map(|id| id.display_name().to_string())
         .unwrap_or_else(|| "unknown".into());
@@ -45,6 +45,29 @@ pub async fn create_session(
                 .into_response();
         }
     }
+
+    // `owner` creates the session on someone else's behalf: they, not the
+    // caller, are its creator and the only identity that may connect to it
+    // first. Admin-only, since it hands that user a logged-in session.
+    let admin_name = match req.owner.as_deref() {
+        None => caller_name.clone(),
+        Some(owner) => {
+            if !identity.as_ref().is_some_and(|id| id.has_role("admin")) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "admin role required to create a session for another owner"})),
+                )
+                    .into_response();
+            }
+            match validate_session_owner(owner) {
+                Ok(o) => o,
+                Err(msg) => {
+                    return (StatusCode::BAD_REQUEST, Json(json!({ "error": msg })))
+                        .into_response();
+                }
+            }
+        }
+    };
 
     let proxies = trusted.map(|Extension(t)| t.0).unwrap_or_default();
     let client_ip = client_ip(&headers, addr.ip(), &proxies);
@@ -95,6 +118,7 @@ pub async fn create_session(
 
     tracing::info!(
         admin = %admin_name,
+        caller = %caller_name,
         client_ip = %client_ip,
         session_type = ?req.session_type,
         target = %target,
@@ -131,6 +155,23 @@ pub async fn create_session(
     }
 }
 
+/// Normalise and check the `owner` of a session created on someone's
+/// behalf. It is compared against the connecting user's email, so it must
+/// look like an identity rather than arbitrary text.
+fn validate_session_owner(owner: &str) -> Result<String, &'static str> {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        return Err("owner must not be empty");
+    }
+    if owner.len() > 320 {
+        return Err("owner is too long");
+    }
+    if owner.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("owner must not contain whitespace or control characters");
+    }
+    Ok(owner.to_string())
+}
+
 /// Strip share_url from session info unless the caller is the session creator or an admin.
 fn redact_share_url(
     mut info: crate::session::SessionInfo,
@@ -142,6 +183,7 @@ fn redact_share_url(
     };
     if !is_owner_or_admin {
         info.share_url = None;
+        info.share_url_readonly = None;
     }
     info
 }
@@ -368,10 +410,20 @@ pub async fn get_session_thumbnail(
     }
 }
 
+/// Optional body for `POST /api/sessions/:id/shadow`.
+#[derive(Deserialize, Default)]
+pub struct ShadowRequest {
+    /// Join as a view-only viewer. Default false (keyboard and mouse
+    /// control), which is what shadow has always granted.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// POST /api/sessions/:id/shadow — Mint a short-lived viewer token
 /// that lets the caller join another user's active session without that
 /// user's cooperation. Admin-only. The raw token is returned once and a
 /// `token_audit_log` entry is written. Tokens expire after 10 minutes.
+#[allow(clippy::too_many_arguments)]
 pub async fn shadow_session(
     State(manager): State<AppState>,
     Extension(database): Extension<Db>,
@@ -380,7 +432,9 @@ pub async fn shadow_session(
     identity: Option<Extension<AuthIdentity>>,
     trusted: Option<Extension<TrustedProxies>>,
     Path(id): Path<Uuid>,
+    body: Option<Json<ShadowRequest>>,
 ) -> impl IntoResponse {
+    let read_only = body.map(|Json(b)| b.read_only).unwrap_or(false);
     let id_inner = match identity {
         Some(Extension(ref id)) if id.has_role("admin") => id.clone(),
         _ => {
@@ -404,9 +458,16 @@ pub async fn shadow_session(
     };
 
     let admin_email = id_inner.display_name().to_string();
-    let (raw, expires_at) = match manager.mint_shadow_token(id, &admin_email).await {
-        Some(t) => t,
-        None => {
+    let (raw, expires_at) = match manager.mint_shadow_token(id, &admin_email, read_only).await {
+        Ok(t) => t,
+        Err(crate::session::SessionError::NotActive) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "session hasn't started yet; its owner must connect before it can be shadowed"})),
+            )
+                .into_response();
+        }
+        Err(_) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": "session not found"})),
@@ -419,9 +480,10 @@ pub async fn shadow_session(
     let proxies = trusted.map(|Extension(t)| t.0).unwrap_or_default();
     let ip = client_ip(&headers, addr.ip(), &proxies).to_string();
     let details = format!(
-        "session_id={}, owner={}, expires_at={}",
+        "session_id={}, owner={}, read_only={}, expires_at={}",
         id,
         info.created_by,
+        read_only,
         expires_at.to_rfc3339()
     );
     let db_clone = database.clone();
@@ -453,6 +515,7 @@ pub async fn shadow_session(
         "url": url,
         "expires_at": expires_at.to_rfc3339(),
         "ttl_seconds": 600,
+        "read_only": read_only,
     }))
     .into_response()
 }
@@ -2747,6 +2810,7 @@ pub async fn ab_connect_entry(
         proxmox_token_secret: ab_entry.proxmox_token_secret,
         proxmox_verify_tls: ab_entry.proxmox_verify_tls,
         max_monitors: ab_entry.max_monitors,
+        owner: None,
     };
 
     let proxies = trusted.map(|Extension(t)| t.0).unwrap_or_default();
@@ -4567,6 +4631,7 @@ pub async fn quick_connect(
             proxmox_token_secret: None,
             proxmox_verify_tls: None,
             max_monitors: None,
+            owner: None,
         };
 
         tracing::info!(
@@ -4686,6 +4751,7 @@ pub async fn quick_connect(
         proxmox_token_secret: None,
         proxmox_verify_tls: None,
         max_monitors: None,
+        owner: None,
     };
 
     match manager.create_session(create_req, admin_name).await {
@@ -5127,5 +5193,22 @@ mod tests {
         assert!(!is_jpeg_magic(&[0xFE, 0xD8, 0xFF]));
         assert!(!is_jpeg_magic(&[0xFF, 0xD7, 0xFF]));
         assert!(!is_jpeg_magic(&[0xFF, 0xD8, 0xFE]));
+    }
+
+    #[test]
+    fn session_owner_is_trimmed() {
+        assert_eq!(
+            validate_session_owner("  alice@example.com "),
+            Ok("alice@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn session_owner_rejects_empty_and_junk() {
+        assert!(validate_session_owner("").is_err());
+        assert!(validate_session_owner("   ").is_err());
+        assert!(validate_session_owner("alice @example.com").is_err());
+        assert!(validate_session_owner("alice\u{7}@example.com").is_err());
+        assert!(validate_session_owner(&"a".repeat(321)).is_err());
     }
 }

@@ -629,11 +629,19 @@
                     if (isActive && isOwn) {
                         tdOpen.appendChild(h('a', 'open', { href: s.client_url, target: '_blank' }));
                     } else if (canShadow) {
+                        tdOpen.appendChild(h('a', 'watch', {
+                            href: '#',
+                            'class': 'shadow-link',
+                            'data-shadow': s.session_id,
+                            'data-read-only': 'true',
+                            title: 'Join this session as a view-only viewer (10 min token, audit-logged)'
+                        }));
+                        tdOpen.appendChild(document.createTextNode(' '));
                         tdOpen.appendChild(h('a', 'shadow', {
                             href: '#',
                             'class': 'shadow-link',
                             'data-shadow': s.session_id,
-                            title: 'Join this session as a read-only viewer (10 min token, audit-logged)'
+                            title: 'Join this session with keyboard and mouse control (10 min token, audit-logged)'
                         }));
                     }
                     tr.appendChild(tdOpen);
@@ -681,10 +689,13 @@
                 var originalText = link.textContent;
                 link.textContent = 'minting...';
                 link.classList.add('shadow-link-busy');
+                var shadowHeaders = apiHeaders();
+                shadowHeaders['Content-Type'] = 'application/json';
                 fetch('/api/sessions/' + id + '/shadow', {
                     method: 'POST',
-                    headers: apiHeaders(),
-                    credentials: 'same-origin'
+                    headers: shadowHeaders,
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ read_only: link.getAttribute('data-read-only') === 'true' })
                 })
                 .then(function(res) {
                     if (!res.ok) return res.text().then(function(t) { throw new Error(t || 'shadow failed'); });

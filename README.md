@@ -60,7 +60,7 @@ guacd (C, from guacamole-server)
 ### Connectivity
 
 - **Multi-hop SSH tunnels**: chain jump hosts/bastions to reach isolated networks (all session types, including the Proxmox API and console hops)
-- **Session sharing**: share tokens for read-only or collaborative access
+- **Session sharing**: share links for view-only or collaborative access, plus admin shadowing
 - **Headless API integration**: create a session over the REST API and hand a browser a ready-to-open URL via a single-use WebSocket ticket, with no OIDC login and no API key in the browser (see [Connecting to a session](docs/api.md#connecting-to-a-session))
 - **Encrypted file transfer**: LUKS-encrypted per-session drive storage (RDP), SFTP (SSH)
 - **Credential variables**: shared credentials across connections entries
