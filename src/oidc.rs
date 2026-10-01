@@ -153,14 +153,12 @@ pub async fn login(State(oidc): State<OidcState>, Query(params): Query<LoginPara
     let mut cookies = vec![(header::SET_COOKIE, state_cookie)];
 
     // Store post-login redirect URL in a cookie if provided and safe
-    if let Some(ref next) = params.next {
-        if next.starts_with('/') && !next.starts_with("//") && !next.contains("://") {
-            let next_cookie = format!(
-                "rustguac_next={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600",
-                next
-            );
-            cookies.push((header::SET_COOKIE, next_cookie));
-        }
+    if let Some(next) = params.next.as_deref().and_then(safe_next) {
+        let next_cookie = format!(
+            "rustguac_next={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600",
+            next
+        );
+        cookies.push((header::SET_COOKIE, next_cookie));
     }
 
     (
@@ -412,7 +410,7 @@ pub async fn callback(
 
     // Check for post-login redirect cookie
     let redirect_to = extract_cookie_from_headers(&headers, "rustguac_next")
-        .filter(|n| n.starts_with('/') && !n.starts_with("//") && !n.contains("://"))
+        .and_then(|n| safe_next(&n).map(str::to_string))
         .unwrap_or_else(|| "/addressbook.html".to_string());
 
     // Set session cookie and redirect; clear OIDC state and next cookies
@@ -524,6 +522,34 @@ fn extract_cookie_value(request: &axum::extract::Request, name: &str) -> Option<
 }
 
 /// Extract a cookie value from a HeaderMap.
+/// Accept a post-login `next` only if it is a same-origin path.
+///
+/// Browsers are lenient about Location: they treat `\` as `/` and drop
+/// tabs and newlines, so `/\evil.com` and a `/<TAB>/evil.com` that arrives
+/// percent-decoded from the query both become `//evil.com`, another site,
+/// after a check for a leading `//` has passed them. Requiring visible ASCII
+/// with no backslash closes those, and also keeps the value safe to place in
+/// the `rustguac_next` cookie and the Location header unescaped (no `;`,
+/// `,`, quotes or spaces). Legitimate targets are already percent-encoded.
+fn safe_next(next: &str) -> Option<&str> {
+    let bytes = next.as_bytes();
+    if next.len() > 2048 || bytes.first() != Some(&b'/') || bytes.get(1) == Some(&b'/') {
+        return None;
+    }
+    if !bytes
+        .iter()
+        .all(|&b| (0x21..=0x7e).contains(&b) && !matches!(b, b'\\' | b';' | b',' | b'"'))
+    {
+        return None;
+    }
+    // An encoded slash or backslash straight after the first `/`.
+    let lower = next.to_ascii_lowercase();
+    if lower.starts_with("/%2f") || lower.starts_with("/%5c") {
+        return None;
+    }
+    Some(next)
+}
+
 fn extract_cookie_from_headers(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     headers
         .get("cookie")
@@ -618,6 +644,38 @@ fn parse_issuer_mismatch(raw: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn safe_next_allows_same_origin_paths() {
+        for ok in [
+            "/connections.html",
+            "/client/550e8400-e29b-41d4-a716-446655440000?token=abc",
+            "/api/connect?scope=shared&folder=My%20Folder&entry=a%2Fb",
+        ] {
+            assert_eq!(super::safe_next(ok), Some(ok), "{ok}");
+        }
+    }
+
+    /// M2: each of these is read by browsers as a different origin.
+    #[test]
+    fn safe_next_rejects_open_redirects() {
+        for bad in [
+            "//evil.com",
+            "/\\evil.com",
+            "/\t/evil.com",
+            "/\n/evil.com",
+            "/ /evil.com",
+            "/%2F/evil.com",
+            "/%5cevil.com",
+            "https://evil.com",
+            "evil.com",
+            "",
+            "/a;Domain=evil.com",
+            "/caf\u{e9}",
+        ] {
+            assert_eq!(super::safe_next(bad), None, "{bad:?}");
+        }
+    }
+
     use super::*;
     use base64::Engine;
 
