@@ -60,7 +60,9 @@ server {
 
         proxy_set_header Host              $host;
         proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        # Overwrite rather than append ($proxy_add_x_forwarded_for), so a
+        # client cannot pre-load the header with an address of its choosing.
+        proxy_set_header X-Forwarded-For   $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
 
         # WebSocket support for session streams.
@@ -203,7 +205,12 @@ Whichever proxy you use, set `trusted_proxies` in `config.toml` to match
 the source IP your proxy connects from (usually `127.0.0.1/32` on
 same-host deployments). rustguac then honours `X-Forwarded-For` from that
 source, so client IPs appear correctly in audit logs, session history,
-and rate-limit decisions.
+IP allowlists and rate-limit decisions.
+
+rustguac reads `X-Forwarded-For` from the right: the client is the
+rightmost address that is not itself a trusted proxy, so entries a client
+forges on the left are ignored. List every proxy in the chain if requests
+pass through more than one.
 
 ```toml
 trusted_proxies = ["127.0.0.1/32"]

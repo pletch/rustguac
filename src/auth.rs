@@ -135,24 +135,112 @@ pub fn compute_effective_role(user_role: &str, max_role: &Option<String>) -> Str
 /// Extract the real client IP, honouring X-Forwarded-For when the socket
 /// address belongs to a trusted proxy CIDR.
 pub fn client_ip(headers: &HeaderMap, socket_addr: IpAddr, trusted_proxies: &[String]) -> IpAddr {
-    if !trusted_proxies.is_empty() {
-        let networks: Vec<IpNetwork> = trusted_proxies
-            .iter()
-            .filter_map(|s| s.parse::<IpNetwork>().ok())
-            .collect();
+    client_ip_from(
+        headers,
+        socket_addr,
+        &parse_trusted_proxies(trusted_proxies),
+    )
+}
 
-        if networks.iter().any(|net| net.contains(socket_addr)) {
-            if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-                // First IP in X-Forwarded-For is the original client
-                if let Some(first) = xff.split(',').next() {
-                    if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                        return ip;
-                    }
-                }
-            }
+/// Parse `trusted_proxies` CIDRs, dropping entries that do not parse
+/// (startup warns about those).
+pub fn parse_trusted_proxies(trusted_proxies: &[String]) -> Vec<IpNetwork> {
+    trusted_proxies
+        .iter()
+        .filter_map(|s| s.parse::<IpNetwork>().ok())
+        .collect()
+}
+
+/// Resolve the client address behind a chain of trusted proxies.
+///
+/// X-Forwarded-For is walked from the RIGHT. Each proxy appends the address
+/// it received the request from, so the right-hand entries are the only ones
+/// written by infrastructure we trust; anything to their left came from the
+/// client and may be forged. The client is the first entry, reading
+/// leftwards, that is not itself a trusted proxy. Taking the leftmost entry
+/// instead would let anyone choose their own address (and so walk through an
+/// IP allowlist) behind any proxy that appends to an incoming header, which
+/// includes nginx's `$proxy_add_x_forwarded_for` and Apache's mod_proxy.
+///
+/// Every X-Forwarded-For header line is read, in order, since some proxies
+/// add a new line rather than appending to the existing one. Entries are
+/// split on raw bytes so a non-UTF-8 value smuggled in on the left cannot
+/// hide the valid address a proxy appended after it.
+pub fn client_ip_from(headers: &HeaderMap, socket_addr: IpAddr, trusted: &[IpNetwork]) -> IpAddr {
+    let is_trusted = |ip: IpAddr| trusted.iter().any(|net| net.contains(ip));
+    if !is_trusted(socket_addr) {
+        return socket_addr;
+    }
+    let hops: Vec<&[u8]> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .flat_map(|v| v.as_bytes().split(|&b| b == b','))
+        .collect();
+    let mut client = socket_addr;
+    for hop in hops.iter().rev() {
+        // A malformed entry ends the walk: nothing to its left can be
+        // attributed to a trusted proxy.
+        let Some(ip) = parse_forwarded_ip(hop) else {
+            break;
+        };
+        client = ip;
+        if !is_trusted(ip) {
+            break;
         }
     }
-    socket_addr
+    client
+}
+
+/// Rate-limit key: the client address as resolved by [`client_ip_from`].
+///
+/// Replaces tower_governor's `SmartIpKeyExtractor`, which believes
+/// X-Forwarded-For (and Forwarded / X-Real-IP) from ANY peer. With that,
+/// a client sending a different forged address per request got a fresh
+/// bucket every time, so no limiter, including the always-on OIDC one,
+/// ever engaged. Forwarded headers are only honoured from `trusted_proxies`
+/// here, exactly as for IP allowlists and audit logs.
+#[derive(Clone)]
+pub struct ClientIpKeyExtractor {
+    trusted: Arc<Vec<IpNetwork>>,
+}
+
+impl ClientIpKeyExtractor {
+    pub fn new(trusted_proxies: &[String]) -> Self {
+        Self {
+            trusted: Arc::new(parse_trusted_proxies(trusted_proxies)),
+        }
+    }
+}
+
+impl tower_governor::key_extractor::KeyExtractor for ClientIpKeyExtractor {
+    type Key = IpAddr;
+
+    fn extract<T>(
+        &self,
+        req: &axum::http::Request<T>,
+    ) -> Result<Self::Key, tower_governor::GovernorError> {
+        let peer = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| addr.ip())
+            .ok_or(tower_governor::GovernorError::UnableToExtractKey)?;
+        Ok(client_ip_from(req.headers(), peer, &self.trusted))
+    }
+}
+
+/// Parse one X-Forwarded-For entry: a bare address, or one with a port
+/// (`203.0.113.5:4711`, `[2001:db8::1]:4711`) as some proxies write it.
+fn parse_forwarded_ip(raw: &[u8]) -> Option<IpAddr> {
+    let s = std::str::from_utf8(raw).ok()?.trim();
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Ok(sa) = s.parse::<SocketAddr>() {
+        return Some(sa.ip());
+    }
+    s.strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .and_then(|r| r.parse::<IpAddr>().ok())
 }
 
 /// Extract session cookie value from the Cookie header.
@@ -546,6 +634,83 @@ mod tests {
         // Socket is NOT in trusted range
         let ip = client_ip(&headers, "192.168.1.1".parse().unwrap(), &proxies);
         assert_eq!(ip.to_string(), "192.168.1.1");
+    }
+
+    fn xff(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for v in values {
+            headers.append("x-forwarded-for", v.parse().unwrap());
+        }
+        headers
+    }
+
+    /// H2: behind a proxy that appends (nginx `$proxy_add_x_forwarded_for`),
+    /// a client-supplied left entry must not be believed.
+    #[test]
+    fn test_client_ip_ignores_forged_left_entry() {
+        let proxies = vec!["10.0.0.0/8".into()];
+        // Client 198.51.100.7 sent "X-Forwarded-For: 192.168.1.10"; nginx
+        // appended the real peer.
+        let headers = xff(&["192.168.1.10, 198.51.100.7"]);
+        let ip = client_ip(&headers, "10.0.0.1".parse().unwrap(), &proxies);
+        assert_eq!(ip.to_string(), "198.51.100.7");
+    }
+
+    #[test]
+    fn test_client_ip_walks_through_proxy_chain() {
+        let proxies = vec!["10.0.0.0/8".into()];
+        let headers = xff(&["1.1.1.1, 203.0.113.50, 10.0.0.9, 10.0.0.8"]);
+        let ip = client_ip(&headers, "10.0.0.1".parse().unwrap(), &proxies);
+        assert_eq!(ip.to_string(), "203.0.113.50");
+    }
+
+    #[test]
+    fn test_client_ip_reads_every_header_line() {
+        // A proxy that adds its own line rather than appending.
+        let proxies = vec!["10.0.0.0/8".into()];
+        let headers = xff(&["192.168.1.10", "198.51.100.7"]);
+        let ip = client_ip(&headers, "10.0.0.1".parse().unwrap(), &proxies);
+        assert_eq!(ip.to_string(), "198.51.100.7");
+    }
+
+    #[test]
+    fn test_client_ip_non_utf8_left_entry_does_not_hide_peer() {
+        let proxies = vec!["10.0.0.0/8".into()];
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_bytes(b"\xff\xfe, 198.51.100.7").unwrap(),
+        );
+        let ip = client_ip(&headers, "10.0.0.1".parse().unwrap(), &proxies);
+        assert_eq!(ip.to_string(), "198.51.100.7");
+    }
+
+    #[test]
+    fn test_client_ip_entry_with_port() {
+        let proxies = vec!["10.0.0.0/8".into()];
+        let ip = client_ip(
+            &xff(&["198.51.100.7:4711"]),
+            "10.0.0.1".parse().unwrap(),
+            &proxies,
+        );
+        assert_eq!(ip.to_string(), "198.51.100.7");
+        let ip = client_ip(
+            &xff(&["[2001:db8::1]:4711"]),
+            "10.0.0.1".parse().unwrap(),
+            &proxies,
+        );
+        assert_eq!(ip.to_string(), "2001:db8::1");
+    }
+
+    #[test]
+    fn test_client_ip_all_hops_trusted_returns_leftmost() {
+        let proxies = vec!["10.0.0.0/8".into()];
+        let ip = client_ip(
+            &xff(&["10.1.2.3, 10.0.0.9"]),
+            "10.0.0.1".parse().unwrap(),
+            &proxies,
+        );
+        assert_eq!(ip.to_string(), "10.1.2.3");
     }
 
     #[test]

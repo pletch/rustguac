@@ -117,7 +117,7 @@ When a user API token authenticates, the effective role is computed as `min(user
 |--------|-----------|
 | Token theft / leakage | `rgu_` prefix enables automated secret scanning; short token lifetime recommended; tokens can be revoked immediately |
 | Privilege escalation via token | effective role is always `min(user_role, max_role)` — demoting the user restricts all their tokens |
-| Brute-force token guessing | 240 bits of entropy (60 hex chars); rate limiting at 2 req/sec per IP |
+| Brute-force token guessing | 240 bits of entropy (60 hex chars), which makes guessing infeasible regardless of rate limiting |
 | Token abuse after user offboarding | user deletion cascade-deletes all tokens; disabling a user blocks all their tokens |
 | Lateral movement from stolen token | tokens inherit the user's identity — all actions are logged with the user's email and client IP |
 | Audit evasion | all token create/revoke/use events are logged in `token_audit_log` with IP addresses |
@@ -133,15 +133,17 @@ Audit logs are retained for 90 days and cleaned up hourly. Admins can view the l
 
 ## Rate limiting
 
-Per-IP rate limiting is applied to all endpoints using `tower_governor`:
+The OIDC login and callback routes are always rate limited, at 1 request per second per client IP with a burst of 20.
+
+Setting `rate_limit = true` adds per-IP limits to the rest of the application. It is off by default, since deployments behind a reverse proxy usually limit there:
 
 | Endpoint group | Rate | Burst |
 |---------------|------|-------|
-| API routes | 2/sec | 10 |
-| Session creation | 1/sec | 5 |
-| WebSocket connections | 2/sec | 20 |
+| API routes (including requests that fail authentication) | 20/sec | 100 |
+| Session creation | 2/sec | 10 |
+| WebSocket connections | 5/sec | 50 |
 
-Rate limiting uses the resolved client IP (honoring `trusted_proxies` for X-Forwarded-For).
+Every limiter keys on the resolved client IP. Forwarded headers are honoured only from `trusted_proxies`, so a client cannot get a fresh allowance by sending a different `X-Forwarded-For` on each request. Behind a proxy, set `trusted_proxies`, or every user shares the proxy's allowance.
 
 ## Security headers
 
@@ -255,7 +257,9 @@ HTTP request bodies are limited to 64KB to prevent memory exhaustion attacks.
 
 ## Trusted proxy support
 
-When `trusted_proxies` is configured, rustguac extracts the real client IP from the `X-Forwarded-For` header for connections originating from trusted proxy CIDRs. This ensures correct IP-based rate limiting and audit logging behind reverse proxies.
+When `trusted_proxies` is configured, rustguac extracts the real client IP from the `X-Forwarded-For` header for connections originating from trusted proxy CIDRs. This ensures correct IP allowlists, rate limiting and audit logging behind reverse proxies.
+
+The header is read from the right, skipping addresses that are themselves trusted proxies. The leftmost entry is never trusted on its own, because a proxy that appends to an incoming header passes along whatever the client put there.
 
 ```toml
 trusted_proxies = ["127.0.0.1/32"]

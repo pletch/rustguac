@@ -57,7 +57,7 @@ CIDR ranges controlling which hosts sessions can connect to. All default to loca
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `trusted_proxies` | `[]` | CIDRs of reverse proxies whose X-Forwarded-For to trust |
+| `trusted_proxies` | `[]` | CIDRs of reverse proxies whose X-Forwarded-For to trust (read right to left, skipping trusted hops) |
 | `rate_limit` | `false` | Enable API rate limiting. Not needed when behind a rate-limiting reverse proxy. |
 | `session_history_retention_days` | `90` | Days to keep session history in the database. 0 = keep forever. |
 

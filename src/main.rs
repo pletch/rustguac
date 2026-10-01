@@ -32,9 +32,7 @@ use axum::{middleware, Extension, Router};
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_governor::{
-    governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer,
-};
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 
@@ -963,6 +961,7 @@ async fn run_server(config: Config, database: Db) {
     // Build TLS connector for guacd if configured
     let guacd_tls = build_guacd_tls(&config);
     let rate_limit_enabled = config.rate_limit;
+    let trusted_proxy_cidrs = config.trusted_proxies.clone();
 
     // Create session manager
     let manager: AppState = Arc::new(SessionManager::new_with_db(
@@ -1109,6 +1108,14 @@ async fn run_server(config: Config, database: Db) {
     if rate_limit_enabled {
         tracing::info!("API rate limiting enabled");
     }
+    // Every limiter keys on the client address resolved through
+    // trusted_proxies, never on forwarded headers from arbitrary peers.
+    let rate_key = auth::ClientIpKeyExtractor::new(&trusted_proxy_cidrs);
+    for cidr in &trusted_proxy_cidrs {
+        if cidr.parse::<ipnetwork::IpNetwork>().is_err() {
+            tracing::warn!(entry = %cidr, "trusted_proxies entry is not a valid IP or CIDR and is ignored");
+        }
+    }
 
     // WebSocket ticket store (single-use tokens to keep API keys out of WS URLs)
     let ws_ticket_store = auth::WsTicketStore::new();
@@ -1121,7 +1128,7 @@ async fn run_server(config: Config, database: Db) {
         let conf = GovernorConfigBuilder::default()
             .per_second(2)
             .burst_size(10)
-            .key_extractor(SmartIpKeyExtractor)
+            .key_extractor(rate_key.clone())
             .finish()
             .expect("Failed to build session creation rate limit config");
         session_create_route = session_create_route.layer(GovernorLayer::new(conf));
@@ -1246,41 +1253,43 @@ async fn run_server(config: Config, database: Db) {
         )
         .route("/api/ssh/probe-host-key", post(api::ssh_probe_host_key))
         .merge(session_create_route)
-        .with_state(manager.clone());
-    if rate_limit_enabled {
-        let conf = GovernorConfigBuilder::default()
-            .per_second(20)
-            .burst_size(100)
-            .key_extractor(SmartIpKeyExtractor)
-            .finish()
-            .expect("Failed to build API rate limit config");
-        api_routes = api_routes.layer(GovernorLayer::new(conf));
-    }
-    let api_routes = api_routes
+        .with_state(manager.clone())
         .layer(middleware::from_fn(auth::require_auth))
         .layer(Extension(ws_ticket_store.clone()))
         .layer(Extension(vault_client.clone()))
         .layer(Extension(vault_configured.clone()))
         .layer(Extension(credential_default_scope.clone()))
         .layer(Extension(database.clone()));
+    // Applied OUTSIDE require_auth so requests with bad credentials are
+    // counted too: a flood of bogus keys is throttled before each one
+    // queues on the database lock to be looked up.
+    if rate_limit_enabled {
+        let conf = GovernorConfigBuilder::default()
+            .per_second(20)
+            .burst_size(100)
+            .key_extractor(rate_key.clone())
+            .finish()
+            .expect("Failed to build API rate limit config");
+        api_routes = api_routes.layer(GovernorLayer::new(conf));
+    }
 
     // WebSocket route with optional auth
     let mut ws_route = Router::new()
         .route("/ws/{session_id}", get(websocket::ws_handler))
-        .with_state(manager.clone());
+        .with_state(manager.clone())
+        .layer(middleware::from_fn(auth::optional_auth))
+        .layer(Extension(ws_ticket_store.clone()))
+        .layer(Extension(database.clone()));
+    // Outside optional_auth, as for the API routes above.
     if rate_limit_enabled {
         let conf = GovernorConfigBuilder::default()
             .per_second(5)
             .burst_size(50)
-            .key_extractor(SmartIpKeyExtractor)
+            .key_extractor(rate_key.clone())
             .finish()
             .expect("Failed to build WebSocket rate limit config");
         ws_route = ws_route.layer(GovernorLayer::new(conf));
     }
-    let ws_route = ws_route
-        .layer(middleware::from_fn(auth::optional_auth))
-        .layer(Extension(ws_ticket_store.clone()))
-        .layer(Extension(database.clone()));
 
     // Quick-connect route with optional auth (handles its own redirect-to-login)
     let connect_route = Router::new()
@@ -1328,10 +1337,12 @@ async fn run_server(config: Config, database: Db) {
 
     // Add OIDC routes if configured (always rate-limited to prevent brute-force)
     if let Some(ref oidc_st) = oidc_state {
+        // Burst sized for an office of users behind one NAT address
+        // logging in at once (each login is two requests).
         let auth_rate_conf = GovernorConfigBuilder::default()
             .per_second(1)
-            .burst_size(5)
-            .key_extractor(SmartIpKeyExtractor)
+            .burst_size(20)
+            .key_extractor(rate_key.clone())
             .finish()
             .expect("Failed to build auth rate limit config");
         let oidc_routes = Router::new()
@@ -1586,45 +1597,93 @@ mod tests {
     // refactor that drops `.layer(GovernorLayer::new(...))` from a route
     // group without noticing.
 
-    #[tokio::test]
-    async fn rate_limit_layer_returns_429_on_burst() {
-        use axum::{body::Body, http::Request, routing::get, Router};
-        use tower::ServiceExt;
-
-        // Same settings family as the OIDC auth-rate-limit path in main.rs.
+    fn probe_app(burst: u32) -> axum::Router {
+        use axum::routing::get;
         let conf = GovernorConfigBuilder::default()
             .per_second(1)
-            .burst_size(3)
-            .key_extractor(SmartIpKeyExtractor)
+            .burst_size(burst)
+            .key_extractor(auth::ClientIpKeyExtractor::new(&["10.0.0.0/8".into()]))
             .finish()
             .expect("governor config");
-
-        let app: Router = Router::new()
+        axum::Router::new()
             .route("/probe", get(|| async { axum::http::StatusCode::OK }))
-            .layer(GovernorLayer::new(conf));
+            .layer(GovernorLayer::new(conf))
+    }
 
-        // Fire 10 requests back-to-back from the same source IP. With
-        // burst=3 per_second=1, at least one must be throttled (429).
-        // SmartIpKeyExtractor honours X-Forwarded-For when present.
+    fn probe_req(peer: &str, xff: Option<&str>) -> axum::http::Request<axum::body::Body> {
+        let mut b = axum::http::Request::builder().uri("/probe");
+        if let Some(x) = xff {
+            b = b.header("x-forwarded-for", x);
+        }
+        let mut req = b.body(axum::body::Body::empty()).unwrap();
+        let addr: std::net::SocketAddr = format!("{peer}:40000").parse().unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(addr));
+        req
+    }
+
+    #[tokio::test]
+    async fn rate_limit_layer_returns_429_on_burst() {
+        use tower::ServiceExt;
+        let app = probe_app(3);
         let mut saw_ok = false;
         let mut saw_429 = false;
         for _ in 0..10 {
-            let req = Request::builder()
-                .uri("/probe")
-                .header("x-forwarded-for", "203.0.113.99")
-                .body(Body::empty())
+            let resp = app
+                .clone()
+                .oneshot(probe_req("203.0.113.99", None))
+                .await
                 .unwrap();
-            let resp = app.clone().oneshot(req).await.unwrap();
             match resp.status().as_u16() {
                 200 => saw_ok = true,
                 429 => saw_429 = true,
-                other => panic!("unexpected status {other} — governor misconfigured"),
+                other => panic!("unexpected status {other}: governor misconfigured"),
             }
         }
-        assert!(saw_ok, "no requests succeeded — layer misconfigured");
+        assert!(saw_ok, "no requests succeeded: layer misconfigured");
         assert!(
             saw_429,
-            "no requests were throttled — rate-limit not applied"
+            "no requests were throttled: rate-limit not applied"
         );
+    }
+
+    /// H1: a client that forges a different X-Forwarded-For on every
+    /// request must still share one bucket when it is not a trusted proxy.
+    #[tokio::test]
+    async fn rate_limit_ignores_forged_xff_from_untrusted_peer() {
+        use tower::ServiceExt;
+        let app = probe_app(3);
+        let mut throttled = 0;
+        for i in 0..10 {
+            let forged = format!("198.51.100.{i}");
+            let resp = app
+                .clone()
+                .oneshot(probe_req("203.0.113.99", Some(&forged)))
+                .await
+                .unwrap();
+            if resp.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                throttled += 1;
+            }
+        }
+        assert!(
+            throttled >= 6,
+            "forged XFF escaped the limiter ({throttled} throttled)"
+        );
+    }
+
+    /// Behind a trusted proxy, clients get their own buckets.
+    #[tokio::test]
+    async fn rate_limit_keys_on_client_behind_trusted_proxy() {
+        use tower::ServiceExt;
+        let app = probe_app(3);
+        for i in 0..10 {
+            let client = format!("198.51.100.{i}");
+            let resp = app
+                .clone()
+                .oneshot(probe_req("10.0.0.1", Some(&client)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        }
     }
 }

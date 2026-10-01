@@ -418,7 +418,8 @@ pub struct Config {
     pub rate_limit: bool,
 
     /// Trusted proxy CIDRs. When the connecting IP matches one of these,
-    /// the first address in X-Forwarded-For is used as the real client IP.
+    /// X-Forwarded-For is read from the right and the first address that
+    /// is not itself a trusted proxy is used as the real client IP.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 
