@@ -45,6 +45,9 @@ pub struct OidcState {
     pub session_ttl_secs: u64,
     /// Pending OIDC flows: state -> (pkce_verifier, nonce, created_at)
     pub pending: PendingFlows,
+    /// Key ids in the provider's signing key set as fetched at startup.
+    /// Only used to explain an ID token signature failure.
+    pub provider_key_ids: Vec<String>,
 }
 
 /// Initialize OIDC client by discovering provider metadata.
@@ -84,6 +87,17 @@ pub async fn init_oidc(config: &OidcConfig, session_ttl_secs: u64) -> Result<Oid
     // configured (Config::load), so reaching this point with None
     // means we were called with a partially-constructed config; treat
     // that as a programming error rather than a user-facing one.
+    let provider_key_ids: Vec<String> = provider_metadata
+        .jwks()
+        .keys()
+        .iter()
+        .filter_map(|k| openidconnect::JsonWebKey::key_id(k).map(|id| id.to_string()))
+        .collect();
+    tracing::info!(
+        keys = provider_key_ids.len(),
+        "OIDC provider signing keys loaded"
+    );
+
     let client_secret = config
         .client_secret
         .clone()
@@ -105,6 +119,7 @@ pub async fn init_oidc(config: &OidcConfig, session_ttl_secs: u64) -> Result<Oid
         config: config.clone(),
         session_ttl_secs,
         pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        provider_key_ids,
     })
 }
 
@@ -279,7 +294,30 @@ pub async fn callback(
     {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("OIDC ID token verification failed: {}", e);
+            // The library's message ("Signature verification failed") hides
+            // the cause in its source chain, so log the whole chain plus the
+            // token's key id and algorithm (header fields, not secrets).
+            let (alg, kid) = jwt_header_alg_kid(&id_token.to_string());
+            let kid_known = kid
+                .as_deref()
+                .map(|k| oidc.provider_key_ids.iter().any(|known| known == k));
+            tracing::error!(
+                error = %error_chain(&e),
+                token_alg = alg.as_deref().unwrap_or("?"),
+                token_kid = kid.as_deref().unwrap_or("?"),
+                kid_in_provider_keys = ?kid_known,
+                provider_keys = ?oidc.provider_key_ids,
+                "OIDC ID token verification failed"
+            );
+            if kid_known == Some(false) {
+                tracing::error!(
+                    "The ID token is signed with a key the provider did not publish when rustguac \
+                     started. If the provider has rotated its keys since, restart rustguac. On \
+                     Microsoft Entra ID, an app with claims mapping or a custom signing \
+                     certificate signs with an app-specific key that is only listed under the \
+                     ?appid=<client-id> key set."
+                );
+            }
             return (
                 StatusCode::BAD_GATEWAY,
                 axum::Json(json!({"error": "ID token verification failed"})),
@@ -477,6 +515,40 @@ fn truncate_group_name(s: &str) -> String {
     s[..end].to_string()
 }
 
+/// An error and its sources, joined with ": ".
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        source = s.source();
+    }
+    out
+}
+
+/// `alg` and `kid` from a JWT's (unverified) header, for diagnostics only.
+fn jwt_header_alg_kid(token_str: &str) -> (Option<String>, Option<String>) {
+    use base64::Engine;
+    let header = token_str
+        .split('.')
+        .next()
+        .and_then(|h| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(h)
+                .ok()
+        })
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let field = |name: &str| {
+        header
+            .as_ref()
+            .and_then(|h| h.get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    (field("alg"), field("kid"))
+}
+
 fn extract_groups_from_jwt(token_str: &str, groups_claim: &str) -> Vec<String> {
     use base64::Engine;
     let parts: Vec<&str> = token_str.split('.').collect();
@@ -644,6 +716,45 @@ fn parse_issuer_mismatch(raw: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn jwt_header_fields_are_read() {
+        // {"alg":"RS256","kid":"abc123","typ":"JWT"}
+        let token = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYzEyMyIsInR5cCI6IkpXVCJ9.e30.sig";
+        assert_eq!(
+            super::jwt_header_alg_kid(token),
+            (Some("RS256".into()), Some("abc123".into()))
+        );
+        assert_eq!(super::jwt_header_alg_kid("garbage"), (None, None));
+    }
+
+    #[test]
+    fn error_chain_includes_sources() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "No matching key found")
+            }
+        }
+        impl std::error::Error for Inner {}
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "Signature verification failed")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        assert_eq!(
+            super::error_chain(&Outer(Inner)),
+            "Signature verification failed: No matching key found"
+        );
+    }
+
     #[test]
     fn safe_next_allows_same_origin_paths() {
         for ok in [
