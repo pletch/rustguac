@@ -1012,20 +1012,54 @@ impl VaultClient {
         entry: &str,
         data: &AddressBookEntry,
     ) -> Result<(), VaultError> {
+        self.write_entry(scope, folder, entry, data, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Write an entry only if none exists at that path, enforced by Vault
+    /// itself (KV v2 check-and-set with `cas: 0`) rather than by a read
+    /// beforehand, so two writers cannot both pass the check. Returns
+    /// `Ok(false)` when an entry is already there.
+    pub async fn put_entry_if_absent(
+        &self,
+        scope: &str,
+        folder: &str,
+        entry: &str,
+        data: &AddressBookEntry,
+    ) -> Result<bool, VaultError> {
+        self.write_entry(scope, folder, entry, data, true).await
+    }
+
+    async fn write_entry(
+        &self,
+        scope: &str,
+        folder: &str,
+        entry: &str,
+        data: &AddressBookEntry,
+        only_if_absent: bool,
+    ) -> Result<bool, VaultError> {
         validate_path(folder)?;
         validate_name(entry)?;
         let scope_prefix = self.resolve_scope_prefix(scope)?;
         let path = self.data_path(&scope_prefix, &format!("{}/{}", folder, entry));
-        let body = serde_json::json!({ "data": data });
+        let body = if only_if_absent {
+            serde_json::json!({ "options": { "cas": 0 }, "data": data })
+        } else {
+            serde_json::json!({ "data": data })
+        };
         let resp = self
             .request(reqwest::Method::POST, &path, Some(&body))
             .await?;
 
         match resp.status().as_u16() {
-            200 | 204 => Ok(()),
+            200 | 204 => Ok(true),
             403 => Err(VaultError::Forbidden),
             s => {
                 let text = resp.text().await.unwrap_or_default();
+                if only_if_absent && s == 400 && text.contains("check-and-set") {
+                    return Ok(false);
+                }
                 Err(VaultError::Parse(format!(
                     "put entry failed ({}): {}",
                     s, text

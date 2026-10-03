@@ -583,6 +583,26 @@ Update a connection entry. Uses read-modify-write: reads existing entry from Vau
 
 Delete a connection entry.
 
+### `POST /api/addressbook/folders/:scope/:folder/entries/:entry/move` (admin)
+
+Move an entry to another folder with everything stored in it, credentials included. The entry is written to the target first and the original is removed only after that succeeds.
+
+```json
+{ "target_scope": "shared", "target_folder": "servers/linux" }
+```
+
+Returns `409` if an entry of the same name already exists in the target (it is never overwritten), and `400` for an invalid scope, folder or name. If the copy succeeds but the original cannot be removed, the response is `502` with `"copied": true`: the entry then exists in both folders.
+
+Do not move an entry by creating it in the new folder and deleting the old one: the read endpoints never return credentials, so a copy made that way has none.
+
+### `POST /api/addressbook/folders/:scope/:folder/entries/:entry/copy` (admin)
+
+Copy an entry, credentials included, to `target_scope`/`target_folder` under `new_name` (default: the same name). Returns `409` if the target exists. Apply further changes to the copy with the `PUT` above, which keeps stored credentials it is not given.
+
+```json
+{ "target_scope": "shared", "target_folder": "servers/linux", "new_name": "web01-copy" }
+```
+
 ## User API Tokens (self-service)
 
 User API tokens allow OIDC users to authenticate via API key for automation and scripting. Tokens inherit the user's identity and are subject to role restrictions.

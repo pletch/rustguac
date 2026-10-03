@@ -2560,6 +2560,7 @@
                 openEditEntry(name, scope, folder, entry.session_type);
                 // Switch to create mode: enable name field, clear edit mode, set copy name
                 entryEditMode = null;
+                cloneSource = { scope: scope, folder: folder, name: name };
                 document.getElementById('entry-modal-title').textContent = 'Clone: ' + name;
                 var nameField = document.getElementById('em-name');
                 nameField.disabled = false;
@@ -2811,6 +2812,7 @@
         // ── Entry modal ──
 
         var entryEditMode = null; // null = create, {scope, folder, name} = edit
+        var cloneSource = null;   // {scope, folder, name} while the create form is a clone
         var entryTypeSelect = document.getElementById('em-type');
 
         entryTypeSelect.addEventListener('change', function() {
@@ -3242,6 +3244,7 @@
         function openNewEntry() {
             if (!selectedFolder) return;
             entryEditMode = null;
+            cloneSource = null;
             document.getElementById('entry-modal-title').textContent = 'New Entry in ' + folderPath(selectedFolder);
             document.getElementById('em-name').value = '';
             document.getElementById('em-name').disabled = false;
@@ -3369,6 +3372,7 @@
 
         function openEditEntry(name, scope, folder, type) {
             entryEditMode = { scope: scope, folder: folder, name: name };
+            cloneSource = null;
             document.getElementById('entry-modal-title').textContent = 'Edit: ' + name;
             document.getElementById('em-name').value = name;
             document.getElementById('em-name').disabled = true;
@@ -3856,26 +3860,21 @@
 
                 updatePromise.then(function() {
                     if (moveTarget) {
-                        // Move = create in new folder + delete from old
+                        // The server moves the entry as stored, secrets
+                        // included. This page never holds them, so building
+                        // the copy here dropped every password, key and
+                        // $variable reference (#232).
                         var sep = moveTarget.indexOf('|');
                         var targetScope = sep >= 0 ? moveTarget.slice(0, sep) : moveTarget;
                         var targetFolder = sep >= 0 ? moveTarget.slice(sep + 1) : '';
-                        var body = { name: entryEditMode.name };
-                        for (var k in entry) body[k] = entry[k];
 
-                        return fetch('/api/addressbook/folders/' + encodeURIComponent(targetScope) + '/' + encodeURIComponent(targetFolder) + '/entries', {
+                        return fetch('/api/addressbook/folders/' + encodeURIComponent(entryEditMode.scope) + '/' + encodeURIComponent(entryEditMode.folder) + '/entries/' + encodeURIComponent(entryEditMode.name) + '/move', {
                             method: 'POST',
                             headers: apiHeaders({ 'Content-Type': 'application/json' }),
                             credentials: 'same-origin',
-                            body: JSON.stringify(body)
+                            body: JSON.stringify({ target_scope: targetScope, target_folder: targetFolder })
                         }).then(function(res) {
                             if (!res.ok) return res.text().then(function(t) { throw new Error('Move failed: ' + t); });
-                            // Delete from original folder
-                            return fetch('/api/addressbook/folders/' + encodeURIComponent(entryEditMode.scope) + '/' + encodeURIComponent(entryEditMode.folder) + '/entries/' + encodeURIComponent(entryEditMode.name), {
-                                method: 'DELETE',
-                                headers: apiHeaders(),
-                                credentials: 'same-origin'
-                            });
                         }).then(function() {
                             // Switch to the target folder
                             selectedFolder = findFolder(targetScope, targetFolder) || selectedFolder;
@@ -3887,6 +3886,37 @@
                     document.getElementById('entry-modal').classList.remove('active');
                     entryTypeSelect.disabled = false;
                     loadEntries(selectedFolder.scope, folderPath(selectedFolder), true);
+                })
+                .catch(function(err) { errEl.textContent = err.message; })
+                .finally(function() { saveBtn.disabled = false; saveBtn.textContent = 'Save'; });
+            } else if (cloneSource) {
+                // Clone: the server copies the source entry as stored, secrets
+                // included (this page never holds them), and the form's edits
+                // are then applied as an ordinary update, which keeps any
+                // stored secret it is not given (#232).
+                var src = cloneSource;
+                var entryUrl = '/api/addressbook/folders/' + encodeURIComponent(scope) + '/' + encodeURIComponent(folder) + '/entries/' + encodeURIComponent(name);
+                fetch('/api/addressbook/folders/' + encodeURIComponent(src.scope) + '/' + encodeURIComponent(src.folder) + '/entries/' + encodeURIComponent(src.name) + '/copy', {
+                    method: 'POST',
+                    headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ target_scope: scope, target_folder: folder, new_name: name })
+                })
+                .then(function(res) {
+                    if (!res.ok) return res.text().then(function(t) { throw new Error('Clone failed: ' + t); });
+                    return fetch(entryUrl, {
+                        method: 'PUT',
+                        headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                        credentials: 'same-origin',
+                        body: JSON.stringify(entry)
+                    });
+                })
+                .then(function(res) {
+                    if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
+                    cloneSource = null;
+                    document.getElementById('entry-modal').classList.remove('active');
+                    entryTypeSelect.disabled = false;
+                    loadEntries(scope, folder, true);
                 })
                 .catch(function(err) { errEl.textContent = err.message; })
                 .finally(function() { saveBtn.disabled = false; saveBtn.textContent = 'Save'; });

@@ -1267,6 +1267,14 @@ async fn run_server(config: Config, database: Db) {
             delete(api::ab_delete_entry),
         )
         .route(
+            "/api/addressbook/folders/{scope}/{folder}/entries/{entry}/move",
+            post(api::ab_move_entry),
+        )
+        .route(
+            "/api/addressbook/folders/{scope}/{folder}/entries/{entry}/copy",
+            post(api::ab_copy_entry),
+        )
+        .route(
             "/api/addressbook/folders/{scope}/{folder}/entries/{entry}/connect",
             post(api::ab_connect_entry),
         )

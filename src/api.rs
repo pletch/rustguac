@@ -2145,6 +2145,19 @@ impl VaultBackends {
             .await
     }
 
+    pub async fn put_entry_if_absent(
+        &self,
+        scope: &str,
+        folder: &str,
+        entry: &str,
+        data: &AddressBookEntry,
+    ) -> Result<bool, VaultError> {
+        self.scoped(scope)
+            .await?
+            .put_entry_if_absent(scope, folder, entry, data)
+            .await
+    }
+
     pub async fn delete_entry(
         &self,
         scope: &str,
@@ -3465,6 +3478,224 @@ pub async fn ab_update_entry(
         )
             .into_response(),
     }
+}
+
+/// Body for `POST .../entries/{entry}/move` and `.../copy`.
+#[derive(Deserialize)]
+pub struct MoveEntryRequest {
+    pub target_scope: String,
+    pub target_folder: String,
+    /// Copy only: the name of the new entry. Defaults to the source name.
+    #[serde(default)]
+    pub new_name: Option<String>,
+}
+
+fn ab_error(status: StatusCode, msg: impl Into<String>) -> Response {
+    (status, Json(json!({ "error": msg.into() }))).into_response()
+}
+
+/// Copy an entry as stored in Vault, secrets included, to a target that
+/// must not already exist.
+///
+/// The browser cannot do this itself: it never receives an entry's secrets
+/// (password, private key, jump host credentials, tokens, or a `$variable`
+/// reference held in the password field), so a copy built from the edit
+/// form silently dropped all of them (#232).
+///
+/// Both endpoints that use this are admin-only, like every other change to
+/// connection entries. If editing is ever delegated per folder (#231), they
+/// must require edit rights on the source AND the target: copying moves
+/// working credentials, so rights on the target alone would let an editor
+/// pull them out of a folder they cannot reach into one they can, and
+/// connect with them there.
+async fn copy_stored_entry(
+    vault: &VaultState,
+    scope: &str,
+    folder: &str,
+    entry: &str,
+    target_scope: &str,
+    target_folder: &str,
+    target_name: &str,
+) -> Result<(), (StatusCode, String)> {
+    let full = vault
+        .get_entry(scope, folder, entry)
+        .await
+        .map_err(ab_vault_error)?;
+    // Vault refuses the write if anything already exists at the target, so
+    // an entry is never overwritten even by a concurrent writer.
+    match vault
+        .put_entry_if_absent(target_scope, target_folder, target_name, &full)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            StatusCode::CONFLICT,
+            "an entry with that name already exists in the target folder".into(),
+        )),
+        Err(e) => Err(ab_vault_error(e)),
+    }
+}
+
+/// Status for a Vault error on the move/copy path: a rejected name or
+/// scope is the caller's mistake, not the backend's.
+fn ab_vault_error(e: VaultError) -> (StatusCode, String) {
+    match e {
+        VaultError::NotFound => (StatusCode::NOT_FOUND, "entry not found".into()),
+        VaultError::BadName(msg) => (StatusCode::BAD_REQUEST, msg),
+        other => (StatusCode::BAD_GATEWAY, other.to_string()),
+    }
+}
+
+fn require_ab_admin(
+    identity: &Option<Extension<AuthIdentity>>,
+) -> Result<String, (StatusCode, String)> {
+    match identity {
+        Some(Extension(id)) if id.has_role("admin") => Ok(id.display_name().to_string()),
+        _ => Err((StatusCode::FORBIDDEN, "admin role required".into())),
+    }
+}
+
+/// POST /api/addressbook/folders/:scope/:folder/entries/:entry/move
+///
+/// Moves an entry with everything stored in it: the full entry is copied to
+/// the target and only then is the original removed. An existing entry of
+/// the same name in the target is never overwritten.
+#[allow(clippy::too_many_arguments)]
+pub async fn ab_move_entry(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    trusted: Option<Extension<TrustedProxies>>,
+    Extension(database): Extension<Db>,
+    Extension(vault): Extension<VaultState>,
+    Path((scope, folder, entry)): Path<(String, String, String)>,
+    Json(req): Json<MoveEntryRequest>,
+) -> impl IntoResponse {
+    let admin_email = match require_ab_admin(&identity) {
+        Ok(e) => e,
+        Err((status, msg)) => return ab_error(status, msg),
+    };
+    if req.target_scope == scope && req.target_folder == folder {
+        return ab_error(StatusCode::BAD_REQUEST, "entry is already in that folder");
+    }
+    if let Err((status, msg)) = copy_stored_entry(
+        &vault,
+        &scope,
+        &folder,
+        &entry,
+        &req.target_scope,
+        &req.target_folder,
+        &entry,
+    )
+    .await
+    {
+        return ab_error(status, msg);
+    }
+
+    let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
+    let details = json!({
+        "to_scope": req.target_scope,
+        "to_folder": req.target_folder,
+    })
+    .to_string();
+
+    // The copy is in place, so a failure from here on leaves the entry in
+    // both folders rather than in neither. Say so instead of reporting a
+    // plain error the caller might answer by retrying.
+    if let Err(e) = vault.delete_entry(&scope, &folder, &entry).await {
+        log_ab_event(
+            &database,
+            &admin_email,
+            "move_entry_incomplete",
+            &scope,
+            &folder,
+            Some(&entry),
+            &ip,
+            Some(&details),
+        )
+        .await;
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": format!(
+                    "entry was copied to the target folder but the original could not be removed: {e}"
+                ),
+                "copied": true,
+            })),
+        )
+            .into_response();
+    }
+
+    log_ab_event(
+        &database,
+        &admin_email,
+        "move_entry",
+        &scope,
+        &folder,
+        Some(&entry),
+        &ip,
+        Some(&details),
+    )
+    .await;
+    (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+}
+
+/// POST /api/addressbook/folders/:scope/:folder/entries/:entry/copy
+///
+/// Copies an entry with everything stored in it, under `new_name` in the
+/// target folder. Used by Clone, which then applies the form's edits with
+/// an ordinary update (which keeps stored secrets it is not given).
+#[allow(clippy::too_many_arguments)]
+pub async fn ab_copy_entry(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    trusted: Option<Extension<TrustedProxies>>,
+    Extension(database): Extension<Db>,
+    Extension(vault): Extension<VaultState>,
+    Path((scope, folder, entry)): Path<(String, String, String)>,
+    Json(req): Json<MoveEntryRequest>,
+) -> impl IntoResponse {
+    let admin_email = match require_ab_admin(&identity) {
+        Ok(e) => e,
+        Err((status, msg)) => return ab_error(status, msg),
+    };
+    let new_name = req.new_name.clone().unwrap_or_else(|| entry.clone());
+    if req.target_scope == scope && req.target_folder == folder && new_name == entry {
+        return ab_error(StatusCode::BAD_REQUEST, "copy needs a new name or folder");
+    }
+    if let Err((status, msg)) = copy_stored_entry(
+        &vault,
+        &scope,
+        &folder,
+        &entry,
+        &req.target_scope,
+        &req.target_folder,
+        &new_name,
+    )
+    .await
+    {
+        return ab_error(status, msg);
+    }
+    let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
+    let details = json!({
+        "to_scope": req.target_scope,
+        "to_folder": req.target_folder,
+        "to_name": new_name,
+    })
+    .to_string();
+    log_ab_event(
+        &database,
+        &admin_email,
+        "copy_entry",
+        &scope,
+        &folder,
+        Some(&entry),
+        &ip,
+        Some(&details),
+    )
+    .await;
+    (StatusCode::CREATED, Json(json!({"ok": true}))).into_response()
 }
 
 /// DELETE /api/addressbook/folders/:scope/:folder/entries/:entry — Delete an entry. Admin only.
@@ -5454,5 +5685,35 @@ mod tests {
         assert!(validate_session_owner("alice @example.com").is_err());
         assert!(validate_session_owner("alice\u{7}@example.com").is_err());
         assert!(validate_session_owner(&"a".repeat(321)).is_err());
+    }
+
+    /// #232: moving and copying entries carries working credentials, so it
+    /// stays admin-only like every other entry change.
+    #[test]
+    fn entry_move_and_copy_are_admin_only() {
+        let user = |role: &str| {
+            Some(Extension(AuthIdentity::User {
+                email: "u@example.com".into(),
+                role: role.into(),
+                groups: vec![],
+            }))
+        };
+        for role in ["viewer", "operator", "poweruser"] {
+            let (status, _) = super::require_ab_admin(&user(role)).unwrap_err();
+            assert_eq!(status, StatusCode::FORBIDDEN, "{role}");
+        }
+        assert!(super::require_ab_admin(&None).is_err());
+        assert_eq!(
+            super::require_ab_admin(&user("admin")).unwrap(),
+            "u@example.com"
+        );
+    }
+
+    #[test]
+    fn vault_name_errors_are_client_errors() {
+        let (status, _) = super::ab_vault_error(VaultError::BadName("reserved name".into()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = super::ab_vault_error(VaultError::NotFound);
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
