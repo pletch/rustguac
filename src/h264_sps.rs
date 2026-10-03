@@ -8,7 +8,7 @@
 //! every shape but one: a colour description that is *present* and says
 //! *unspecified* makes it discard the whole `video_signal_type` and fall back
 //! to limited-range BT.709. Leaving the description out entirely does not.
-//! Measured 2026-09-09 against x264 streams whose SPS was parsed by hand, and
+//! Measured against x264 streams whose SPS was parsed by hand, and
 //! pinned by `tests/h264-vui-range.mjs`:
 //!
 //! | `full_range` | colour description | `colorSpace.fullRange` | 16,16,16 painted as |
@@ -1167,7 +1167,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// NVENC's SPS as the xrdp fork's accel-assist sent it (2026-09-30): Main,
+    /// NVENC's SPS as the xrdp fork's accel-assist sent it: Main,
     /// `constraint_set1` only, level 5.0, POC type 2, three reference frames,
     /// a full-range BT.709 description and timing info -- and no
     /// `bitstream_restriction`, the shape Chrome holds a DPB of pictures for.
