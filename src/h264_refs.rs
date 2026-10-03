@@ -1,195 +1,65 @@
 //! Reads the reference structure out of an AVC444 stream's slice headers, to
 //! settle whether the auxiliary chroma view can be dropped on the way to the
-//! browser.
+//! browser. `crate::h264_aux_drop` does the dropping.
 //!
-//! # The question
+//! The two views are **one H.264 sequence sharing one decoded picture
+//! buffer**, not two streams multiplexed together: FreeRDP's
+//! `avc444_decompress` feeds both through one `H264_CONTEXT`, and the browser
+//! decodes both through one `VideoDecoder`. So a view can be dropped only if
+//! nothing that survives depends on it. Everything needed to decide that is in
+//! the slice headers, and nothing here decodes a picture -- it reads the first
+//! ~2KB of each access unit, which is enough to reach the first slice header.
 //!
-//! The combine gate in `H264Decoder.js` removes the *cost* of 4:4:4 by
-//! discarding the auxiliary view after decoding it. What it cannot remove is
-//! the bandwidth, because the bytes have already crossed the link, nor the
-//! second decode. On the WAN leg between rustguac and the browser — which is
-//! where the constraint usually sits, guacd being local to rustguac — the
-//! auxiliary view is 13% of the H.264 traffic against a Windows host and 43%
-//! against the xrdp fork, which sends chroma far more often.
+//! # What is read, and why
 //!
-//! Asking the host for AVC420 instead is the existing lever, and against
-//! Windows it does not work: `rdpgfx_main.c` emits the RDPGFX v10 capability
-//! sets only when AVC444 is requested (`!GfxH264 || GfxAVC444`), and at v10 the
-//! only AVC-related flag is `AVC_DISABLED`. So the protocol offers
-//! AVC420-at-v8.1, AVC-off-at-v10 and AVC444-at-v10, and a Windows host that
-//! wants H.264 at all must be asked for AVC444. Which leaves dropping the
-//! auxiliary view downstream as the only place the saving could come from.
+//! - **`nal_ref_idc` and `frame_num`, per view.** Whether auxiliary pictures
+//!   are stored as references at all, and whether dropping them leaves holes
+//!   in `frame_num`.
+//! - **`ref_pic_list_modification` in main slices.**
+//!   `modification_of_pic_nums_idc` 2 names an absolute `long_term_pic_num`,
+//!   which survives a drop. 0 and 1 step *relatively* through short-term
+//!   `PicNum`s, which shift when a picture is removed, so any of those in a
+//!   main slice refuses the stream.
+//! - **`memory_management_control_operation`.** Which long-term indices each
+//!   view *claims*. A dropped picture that had marked itself with an index main
+//!   reads would take that index's contents with it, so it is the claims that
+//!   are tested, never what an auxiliary view merely reads.
+//! - **`num_ref_idx_l0_active_minus1`.** With no reordering, a P slice's
+//!   default list puts short-term pictures (by descending `PicNum`) before
+//!   long-term ones, so long-term auxiliary pictures are beyond main's reach
+//!   only while main activates a single entry. With more, an auxiliary picture
+//!   sits at index 1, and whether a macroblock uses it is below the slice
+//!   header: `Unproven`.
+//! - **`max_num_ref_frames`** against the long-term pictures held. Dropping
+//!   leaves `frame_num` holes the decoder must fill with inferred short-term
+//!   references (8.2.5.2), and it needs a free slot to do so.
 //!
-//! # Why it is not obviously safe
+//! # The hosts measured
 //!
-//! The two views are **one H.264 sequence sharing one decoded picture buffer**,
-//! not two streams multiplexed together. FreeRDP's `avc444_decompress` feeds
-//! both bitstreams to the same `H264_CONTEXT` through the same `Decompress`,
-//! `patch 004` says so in as many words, and our own client is the positive
-//! proof: `H264Decoder.js` holds a single `VideoDecoder` and interleaves both
-//! views into it, which two independent sequences would break at the first IDR.
+//! Windows keeps the views on disjoint, explicitly named long-term chains --
+//! main 0, auxiliary 1, every inter picture marking itself with `mmco` 6 --
+//! with three reference frames, and is droppable. The xrdp fork does the same
+//! with dual long-term references; without them its main slices took the
+//! default list with two entries active, the auxiliary picture was reachable
+//! at index 1, and a replay of such a recording showed 12 of 141 main access
+//! units undecodable once the views were removed. Neither host leaves an
+//! auxiliary picture where a main slice's first reference lands: both have to
+//! keep the views from predicting through each other, and H.264 has few tools
+//! for it.
 //!
-//! Dropping access units out of a single sequence is safe only if nothing that
-//! survives depends on them. Three things decide it, and all three are written
-//! in the slice headers:
+//! LC=2 commands -- an auxiliary view with no main view beside it -- occur on
+//! Windows, which is why unpaired auxiliary views are counted.
 //!
-//! 1. **`nal_ref_idc` on auxiliary slices.** Zero means the picture is never
-//!    stored as a reference, and a picture that is never stored can never be
-//!    referred to. That alone would settle it.
-//! 2. **Whether `frame_num` advances across an auxiliary view.** A reference
-//!    picture consumes a `frame_num`; a non-reference one does not. So the
-//!    delta between consecutive *main* views says the same thing from the other
-//!    side, and disagreeing with (1) means this parser is misreading the
-//!    headers rather than that the stream is unusual.
-//! 3. **`ref_pic_list_modification` in main slices.** The default reference
-//!    list is ordered by descending `PicNum`, which in an interleaved stream
-//!    puts the *auxiliary* picture first — so a working encoder must be
-//!    reordering past it, by a `PicNum` that would no longer exist once the
-//!    auxiliary view is dropped. `memory_management_control_operation` is read
-//!    for the same reason from the other direction: an encoder that marks each
-//!    auxiliary picture unused as soon as it has served its purpose would keep
-//!    them out of main's lists by construction.
+//! The auxiliary view is **13% of the H.264 payload** against Windows and
+//! **43% against the xrdp fork**, which sends chroma far more often; the
+//! proportion moves with the workload as well as the host.
 //!
-//! Plus `gaps_in_frame_num_value_allowed_flag`, which says whether a decoder is
-//! even required to tolerate the holes dropping would leave.
-//!
-//! # It has been done before, and what went wrong was not this
-//!
-//! Upstream sol1 **v1.8.0 shipped exactly this configuration**: it negotiated
-//! `GfxAVC444 = TRUE` and its AVC444 branch copied `bitstream[0]` alone,
-//! dropping the auxiliary view before the browser ever saw it. v1.8.1
-//! (`4bcac32`) changed it to `GfxAVC444 = FALSE`, which is where the present
-//! AVC420 lever comes from — and, unknown at the time, is what stops a Windows
-//! host engaging hardware H.264 encoding at all.
-//!
-//! The symptom that drove that change was *not* a broken reference chain. It
-//! was recorded as "two blocks with green and magenta casts": v1.8.0 read no
-//! `LC` at all, so an MS-RDPEGFX LC=2 command — chroma in `bitstream[0]`, no
-//! luma anywhere — was forwarded and painted as an image. Packed chroma drawn
-//! as YUV is green and magenta. A shattered reference chain looks like
-//! smearing or nothing, not like a recognisable chroma plane, so the pictures
-//! were decoding.
-//!
-//! That is real evidence the drop is viable, and it is weaker than it looks on
-//! three counts, all of which this probe can speak to: v1.8.0 still ran the
-//! GDI decode (`orig(context, cmd)`), so guacd held real pixels and the layer
-//! had another source of paint; the fault was diagnosed as a colour bug and
-//! fixed quickly, so nobody watched a long session for slow reference drift;
-//! and it says nothing about xrdp, whose fork interleaves chroma on a
-//! `CHROMA_INTERVAL` and need not structure its references the same way.
-//!
-//! It also settles one thing outright: **LC=2 commands are real on Windows**.
-//! A downstream drop has to lose the whole command for those, not merely its
-//! auxiliary half, which is why the unpaired auxiliary view is counted here.
-//!
-//! # What the first Windows capture said
-//!
-//! Measured 2026-09-12, 200 access units: 139 main and 61 auxiliary views, all
-//! of them reference pictures — and the two views run on **separate long-term
-//! reference chains**. Every inter picture ends with `mmco` 6, marking itself
-//! as a long-term reference, and every reordering is
-//! `modification_of_pic_nums_idc` 2, naming a long-term picture: main names 0,
-//! the auxiliary views name 1. No relative short-term reordering anywhere.
-//!
-//! Which is the ordinary way to multiplex two independent reference chains
-//! into one H.264 sequence, and it means **no surviving slice predicts from a
-//! dropped picture**. It also explains v1.8.0: dropping `bitstream[1]` left
-//! main's references intact, so the pictures decoded, and the only fault was
-//! the LC=2 command being painted.
-//!
-//! The distinction the first verdict here missed is that idc 0 and 1 carry
-//! `abs_diff_pic_num_minus1`, a *relative* step through short-term PicNums
-//! that shifts when a picture is removed, while idc 2 carries an absolute
-//! `long_term_pic_num` that does not. Reading any reordering as dangerous is
-//! what made a droppable stream look undroppable.
-//!
-//! What is left is `frame_num`, which advances across the auxiliary views and
-//! would leave holes: `gaps_in_frame_num_value_allowed_flag` is 0, so the
-//! result is not a conforming stream even though it decoded in v1.8.0. That
-//! flag is one bit in the SPS, and `crate::h264_rewrite` already edits that
-//! structure.
-//!
-//! # xrdp separates the views differently, and the difference matters
-//!
-//! The same day, the xrdp fork: 152 main and 48 auxiliary views, all
-//! reference pictures, and **no reference list modification anywhere**. Main
-//! slices carry no marking either — ordinary short-term references on the
-//! default list — while every auxiliary slice carries `mmco` 4 and 6, setting
-//! the maximum long-term index and marking itself long-term.
-//!
-//! That reaches the same place by the opposite route. A P slice's default
-//! list-0 ordering is the short-term pictures by descending `PicNum` followed
-//! by the long-term ones ascending, so marking each auxiliary picture
-//! long-term lifts it out of the short-term set and puts the previous *main*
-//! view at index 0. Left short-term it would have been the most recent
-//! short-term picture and landed at index 0 itself, which is the fatal case.
-//!
-//! So the deciding number is `num_ref_idx_l0_active_minus1`: with one entry
-//! active, main can only ever reference index 0 and the auxiliary pictures are
-//! unreachable; with more, the list reaches them from index 1 and whether any
-//! macroblock picks one is below the slice header, where this cannot see.
-//! **That field was not recorded in the first captures**, which is why it is
-//! read now — the xrdp verdict is not settled until a capture reports it.
-//!
-//! Two hosts, two schemes, and the one thing they share is that neither leaves
-//! an auxiliary picture where a main slice's first reference would land. That
-//! is not a coincidence: both encoders have to keep two views from predicting
-//! through each other, and the H.264 tools for doing so are few.
-//!
-//! # What it costs, and the IDR that is still open
-//!
-//! Re-measured on Windows with the byte counters, 201 access units: the
-//! auxiliary view is **13% of the H.264 payload** (559 KiB against main's
-//! 3443 KiB, 27 pictures against 174). Not half, which is what this module
-//! and `CLAUDE.md` both assumed before anyone counted. Windows sends chroma
-//! sparsely, so dropping it is a real saving and a modest one, and the
-//! proportion moves with the workload — an earlier capture ran 61 auxiliary
-//! pictures in 200.
-//!
-//! One thing is unresolved, and it came out of an odd `frame_num` delta.
 //! **Auxiliary views send IDRs too.** An IDR with `long_term_reference_flag`
 //! set marks every other reference unused and claims `LongTermFrameIdx` 0
-//! (8.2.5.1), so immediately after an auxiliary IDR the picture at long-term 0
-//! is chroma — and the capture shows a main slice naming long-term 0 right
-//! there. Either that is main predicting from chroma across a keyframe
-//! boundary, or the view attribution at those points is wrong; the counter
-//! above is what tells them apart. Dropping an auxiliary IDR would also remove
-//! a decoded picture buffer reset the surviving stream is written against,
-//! which is a separate problem from the reference itself.
-//!
-//! Two supporting oddities: Windows' auxiliary slices claim index 1 with
-//! `mmco` 6 but never send the `mmco` 4 that raises `MaxLongTermFrameIdx`
-//! above the 0 an IDR leaves behind, while xrdp sends both, in that order.
-//!
-//! # What it costs, and what it took to collect
-//!
-//! Re-measured with the byte counters: the auxiliary view is **13% of the
-//! H.264 payload** on Windows (559 KiB against main's 3443) and **43% on the
-//! xrdp fork** (780 KiB against 1007), the difference being how often each
-//! host sends chroma. Not half, which is what this module and `CLAUDE.md` both
-//! assumed before anyone counted.
-//!
-//! Getting xrdp there took two goes and a fix at each end. It first read
-//! `Unproven` -- main slices took the default reference list and activated two
-//! entries, so the auxiliary picture was reachable at index 1 -- and forcing
-//! the drop corrupted it, which `tests/aux-drop-replay.mjs` then confirmed
-//! against a recording: 12 of 141 main access units undecodable. The fork
-//! answered with `f42cc481`, putting both views on explicitly named long-term
-//! chains.
-//!
-//! That passed the reference test and still froze, because the reference test
-//! was not the only question. See `no_room_for_inferred_frames`: dropping
-//! leaves holes in `frame_num`, the decoder must invent a short-term picture
-//! for each, and xrdp's `max_num_ref_frames` of 2 was entirely long-term.
-//! `235990e9` declares a third slot, and it works on both hosts.
-//!
-//! Worth stating plainly, because the obvious reading of the first
-//! measurements is that this is not worth building: the drop was provably safe
-//! only where it was worth least, and unproven where it was worth most. That
-//! was true of the encoders as they stood, and stopped being true when the one
-//! encoder we control was changed to suit. Sound reasoning, perishable
-//! conclusion -- the shape of the argument outlives the encoders it was made
-//! about, so re-check the encoders before reusing it.
+//! (8.2.5.1), so straight after an auxiliary IDR a main slice naming long-term
+//! 0 is naming that chroma picture. That is settled by never dropping an IDR:
+//! guacd flags a keyframe on `nal_type` 5, every auxiliary IDR passes through,
+//! and the main slice gets the identical picture either way.
 //!
 
 use std::collections::BTreeMap;
@@ -894,9 +764,10 @@ impl Stats {
         // Windows does exactly this after a surface recreation. The first
         // auxiliary picture following an IDR has no chain of its own yet, so it
         // names long-term 0 -- main's -- because that is the only long-term
-        // picture in the buffer. Testing what it reads condemned the stream
-        // 110s into a session on 2026-09-14, at the same moment
-        // `h264_black_keyframe_kept` fired: one event, two symptoms.
+        // picture in the buffer. Testing what it reads condemns a healthy
+        // Windows stream at exactly that moment -- alongside
+        // `h264_black_keyframe_kept`, since the surface recreation that
+        // triggers one triggers both.
         let chains_are_separate =
             !main_long_term.is_empty() && main_long_term.is_disjoint(&aux_marks) && short_term == 0;
 
@@ -1035,16 +906,15 @@ impl Stats {
     /// `max_num_ref_frames` is entirely consumed by long-term references has
     /// nowhere to put one, and the decoder fails rather than degrading.
     ///
-    /// Measured 2026-09-12 on the dual-LTR xrdp fork: `max_num_ref_frames` 2,
-    /// with long-term 0 held by main and 1 by the auxiliary view. Dropping
-    /// began at 21:14:34.654 and Chrome reported a decode error 212ms later,
-    /// then held every frame waiting for a keyframe that an idle desktop never
-    /// sends -- a permanent freeze. Windows survives the same treatment
+    /// Measured on the dual-LTR xrdp fork with `max_num_ref_frames` 2,
+    /// long-term 0 held by main and 1 by the auxiliary view: Chrome reported a
+    /// decode error 212ms after the first drop, then held every frame waiting
+    /// for a keyframe that an idle desktop never sends -- a permanent freeze. Windows survives the same treatment
     /// because its `max_num_ref_frames` is 3: two long-term and one to spare.
     ///
-    /// This is why the separate-chains test was necessary and not sufficient.
-    /// It asked whether anything *refers* to a dropped picture, which was the
-    /// right question and not the only one; the decoder also has to be able to
+    /// So the separate-chains test is necessary and not sufficient. It asks
+    /// whether anything *refers* to a dropped picture, which is the right
+    /// question and not the only one; the decoder also has to be able to
     /// account for the ones that are missing.
     fn no_room_for_inferred_frames(&self) -> Option<String> {
         // No gaps, nothing to infer.
@@ -1635,7 +1505,7 @@ mod tests {
         stats.views[2].total = 61;
         stats.views[2].reference = 61;
         // Main names long-term picture 0, the auxiliary views name 1, each
-        // assigned by mmco 6. Measured 2026-09-12 against a Windows host.
+        // assigned by mmco 6, as measured against a Windows host.
         stats.list_mods_by_view[0].insert((2, 0), 136);
         stats.list_mods_by_view[2].insert((2, 1), 58);
         stats.mmco_by_view[0].insert((6, 0), 136);
@@ -1710,7 +1580,7 @@ mod tests {
         assert!(verdict.contains("default reference list"), "{}", verdict);
     }
 
-    /// The dual-LTR xrdp fork, as measured on 2026-09-12: separate chains,
+    /// The dual-LTR xrdp fork, as measured: separate chains,
     /// explicitly named, and a decoded picture buffer with no room to spare.
     fn xrdp_dual_ltr_stats() -> Stats {
         let mut stats = Stats {
