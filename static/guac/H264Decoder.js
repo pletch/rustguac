@@ -2203,8 +2203,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * setting, and there is nothing to compare: the auxiliary view has
          * been removed from the wire, so combining cannot produce 4:4:4 from
          * what arrives, only the cost of trying. The lever that answers this
-         * question is upstream of the browser, where the auxiliary view
-         * is dropped. */
+         * question is the connection entry's Full Colour setting, which keeps
+         * the auxiliary view on the wire. */
         if (auxDropped)
             return false;
 
@@ -3119,14 +3119,26 @@ Guacamole.H264Decoder = function H264Decoder(display) {
 
                             combineDisabledLogged = true;
 
-                            diagnostic('chroma_off', 'the server is sending '
-                                    + 'AVC444 auxiliary views and 4:4:4 '
-                                    + 'combining is switched off by an '
-                                    + 'explicit h264Chroma444 override, so '
-                                    + 'they are decoded and discarded. Check '
-                                    + 'window.__h264Chroma444 and '
-                                    + 'the h264Chroma444 key in localStorage.',
-                                    true);
+                            /* Standard colour is the entry saying so, not a
+                             * setting to go and find: expected on every AVC444
+                             * host until the in-transit drop stops the views,
+                             * which reports on its own account server-side. */
+                            if (window.__h264StandardColour === true)
+                                console.info('[rustguac] H.264: Standard '
+                                        + 'colour -- auxiliary views are '
+                                        + 'decoded and not combined until the '
+                                        + 'drop in transit stops them.');
+
+                            else
+                                diagnostic('chroma_off', 'the server is '
+                                        + 'sending AVC444 auxiliary views and '
+                                        + '4:4:4 combining is switched off by '
+                                        + 'an explicit h264Chroma444 '
+                                        + 'override, so they are decoded and '
+                                        + 'discarded. Check '
+                                        + 'window.__h264Chroma444 and the '
+                                        + 'h264Chroma444 key in localStorage.',
+                                        true);
 
                         }
 

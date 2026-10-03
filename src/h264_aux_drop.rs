@@ -186,10 +186,12 @@ pub struct AuxDropper {
 impl AuxDropper {
     /// A dropper for one session.
     ///
-    /// `setting`: `None` waits for the corroborated sample, `Some(true)`
-    /// decides from the least evidence that can answer, and `Some(false)`
-    /// never drops. The environment variable still overrides everything, as a
-    /// kill switch that needs no configuration edited.
+    /// `setting` comes from the session's colour choice (see
+    /// `Session::aux_drop_setting`): `None` waits for the corroborated sample,
+    /// `Some(true)` decides from the least evidence that can answer, and
+    /// `Some(false)` -- full colour, which needs the view -- never drops. The
+    /// environment variable still overrides everything, as a kill switch that
+    /// needs no entry edited.
     pub fn for_session(setting: Option<bool>) -> Self {
         let mut dropper = Self::new();
 

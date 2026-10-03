@@ -3054,6 +3054,8 @@ pub async fn ab_connect_entry(
         enable_full_window_drag: ab_entry.enable_full_window_drag,
         force_lossless: ab_entry.force_lossless,
         enable_h264: ab_entry.enable_h264,
+        // From an entry, so always set: see CreateSessionRequest.
+        h264_chroma444: Some(ab_entry.h264_chroma444.unwrap_or(false)),
         container_image: ab_entry.container_image,
         container_cpu_limit: ab_entry.container_cpu_limit,
         container_memory_limit: ab_entry.container_memory_limit,
@@ -5547,6 +5549,8 @@ pub async fn quick_connect(
             enable_full_window_drag: ab_entry.enable_full_window_drag,
             force_lossless: ab_entry.force_lossless,
             enable_h264: ab_entry.enable_h264,
+            // From an entry, so always set: see CreateSessionRequest.
+            h264_chroma444: Some(ab_entry.h264_chroma444.unwrap_or(false)),
             container_image: ab_entry.container_image,
             container_cpu_limit: ab_entry.container_cpu_limit,
             container_memory_limit: ab_entry.container_memory_limit,
@@ -5676,6 +5680,7 @@ pub async fn quick_connect(
         enable_full_window_drag: None,
         force_lossless: None,
         enable_h264: None,
+        h264_chroma444: None,
         container_image: None,
         container_cpu_limit: None,
         container_memory_limit: None,
