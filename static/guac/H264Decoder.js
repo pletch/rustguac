@@ -2537,7 +2537,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
          * setting, and there is nothing to compare: the auxiliary view has
          * been removed from the wire, so combining cannot produce 4:4:4 from
          * what arrives, only the cost of trying. The lever that answers this
-         * question is the connection entry's own drop setting, one level up. */
+         * question is the connection entry's Full Colour setting, which keeps
+         * the auxiliary view on the wire. */
         if (auxDropped)
             return false;
 
@@ -3458,8 +3459,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                                     + 'combining is switched off by an '
                                     + 'explicit h264Chroma444 override, so '
                                     + 'they are decoded and discarded. Check '
-                                    + 'window.__h264Chroma444 (the entry\'s '
-                                    + '"never combined" setting sets it) and '
+                                    + 'window.__h264Chroma444 (set for any '
+                                    + 'entry without Full Colour) and '
                                     + 'the h264Chroma444 key in localStorage.',
                                     true);
 
