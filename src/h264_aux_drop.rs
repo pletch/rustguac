@@ -1216,6 +1216,15 @@ mod tests {
         );
     }
 
+    /// A session that carried no H.264 at all has nothing to report: no
+    /// stream was waited on, so "never dropped" would describe nothing.
+    #[test]
+    fn a_session_without_h264_has_no_summary() {
+        let mut d = AuxDropper::for_session(None);
+        d.process("4.sync,4.1000;4.size,1.0,4.1920,4.1080;");
+        assert_eq!(d.summary(), None);
+    }
+
     /// The env var is the kill switch, and off means never looking.
     #[test]
     fn the_kill_switch_disables_it() {
