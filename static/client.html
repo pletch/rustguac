@@ -1721,11 +1721,26 @@
             // overlay, and the browser kept uploading thumbnails into
             // 404 responses for hours. Forwarding tunnel events into the
             // existing client.onerror closes that loop.
+            // Set once an error has been shown, so that the CLOSED transition
+            // which always follows does not replace a specific message with
+            // a generic one.
+            var tunnelErrorShown = false;
             tunnel.onerror = function(status) {
                 if (typeof console !== 'undefined')
                     console.log('[rustguac] tunnel error:',
                                 status && status.message,
                                 'code=' + (status && status.code));
+                // An exception in an instruction handler closes the tunnel
+                // from this end, which the server logs as an ordinary browser
+                // disconnect. Say what threw and where: the exception, stack
+                // included, here, and its message on the overlay.
+                var ex = tunnel.lastException;
+                if (ex) {
+                    tunnel.lastException = null;
+                    console.error('[rustguac] instruction handler threw; '
+                            + 'closing the tunnel:', ex);
+                }
+                tunnelErrorShown = true;
                 if (client.onerror) client.onerror(status || {
                     code: 519,
                     message: 'Connection lost'
@@ -1735,7 +1750,7 @@
                 if (state === Guacamole.Tunnel.State.CLOSED) {
                     if (typeof console !== 'undefined')
                         console.log('[rustguac] tunnel closed');
-                    if (client.onerror) client.onerror({
+                    if (client.onerror && !tunnelErrorShown) client.onerror({
                         code: 519,
                         message: 'Connection lost'
                     });
