@@ -292,15 +292,36 @@ install_rustguac() {
     # `static/.` rather than `static/*` because the latter is one slip away
     # from `cp -r static "$PREFIX/static/"`, which nests the tree instead of
     # filling the directory -- which is how that copy got there.
-    if command -v rsync >/dev/null 2>&1; then
-        rsync -a --delete "$SCRIPT_DIR/static/." "$PREFIX/static/"
-    else
-        # Same effect without rsync: replace the tree outright. Nothing in
-        # here is operator-supplied; branding comes from config and themes.
-        rm -rf "$PREFIX/static"
-        mkdir -p "$PREFIX/static"
-        cp -r "$SCRIPT_DIR/static/." "$PREFIX/static/"
+    #
+    # Operators are told to put their own files here too (a theme logo_url
+    # such as /acme-logo.png, see docs/configuration.md), so a blind mirror
+    # would delete them on every upgrade. Instead each install records what
+    # it put there, and the next one removes only files from that record that
+    # have since left the repo. Anything an operator added is never in the
+    # record and is left alone.
+    local manifest="$PREFIX/.static-installed-files"
+    local new_manifest
+    new_manifest="$(mktemp)"
+    (cd "$SCRIPT_DIR/static" && find . -type f | sort) > "$new_manifest"
+    if [[ -f "$manifest" ]]; then
+        comm -23 <(sort "$manifest") "$new_manifest" | while IFS= read -r stale; do
+            case "$stale" in
+                ./*) ;;
+                *) continue ;;
+            esac
+            [[ "$stale" == *..* ]] && continue
+            rm -f -- "$PREFIX/static/${stale#./}"
+            info "Removed stale static file ${stale#./}"
+        done
     fi
+    # The nested copy described above predates any record, so name it.
+    if [[ -d "$PREFIX/static/static" && ! -e "$SCRIPT_DIR/static/static" ]]; then
+        rm -rf -- "$PREFIX/static/static"
+        info "Removed stray nested $PREFIX/static/static"
+    fi
+    cp -r "$SCRIPT_DIR/static/." "$PREFIX/static/"
+    install -m 0644 "$new_manifest" "$manifest"
+    rm -f "$new_manifest"
 
     # Default config (don't overwrite existing)
     if [[ ! -f "$PREFIX/config.toml" ]]; then
