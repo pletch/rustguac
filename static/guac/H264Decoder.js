@@ -149,14 +149,14 @@ Guacamole.H264Decoder = function H264Decoder(display) {
     /**
      * The longest the recovery window may grow to, in milliseconds.
      *
-     * There used to be a cap on the number of attempts instead, on the
-     * reasoning that a client recovering from transient load and one that
+     * A cap on the number of attempts looks like the natural alternative, on
+     * the reasoning that a client recovering from transient load and one that
      * simply cannot sustain the combine look identical sample by sample, and
-     * only time separates them. That much is true; a permanent latch was the
-     * wrong instrument for it. It condemned the rest of the session for a
-     * workload that had passed -- a video at lunchtime meant reading text at
-     * 4:2:0 until the next reconnect -- and it bounded the cost of re-probing
-     * no better than backing off does.
+     * only time separates them. That much is true, but a permanent latch is
+     * the wrong instrument for it: it condemns the rest of the session for a
+     * workload that has passed -- a video at lunchtime would mean reading text
+     * at 4:2:0 until the next reconnect -- and it bounds the cost of
+     * re-probing no better than backing off does.
      *
      * What re-probing costs is a whole-plane resync (suspendCombining leaves
      * resyncNeeded set, so the first picture back copies and uploads every
@@ -566,9 +566,9 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * size, mid-session, with no resize. The new surface is empty, so its
      * first keyframe decodes black and covers the whole screen -- and Windows
      * then repaints only what it thinks changed, trusting the client still to
-     * hold the rest. Both black-display episodes of 2026-09-11 were exactly
-     * that (guacd logged Delete+CreateSurface 2992x2000 over 2992x2000 2-4s
-     * before each), and they were the only same-size recreations that day.
+     * hold the rest. In the field, guacd logged a same-size Delete+Create-
+     * Surface (2992x2000 over 2992x2000) 2-4s before each black-display
+     * episode, and at no other time.
      *
      * It is the same Windows behaviour as sol1/rustguac#118, where a resize
      * reallocated the surface and left regions unpainted. The evidence there
@@ -832,23 +832,23 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * Share of wall clock spent inside copyTo() above which a busy window
      * while combining gives the combine up. **The only copy condition.**
      *
-     * A mean-per-picture threshold sat beside this until 2026-09-12, and both
-     * had to be exceeded. That was wrong, and the case that showed it is the
-     * one this gate most needs to catch: xrdp at 1920x1080 dragging a VS Code
+     * There is deliberately no mean-per-picture threshold beside it. Requiring
+     * both misses the case this gate most needs to catch: xrdp at 1920x1080
+     * dragging a VS Code
      * scrollbar ran 39-47 pictures a second at 12ms each -- 46-60% of the main
      * thread, and drags that lost the scrollbar thumb -- while the per-picture
      * figure sat under any sane threshold and vetoed the trip. Many cheap
      * copies is the shape that hurts, and per picture is blind to it by
      * construction.
      *
-     * The near-idle desktop that the per-picture condition was added to
-     * protect (33-38ms a picture) needs no protecting: it spends 4.6% of the
+     * The near-idle desktop a per-picture condition would protect (33-38ms a
+     * picture) needs no protecting: it spends 4.6% of the
      * main thread and this declines on its own. Measured shares: Windows idle
      * 4.6%, Windows typing 17-19%, full-screen video ~45%, xrdp scrolling
      * 46-60%, xrdp with glxgears 70%. Every one of them lands on the right
      * side of 30% without help.
      *
-     * The pathological case per picture would have caught -- one enormous copy
+     * The pathological case per picture would catch -- one enormous copy
      * against an otherwise idle session -- is covered: a block long enough to
      * matter exceeds SYNC_WAIT_TIMEOUT_MS and the sync-timeout latch takes it.
      *
@@ -868,17 +868,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * downstream, and it is the backstop for congestion the copy share does
      * not explain.
      *
-     * It was 8ms, measured 2026-09-09 when combining cost 30-60ms a picture,
-     * and condemned healthy sessions once the copies were banded: the same
-     * client at ~12ms of copy a picture flushed at 11.1ms with decode 1-3ms
-     * and combine 0.4ms. It was then derived as 1.5x a per-picture copy
-     * threshold, to stop it pre-empting that gate; when the per-picture
-     * condition was removed the derivation lost its anchor and 30ms stayed as
-     * a measured constant.
+     * Lower thresholds condemn healthy sessions once the copies are banded:
+     * the same client at ~12ms of copy a picture flushes at 11.1ms, with
+     * decode at 1-3ms and combine at 0.4ms.
      *
      * 30ms is well evidenced: it is what caught the xrdp VS Code scrolling
-     * case (`mean flush 30.0ms over 128 syncs in 10s`) while the copy gate,
-     * still requiring a per-picture threshold at the time, declined. Roughly
+     * case (`mean flush 30.0ms over 128 syncs in 10s`). Roughly
      * two frames at 60Hz of the display waiting.
      *
      * @private
@@ -1466,29 +1461,25 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * between damaged regions is worth a second copy rather than being read
      * through.
      *
-     * Refitted 2026-09-13 on a Windows client with hardware decode, against a
+     * Fitted on a Windows client with hardware decode, against a
      * Windows host at 2992x1648: 28 `copy` windows spanning 0.15MP to 4.96MP,
      * giving **10ms + 5ms/MP**, R-squared 0.90, with bucketed residuals inside
      * 2ms across the whole range.
      *
-     * The previous pair, 2.7ms + 6.5ms/MP, was fitted to two points at 4.93MP
-     * and 1.72MP. Both are large, so the intercept was an extrapolation off a
-     * short lever arm, and it landed a third of the way to the truth: at
-     * 0.15MP it predicts 3.6ms where eight measured copies averaged **11.8ms**.
-     * The two models agree to 0.4ms at 4.93MP, which is the tell -- they
-     * differ only where the old one had no data, and small copies are exactly
+     * Fit only large copies and the intercept goes wrong: two points at
+     * 4.93MP and 1.72MP give 2.7ms + 6.5ms/MP, an extrapolation off a short
+     * lever arm that predicts 3.6ms at 0.15MP where eight measured copies
+     * averaged **11.8ms**. The two models agree to 0.4ms at 4.93MP and differ
+     * only where the short one has no data -- and small copies are exactly
      * what banding produces.
      *
-     * The old note argued that 3ms was "the conservative end" and that
-     * conservative meant "fewer, larger copies". The second half is backwards
-     * and takes the first with it: the threshold is
-     * `FIXED * rowsPerMs * FACTOR`, so a *smaller* fixed cost makes splitting
-     * *easier*. Picking the low end bought more copies and smaller ones, which
-     * is the opposite of what it was chosen for, and each of them cost three
-     * times what it was budgeted.
+     * Erring low on the fixed cost is not the conservative choice. The
+     * threshold is `FIXED * rowsPerMs * FACTOR`, so a *smaller* fixed cost
+     * makes splitting *easier*: it buys more copies and smaller ones, each
+     * costing more than it was budgeted.
      *
-     * At 2992 wide this moves the minimum worthwhile gap from 309 rows to
-     * about 1280, so a second copy now has to skip roughly 4MP of transfer to
+     * At 2992 wide the minimum worthwhile gap is about 1280 rows, so a second
+     * copy has to skip roughly 4MP of transfer to
      * pay for itself. That is deliberate and it is what the arithmetic says:
      * at 10ms a call and 5ms/MP, nothing smaller earns the stall. It does not
      * touch the win banding was built for, which is cropping one copy to the
@@ -2904,7 +2895,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      * The codec string to configure the decoder with, when no sequence
      * parameter set has been seen yet. High profile at level 5.2, which
      * covers every picture size this decoder is asked for, rather than the
-     * level 4.1 that used to be hardcoded here.
+     * level 4.1 that is too small for them.
      *
      * The level in a codec string is not advisory: Chrome sizes its hardware
      * decoder from it, and a stream whose frames exceed the declared level

@@ -1,49 +1,33 @@
 //! Drops an AVC444 stream's auxiliary chroma view on the way to the browser,
 //! where the stream proves it can be dropped.
 //!
-//! # What this is for
-//!
 //! The combine gate in `H264Decoder.js` gives up 4:4:4 by discarding the
-//! auxiliary view *after* decoding it, so it removes the main-thread cost and
-//! nothing else: both views have already crossed the link, and both have been
-//! decoded. This removes them from the wire instead, which is the same picture
-//! for less bandwidth and one decode per picture rather than two.
+//! auxiliary view *after* it has crossed the link and been decoded, so it
+//! removes main-thread cost and nothing else. This removes the view from the
+//! wire instead: the same 4:2:0 picture for less bandwidth and one decode per
+//! frame rather than two. It cannot be had at the source, because a Windows
+//! host has to be offered AVC444 to send H.264 at all.
 //!
-//! It is an alternative to the never-combine setting rather than a replacement
-//! for it: never-combine works on any stream, this one only where the encoder
-//! has kept the two views' references apart.
+//! # The gate
 //!
-//! # Why it needs a gate, and what the gate has to ask
+//! The two views share one decoded picture buffer, so dropping is safe only if
+//! two things hold. `crate::h264_refs` reads both from the slice headers.
 //!
-//! The two views are one H.264 sequence sharing one decoded picture buffer, so
-//! dropping access units is safe only if two things hold, and the second was
-//! learned the hard way.
+//! **Nothing surviving may predict from a dropped picture.** Windows names its
+//! references explicitly with disjoint long-term indices, and the xrdp fork
+//! does the same with dual long-term references.
 //!
-//! **Nothing surviving may predict from a dropped picture.**
-//! `crate::h264_refs` reads that out of the slice headers. Windows names its
-//! references explicitly with disjoint long-term indices; the dual-LTR xrdp
-//! fork does the same since `f42cc481`. Both pass.
-//!
-//! **And the decoder must have room for the pictures a gap makes it invent.**
+//! **The decoder must have room for the pictures a gap makes it invent.**
 //! Dropping a picture leaves a hole in `frame_num`, and 8.2.5.2 obliges a
 //! decoder to fill each hole with an inferred *non-existing* frame held as a
 //! **short-term** reference. The sliding window can only evict short-term
 //! pictures, so a stream whose `max_num_ref_frames` is entirely consumed by
 //! long-term references has nowhere to put one, and the decoder fails outright
-//! rather than degrading.
-//!
-//! That is what froze an xrdp session on 2026-09-12. Its chains were separate
-//! and explicitly named -- the first test passed, correctly -- but
-//! `max_num_ref_frames` was 2 with long-term 0 held by main and 1 by the
-//! auxiliary view. Dropping began at 21:14:34.654 and Chrome reported a decode
-//! error 212ms later, rebuilt its decoder, and then held every frame waiting
-//! for a keyframe an idle desktop never sends. Windows survives the identical
-//! treatment only because its `max_num_ref_frames` is 3: two long-term and one
-//! to spare.
-//!
-//! So the first question was the right one and not the only one. Asking
-//! whether anything *refers* to a dropped picture says nothing about whether
-//! the decoder can account for the ones that are missing.
+//! rather than degrading. Asking whether anything *refers* to a dropped picture
+//! says nothing about this: an xrdp stream with perfectly separate chains,
+//! long-term 0 for main and 1 for the auxiliary view and `max_num_ref_frames`
+//! 2, froze within a fifth of a second of the first drop. Windows has 3, two
+//! long-term and one to spare.
 //!
 //! # What it does, in order
 //!
@@ -53,11 +37,11 @@
 //!    a keyframe and a host can go minutes without one. Setting it on a stream
 //!    that is never dropped from is inert.
 //! 2. **Waits** while the probe accumulates -- three auxiliary inter slices
-//!    and ten main ones, or one of each where the entry has asked for the
-//!    drop. Inter slices rather than pictures: an IDR names no reference and
+//!    and ten main ones, or one of each for a connection entry at Standard
+//!    colour. Inter slices rather than pictures: an IDR names no reference and
 //!    marks nothing, so excluding them is already the guard against deciding
-//!    from the connect-time keyframe burst, and a count of pictures would
-//!    only add delay on a quiet desktop that sends few.
+//!    from the connect-time keyframe burst, and a count of pictures would only
+//!    add delay on a quiet desktop that sends few.
 //! 3. **Drops**, as soon as the stream proves itself, the `h264`, `blob` and
 //!    `end` instructions of every non-IDR auxiliary view, and clears the
 //!    trailing `<paired>` flag on main views so the client paints them instead
@@ -66,55 +50,36 @@
 //!    is a verdict about the first few auxiliary views, so one that turns
 //!    unsafe later stops the drop.
 //!
-//! A session that never gets past step 2 says what it was short of, in the
-//! disconnect summary. The gate is otherwise silent until it decides, so
-//! without that a stream that never qualifies looks identical to one that is
-//! merely slow -- and "it seems slow to start" is not something that can be
-//! reasoned about.
+//! From the first SPS to the decision takes about 2.5s on both hosts, almost
+//! all of it the keyframe burst. A session that never gets past step 2 says
+//! what it was short of in its disconnect summary, since the gate is otherwise
+//! silent until it decides and a stream that never qualifies would look
+//! identical to one that is merely slow.
 //!
-//! Measured from the first SPS to the decision: 2.4s on Windows, 2.5s on the
-//! xrdp fork. Almost all of that is the keyframe burst, during which there is
-//! nothing to decide on. Remembering the verdict against the connection entry
-//! between sessions is the only thing that would remove it.
-//!
-//! # What it deliberately does not drop
+//! # What it never drops
 //!
 //! **Auxiliary IDRs.** An IDR with `long_term_reference_flag` set marks every
-//! other reference unused and claims `LongTermFrameIdx` 0 (8.2.5.1), so it is
-//! a buffer reset the surviving stream is written against, and a Windows
-//! capture shows a main slice naming long-term 0 immediately after one. That
-//! interaction is unresolved. They are two pictures in two hundred, so keeping
-//! them costs almost nothing and removes the question: an auxiliary view that
-//! arrives is decoded and never painted, exactly as before.
+//! other reference unused and claims `LongTermFrameIdx` 0 (8.2.5.1), so a main
+//! slice naming long-term 0 straight after one is naming that auxiliary
+//! picture. guacd flags a keyframe on `nal_type` 5, so every auxiliary IDR
+//! passes through and the main slice gets the identical picture either way.
+//! They are a few pictures in a hundred.
 //!
-//! Dropping is also safe upstream. guacd calls `guac_client_free_stream`
-//! immediately after writing the blobs, so no acknowledgement is expected for
-//! a stream that is swallowed here and no flow control depends on one.
+//! Dropping is safe for guacd too: it calls `guac_client_free_stream` as soon
+//! as it has written the blobs, so nothing waits on an acknowledgement for a
+//! stream swallowed here.
 //!
 //! # Where it sits
 //!
-//! In `guacd_to_ws`, after the recording tee — so recordings keep the full
-//! 4:4:4 stream and `SessionRecording.js` is unaffected — and before the
+//! In `guacd_to_ws`, after the recording tee -- so recordings keep the full
+//! 4:4:4 stream and `SessionRecording.js` is unaffected -- and before the
 //! colour rewrite and the binary blob splitter.
 //!
-//! `RUSTGUAC_H264_AUX_DROP=0` turns it off; `=unproven` extends it to streams
-//! the slice headers cannot prove, which is not currently a good idea.
-//!
-//! # Unproven, and what it turned out to be worth
-//!
-//! `Safety::Unproven` means the auxiliary picture sits in a reference list
-//! past the index the encoder is known to use, and that the slice headers
-//! cannot say whether a macroblock reaches it. That was the xrdp fork's shape
-//! before `f42cc481`: main slices took the default list and activated two
-//! entries because the *auxiliary* slices needed two to reach their own chain,
-//! so the reasoning ran that main very likely never used index 1.
-//!
-//! It was tried on 2026-09-12 and xrdp corrupted, and
-//! `tests/aux-drop-replay.mjs` then settled it against a recording: the drop
-//! left 12 of 141 main access units undecodable. Very likely never was doing
-//! the work in that argument, and it was wrong. `=unproven` still exists for
-//! experiments and is off by default.
-//!
+//! `RUSTGUAC_H264_AUX_DROP=0` turns it off. `=unproven` extends it to streams
+//! the slice headers cannot prove (`Safety::Unproven`: an auxiliary picture
+//! reachable in a main slice's reference list). That is for experiments only:
+//! on the one such stream measured, a replay showed 12 of 141 main access
+//! units undecodable once the views were removed.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -223,9 +188,9 @@ impl AuxDropper {
         let setting = std::env::var("RUSTGUAC_H264_AUX_DROP").unwrap_or_default();
         let setting = setting.trim().to_ascii_lowercase();
         let enabled = !matches!(setting.as_str(), "0" | "off" | "false" | "no");
-        // Only what the slice headers can prove, by default. Dropping on
-        // unproven streams was tried on 2026-09-12 and corrupted xrdp; see the
-        // module documentation. `unproven` puts it back for experiments.
+        // Only what the slice headers can prove, by default: the one unproven
+        // stream measured corrupted when its auxiliary views were dropped (see
+        // the module documentation). `unproven` puts it back for experiments.
         let unproven = matches!(setting.as_str(), "unproven" | "force");
 
         Self {
@@ -291,8 +256,8 @@ impl AuxDropper {
                     self.state = State::Off;
                     lines.push(format!(
                         "auxiliary view will NOT be dropped on this stream: the \
-                         slice headers cannot prove it, and the one host with \
-                         this shape corrupted when it was tried \
+                         slice headers cannot prove it, and the one stream of \
+                         this shape measured corrupted when it was dropped \
                          (RUSTGUAC_H264_AUX_DROP=unproven to try again) — {}",
                         self.probe.verdict()
                     ));
@@ -795,8 +760,8 @@ mod tests {
         assert_eq!(out, text.as_str());
     }
 
-    /// An unproven stream is left alone by default: the one host with that
-    /// shape corrupted when it was tried.
+    /// An unproven stream is left alone by default: the one stream of that
+    /// shape measured corrupted when its auxiliary views were dropped.
     #[test]
     fn unproven_streams_are_left_alone_by_default() {
         assert!(!AuxDropper::new().unproven);
