@@ -268,8 +268,9 @@ async fn handle_ws(
         "Starting proxy"
     );
 
-    // Whether this entry asked for the AVC444 auxiliary view to be dropped.
-    // Read here rather than sent to guacd: the removal happens in guacd_to_ws.
+    // How this session's colour setting maps onto dropping the AVC444
+    // auxiliary view. Read here rather than sent to guacd: the removal
+    // happens in guacd_to_ws.
     let drop_aux = manager.h264_drop_aux(session_id).await;
 
     // Set up recording file (only for owner connections, and only if recording is enabled)

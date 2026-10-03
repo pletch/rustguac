@@ -186,10 +186,12 @@ pub struct AuxDropper {
 impl AuxDropper {
     /// A dropper for one session.
     ///
-    /// `setting` is the connection entry's `h264_drop_aux`: `None` leaves the
-    /// per-stream gate to decide, `Some(true)` drops from the first picture,
-    /// `Some(false)` never drops. The environment variable still overrides
-    /// everything, as a kill switch that needs no entry edited.
+    /// `setting` comes from the session's colour choice (see
+    /// `Session::aux_drop_setting`): `None` waits for the corroborated sample,
+    /// `Some(true)` decides from the least evidence that can answer, and
+    /// `Some(false)` -- full colour, which needs the view -- never drops. The
+    /// environment variable still overrides everything, as a kill switch that
+    /// needs no entry edited.
     pub fn for_session(setting: Option<bool>) -> Self {
         let mut dropper = Self::new();
 
@@ -1032,9 +1034,8 @@ mod tests {
     ///
     /// There is no auxiliary view to drop, so the gate can never leave
     /// `Undecided` and the filter is never entered -- the chunk is borrowed,
-    /// not rebuilt. Worth pinning because dropping is now the default for new
-    /// entries, so this path carries every AVC420 host: stock xrdp, anything
-    /// negotiating AVC420 only, and any target whose `avc444` setting is off.
+    /// not rebuilt. Worth pinning because dropping is the default, so this path
+    /// carries every AVC420 host -- stock xrdp among them.
     #[test]
     fn an_avc420_only_stream_is_passed_through_untouched() {
         for entry in [None, Some(true)] {

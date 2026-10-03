@@ -77,21 +77,15 @@ the measurement work that made the browser-side combine affordable.
   session sat white or frozen on a stream mstsc and ffmpeg decode perfectly.
   This fork adds `max_num_reorder_frames=0` on the wire where POC type 2
   guarantees it, and nowhere else.
-- **Per-connection AVC444 request** (`patches/013-rdp-avc420-only.patch`) —
-  which H.264 codecs are offered, per entry: **AVC444 + AVC420** (the server
-  chooses), **AVC444 + AVC420, never combined**, **AVC444 + AVC420, chroma
-  dropped in transit** (the default for new entries; see below), or **AVC420
-  only**. Never combined leaves the offer alone and tells the browser to paint
-  4:2:0: the second view is still sent and decoded, but each update reaches
-  the screen 12-17ms sooner, which suits a target used mainly for typing. AVC444 + AVC420 is required for
-  Windows targets: they offer no H.264 below RDPGFX v10, and FreeRDP emits
-  those capability sets only when AVC444 is requested, so AVC420 only loses
-  H.264 there altogether rather than downgrading its chroma. AVC420 only is
-  for xrdp targets where bandwidth or decode work matters more than chroma. This says what the
-  server is asked to send, not what the browser draws -- whether the two views
-  are combined is decided per picture in the browser. (An Automatic option
-  that dropped AVC444 under Native Resolution was removed: on Windows it lost
-  H.264 outright. Entries saved with it are treated as AVC444 + AVC420.)
+- **Per-connection colour** — one **Full Colour (4:4:4)** checkbox per RDP
+  entry. AVC444 is always offered, because a Windows host needs it: its
+  hardware encoder engages only in AVC444 mode, and FreeRDP advertises the
+  RDPGFX 10.x capability sets only alongside it, without which Windows sends
+  no H.264 at all. Left off (the default), the auxiliary chroma view is
+  dropped in transit wherever the stream proves it can be spared, and the
+  browser never combines, so 4:2:0 is painted at the lowest cost available.
+  Turned on, both views reach the browser and are combined into 4:4:4, which
+  the browser still gives up when the copy costs too much.
 - **Dropping the auxiliary view in transit** (`src/h264_aux_drop.rs`,
   `src/h264_refs.rs`) — removes AVC444's second picture from the wire between
   rustguac and the browser, where the stream proves it can spare it: **13% of
