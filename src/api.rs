@@ -3994,6 +3994,7 @@ pub fn session_request_from_entry(
 ) -> Result<CreateSessionRequest, String> {
     let session_type = entry_session_type(&entry.session_type)
         .ok_or_else(|| format!("unknown session type: {}", entry.session_type))?;
+    let from_saved_entry = attribution.is_some();
     let (address_book_entry, address_book_folder, entry_display_name) = match attribution {
         Some(r) => (Some(r.key), Some(r.folder), entry.display_name),
         None => (None, None, None),
@@ -4081,6 +4082,9 @@ pub fn session_request_from_entry(
         wol_broadcast_addr: entry.wol_broadcast_addr,
         wol_udp_port: entry.wol_udp_port,
         wol_wait_time: entry.wol_wait_time,
+        // Always set from a saved entry, never from an ad-hoc one: see
+        // CreateSessionRequest.
+        h264_chroma444: from_saved_entry.then(|| entry.h264_chroma444.unwrap_or(false)),
     })
 }
 
@@ -7484,6 +7488,7 @@ pub async fn quick_connect(
         enable_full_window_drag: None,
         force_lossless: None,
         enable_h264: None,
+        h264_chroma444: None,
         container_image: None,
         container_cpu_limit: None,
         container_memory_limit: None,
@@ -7794,6 +7799,8 @@ mod tests {
             wol_broadcast_addr: ab_entry.wol_broadcast_addr,
             wol_udp_port: ab_entry.wol_udp_port,
             wol_wait_time: ab_entry.wol_wait_time,
+            // From an entry, so always set: see CreateSessionRequest.
+            h264_chroma444: Some(ab_entry.h264_chroma444.unwrap_or(false)),
         };
         create_req
     }
@@ -7892,6 +7899,8 @@ mod tests {
             wol_broadcast_addr: ab_entry.wol_broadcast_addr,
             wol_udp_port: ab_entry.wol_udp_port,
             wol_wait_time: ab_entry.wol_wait_time,
+            // From an entry, so always set: see CreateSessionRequest.
+            h264_chroma444: Some(ab_entry.h264_chroma444.unwrap_or(false)),
         };
         create_req
     }
@@ -8042,6 +8051,25 @@ mod tests {
         assert_eq!(req.address_book_folder, None);
         assert_eq!(req.entry_display_name, None);
         assert_eq!(req.hostname.as_deref(), Some("host.example.test"));
+        // No admin vouched for an ad-hoc target, so the auxiliary-view drop
+        // waits for its full sample; a saved entry always says which colour.
+        assert_eq!(req.h264_chroma444, None);
+        let attributed = session_request_from_entry(
+            full_entry("rdp"),
+            EntryDisplay {
+                width: None,
+                height: None,
+                dpi: None,
+                desktop_scale: None,
+                display_scale: None,
+            },
+            Some(EntryRef {
+                key: "shared/f/e".into(),
+                folder: "f".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(attributed.h264_chroma444, Some(false));
         assert!(session_request_from_entry(
             AddressBookEntry {
                 session_type: "telnet".into(),
