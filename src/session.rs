@@ -551,6 +551,33 @@ pub(crate) fn allowed_address(
         })
 }
 
+/// Longest Wake-on-LAN wait rustguac will ask guacd for, in seconds.
+const MAX_WOL_WAIT_SECS: u32 = 600;
+/// Bounds for the SSH terminal font size, in points.
+const MIN_SSH_FONT: u32 = 6;
+const MAX_SSH_FONT: u32 = 72;
+
+/// Wake-on-LAN settings for guacd.
+///
+/// guacd sends the magic packet to whatever broadcast address and UDP port
+/// it is given, then waits the given time before connecting, so for an
+/// ad-hoc request from a non-admin these come from the caller. They are
+/// dropped there: Wake-on-LAN is configured on connection entries. The
+/// wait is capped either way so one session cannot hold a guacd process for
+/// days.
+fn wol_params(req: &CreateSessionRequest, fence_all_targets: bool) -> guacd::WolParams {
+    if fence_all_targets {
+        return guacd::WolParams::default();
+    }
+    guacd::WolParams {
+        send_packet: req.wol_send_packet.unwrap_or(false),
+        mac_addr: req.wol_mac_addr.clone(),
+        broadcast_addr: req.wol_broadcast_addr.clone(),
+        udp_port: req.wol_udp_port,
+        wait_time: req.wol_wait_time.map(|t| t.min(MAX_WOL_WAIT_SECS)),
+    }
+}
+
 /// An address formatted for a `host:port` string (IPv6 in brackets), as
 /// the SSH tunnel and probe code builds its dial address that way.
 pub(crate) fn dial_host(ip: std::net::IpAddr) -> String {
@@ -768,6 +795,8 @@ impl SessionManager {
         // and the generic tunnel setup after the match uses them for the other
         // session types.
         let fence_all_targets = req.fence_all_targets;
+        // Wake-on-LAN params, applied to SSH/RDP/VNC alike (passed through to guacd).
+        let wol = wol_params(&req, fence_all_targets);
         let jump_hops: Vec<tunnel::JumpHost> = if let Some(hops) = req.jump_hosts {
             hops
         } else if let Some(ref jh) = req.jump_host {
@@ -803,15 +832,6 @@ impl SessionManager {
         // Tunnels the Proxmox branch establishes in-branch (PVE API + SPICE
         // proxy hops); merged into the session's tunnel list after the match.
         let mut proxmox_tunnels: Vec<tunnel::SshTunnel> = Vec::new();
-
-        // Wake-on-LAN params, applied to SSH/RDP/VNC alike (passed through to guacd).
-        let wol = guacd::WolParams {
-            send_packet: req.wol_send_packet.unwrap_or(false),
-            mac_addr: req.wol_mac_addr.clone(),
-            broadcast_addr: req.wol_broadcast_addr.clone(),
-            udp_port: req.wol_udp_port,
-            wait_time: req.wol_wait_time,
-        };
 
         let (
             mut conn_params,
@@ -944,7 +964,9 @@ impl SessionManager {
                         .as_ref()
                         .map(|(_, _, c)| *c)
                         .unwrap_or(false),
-                    font_size: req.ssh_font_size,
+                    font_size: req
+                        .ssh_font_size
+                        .map(|s| s.clamp(MIN_SSH_FONT, MAX_SSH_FONT)),
                     wol: wol.clone(),
                 });
                 (
@@ -3075,6 +3097,23 @@ mod tests {
                 other.map(|i| i.session_id)
             ),
         }
+    }
+
+    #[test]
+    fn wol_is_dropped_for_untrusted_ad_hoc_and_wait_is_capped() {
+        let req = fenced_request(serde_json::json!({
+            "session_type": "ssh",
+            "wol_send_packet": true,
+            "wol_mac_addr": "00:11:22:33:44:55",
+            "wol_broadcast_addr": "192.0.2.255",
+            "wol_udp_port": 4822,
+            "wol_wait_time": 999999,
+        }));
+        let fenced = wol_params(&req, true);
+        assert!(!fenced.send_packet && fenced.broadcast_addr.is_none());
+        let trusted = wol_params(&req, false);
+        assert!(trusted.send_packet);
+        assert_eq!(trusted.wait_time, Some(MAX_WOL_WAIT_SECS));
     }
 
     #[test]
