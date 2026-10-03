@@ -157,9 +157,11 @@ xrdp and Windows. No environment variables — `enable-h264` is the only switch.
 Policy *"Use WDDM graphics display driver for Remote Desktop Connections"* must
 be **Disabled** or hardware H.264 encoding never engages (GPU 3D shows load
 while Video Encode stays at 0%). `AVC444ModePreferred=1` is also required *for
-hardware encoding*, and makes Windows send AVC444 — which is handled: both
-views are forwarded and combined in the browser into full 4:4:4 chroma. Full
-details, including verification commands, in `docs/rdp-h264.md`.
+hardware encoding*, and makes Windows send AVC444 — which is handled: at the
+default Standard colour the chroma view is dropped in transit and 4:2:0 is
+painted, and an entry's *Full Colour (4:4:4)* checkbox forwards both views and
+combines them in the browser. Full details, including verification commands,
+in `docs/rdp-h264.md`.
 
 **`hardwareAcceleration: 'prefer-hardware'` reads as a hint and is not one.**
 Chrome reports a configuration carrying it as unsupported outright where no
@@ -459,7 +461,7 @@ and **sync gate timeouts from 2026-09-11**:
   exists to protect -- or timer queries that are not reliably available. A held
   sync ack needs neither and is what the user actually feels. That reasoning
   still holds, and it is exactly why it does **not** apply to
-  `COMBINE_COPY_TRIP_SHARE` (lever 4): `copyTo()`'s prologue is blocking
+  `COMBINE_COPY_TRIP_SHARE` (layer 4): `copyTo()`'s prologue is blocking
   main-thread time, so timing it is a wall-clock delta across a synchronous
   call -- exact, free, on a path already paying it. The old argument was about
   GPU work, and the dominant cost turned out not to be GPU work.
@@ -540,58 +542,52 @@ off-by-one there reads a rect coordinate as a boolean -- true for nearly every
 rect -- and silently drops the paint of unpaired main views on some servers
 only. It covers the older instruction shapes too.
 
-#### Four levers, none of which replaces another
+#### Four layers, none of which replaces another
 
-Adaptive suspension does **not** make the AVC420 levers redundant, and the
+Adaptive suspension does **not** make the earlier layers redundant, and the
 four sit at levels the others cannot reach:
 
-1. **Whether AVC444 is advertised at all** (`013-rdp-avc420-only`, set per
-   connection -- lever 2 below). Clearing `GfxAVC444` reduces what is *sent
-   and decoded*: one bitstream instead of two, so guacd's copy and queue work
-   halves and there is one decode per picture instead of two. It is also the
-   only lever with a quality argument behind it rather than a cost one -- at
-   1.4x or 1.8x a 4:2:0 chroma block covers close to one logical pixel, so the
-   density has already bought most of what combining recovers.
+1. **What the server is offered: always AVC444 + AVC420.** Not a lever, and
+   deliberately not one. A Windows host engages its hardware encoder only in
+   AVC444 mode (`AVC444ModePreferred=1`), and FreeRDP advertises the RDPGFX
+   10.x capability sets only when `GfxAVC444` is set
+   (`channels/rdpgfx/client/rdpgfx_main.c`) -- with AVC420 alone it offers
+   8.1, and Windows at 8.1 sent only CLEARCODEC and progressive when tested,
+   no H.264 at all. So declining AVC444 at the source cost Windows its H.264
+   outright, and the only host it helped was xrdp, which the drop in transit
+   (layer 3) reaches anyway from the dual-LTR encoder on. A per-entry AVC420
+   choice existed and was a trap for exactly the hosts most people point this
+   at.
 
-   **It is not half the bandwidth**, which is the easy assumption and is wrong
-   on both hosts measured. The auxiliary view is **13% of the H.264 payload
-   against a Windows host and 43% against the xrdp fork** --
-   Windows sends chroma sparsely (27 auxiliary pictures in 201) while xrdp's
+   **The auxiliary view is not half the bandwidth**, which is the easy
+   assumption and is wrong on both hosts measured: **13% of the H.264 payload
+   against a Windows host and 43% against the xrdp fork** -- Windows sends
+   chroma sparsely (27 auxiliary pictures in 201) while xrdp's
    `CHROMA_INTERVAL` makes each one carry accumulated damage, 27KB against
-   main's 10KB. The saving is real and it is not a factor of two on either
-   host, and it varies with the workload as well as with the host.
-2. **The per-connection codec offer: AVC444 + AVC420, that pair never
-   combined, or AVC420 only** (stored as `avc444` true/false plus
-   `h264_combine`, which reaches client.html through `SessionInfo` as
-   `h264_no_combine` and sets the `h264Chroma444` window override before the
-   decoder exists -- combining is the only one of the four levers the server
-   never sees; the first is the default; an
-   Automatic option that dropped AVC444 under HiDPI was removed 2026-09-11 --
-   on Windows it lost H.264 outright, and the combine cost it guarded against
-   is now judged in the browser by area and measured flush; unset entries are
-   sent as AVC444 + AVC420, never as guacd's empty/auto value). Not really a
-   chroma switch: Windows offers no H.264 below RDPGFX v10 and FreeRDP emits
-   those capability sets only when AVC444 is requested, so AVC420 only on a Windows
-   host loses H.264 altogether rather than downgrading its chroma. A per-target
-   compatibility decision, invisible to the client. It says what the server is
-   asked to send, **not** what gets drawn -- AVC444 + AVC420 on a 4K host still paints
-   4:2:0 once lever 4 suspends, and is still the correct setting there, because
-   it is what keeps H.264 working at all. Do not be tempted to make AVC444 + AVC420
-   disable lever 4: it is the recommended setting for every Windows target,
-   so that would switch the gate off exactly where it earns most. xrdp needs the same lever
-   from the other direction -- see [[xrdp-avc444-causes-chop]] in project
-   memory, where AVC444 itself causes the chop and only clearing `GfxAVC444`
-   fixes it.
+   main's 10KB. It varies with the workload as well as with the host.
+2. **The per-entry colour choice** -- one *Full Colour (4:4:4)* checkbox,
+   stored as `h264_chroma444`. Off, the default, is Standard: the auxiliary
+   view is dropped in transit wherever the stream proves it can be spared,
+   from the least evidence that can answer, and the browser never combines --
+   so a stream the drop gate refuses still paints 4:2:0 rather than paying for
+   4:4:4 nobody asked for. On keeps the view on the wire (the dropper is
+   switched off) and lets the browser combine. The mapping lives in
+   `aux_drop_setting()` and `combines()` in `src/session.rs`; the no-combine
+   half reaches client.html through `SessionInfo` as `h264_no_combine`, which
+   sets the `h264Chroma444` window override before the decoder exists.
+   Ad-hoc sessions have no entry and get Standard from the corroborated sample.
+   Do not be tempted to make Full Colour disable layer 4: a 4K session still
+   needs the gate to fall back to 4:2:0 when the copy costs too much.
 3. **Dropping the auxiliary view in transit** (`src/h264_aux_drop.rs`, on by
-   default) -- see the section below. Sits between levers 1 and 4: the server
-   still sends both views, so guacd's work is unchanged, but the second one
-   never reaches the browser, so the link and the decode are halved in the same
-   proportions lever 1 would have managed. It is the only way to get that on a
-   Windows host, which loses H.264 entirely if asked for AVC420.
+   default) -- see the section below. The server still sends both views, so
+   guacd's work is unchanged, but the second one never reaches the browser, so
+   the link and the decode shrink by the auxiliary view's share. It is the
+   only way to get that on a Windows host, which loses H.264 entirely if asked
+   for AVC420.
 4. **The client-side combine gate.** Acts in the decoder's output callback,
    after both access units have already been decoded, so it removes the combine
    and nothing else -- never the decode or the bandwidth, which is why it does
-   not replace levers 1 or 3. Three parts, in the order they act:
+   not replace layer 3. Three parts, in the order they act:
 
    * `COMBINE_MAX_PIXELS`, a static threshold on framebuffer area, raised to
      4K on 2026-09-12. A prior only -- a ceiling on the worst case a session
@@ -811,7 +807,7 @@ It matters most where AVC420 cannot be asked for: FreeRDP emits the RDPGFX v10
 capability sets only when AVC444 is requested, so a Windows host offered
 AVC420 loses H.264 altogether rather than downgrading its chroma.
 
-**On a Windows target the other three levers cannot reach this, and the
+**On a Windows target the other three layers cannot reach this, and the
 reasoning is worth keeping because it is not obvious and gets re-derived.**
 AVC444 is not a quality choice there, it is the price of admission:
 `AVC444ModePreferred=1` is what puts the host on its *hardware* encoder, and
@@ -828,9 +824,9 @@ it.
 Which leaves a host obliged to send a picture the client does not need and
 cannot refuse:
 
-* lever 1 cannot decline it (clearing `GfxAVC444` loses hardware encoding, and
-  on Windows H.264 entirely),
-* lever 4 cannot avoid its cost (the bytes have arrived and been decoded before
+* the offer cannot decline it (clearing `GfxAVC444` loses hardware encoding,
+  and on Windows H.264 entirely),
+* layer 4 cannot avoid its cost (the bytes have arrived and been decoded before
   the combine gate acts), and
 * raising the resolution makes the chroma pointless without making it stop.
 
@@ -1021,9 +1017,9 @@ It sits in `guacd_to_ws` after the recording tee, so **recordings keep the full
 rewrite and the binary blob splitter. guacd frees each stream as soon as it has
 written the blobs, so nothing upstream waits on one that is swallowed here.
 
-Per entry as a fourth option under *H.264 codecs offered*, the default for new
-entries; it asks for the same questions to be answered from less evidence, not
-for them to be skipped. `RUSTGUAC_H264_AUX_DROP=0` is the deployment-wide kill
+Every entry at Standard colour asks for the same questions to be answered from
+less evidence, not for them to be skipped; ad-hoc sessions wait for the
+corroborated sample, and Full Colour switches the dropper off. `RUSTGUAC_H264_AUX_DROP=0` is the deployment-wide kill
 switch, `=unproven` relaxes the gate for experiments. An AVC420-only host never
 reaches a verdict and is passed through borrowed, not rebuilt.
 
@@ -1051,8 +1047,8 @@ and leaves exactly the cost above with nothing logged anywhere.
 override**, which everything else there defers to. The override exists so a
 session can be compared against the other setting and there is nothing to
 compare: with the auxiliary view off the wire, combining can produce the cost
-of 4:4:4 but not the result. The lever that answers this question is the
-entry's own drop setting, one level up. Combining then stops at the next
+of 4:4:4 but not the result. The setting that answers this question is the
+entry's Full Colour checkbox, which keeps the view on the wire. Combining then stops at the next
 **main** view, through the same re-check that handles a framebuffer growing
 past its threshold, and restarts by itself at the next auxiliary view if the
 drop ever stops -- with `resyncNeeded` set, since the textures predate the gap.
@@ -1070,8 +1066,9 @@ are shared state: skipping the uploads leaves the renderer's textures stale, so
 the next paired picture must resync whole planes or refine rows that are out of
 date. On a host interleaving the two that could cost more than it saves.
 
-**Never-combine is not redundant.** It is the only 4:2:0 lever on a stream the
-gate refuses, and during the window before the gate has decided.
+**Standard colour never combines, and that is not redundant with the drop.**
+It is what keeps a stream the gate refuses at 4:2:0, and the window before the
+gate has decided.
 
 Two harnesses, because both failures were found by measurement and neither by
 reading. `tests/aux-drop-replay.mjs` strips the auxiliary views from a
