@@ -1130,6 +1130,12 @@ Guacamole.WebSocketTunnel = function(tunnelURL) {
                 parser.receive(event.data);
             }
             catch (e) {
+                // An exception thrown by any instruction handler lands here
+                // and ends the session, and the status below carries only its
+                // message. Kept whole, so onerror can report where it came
+                // from -- otherwise a client-side bug reads to the server as a
+                // browser that simply hung up.
+                tunnel.lastException = e;
                 close_tunnel(new Guacamole.Status(Guacamole.Status.Code.SERVER_ERROR, e.message));
             }
 
