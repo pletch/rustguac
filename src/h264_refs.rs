@@ -773,7 +773,7 @@ impl Stats {
             if eager {
                 ""
             } else {
-                ". An eager dropper lowers the slice counts to one each"
+                ". A connection entry at Standard colour lowers the slice counts to one each"
             }
         )
     }

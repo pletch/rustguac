@@ -823,6 +823,26 @@ checks both shapes against ffmpeg, field by field. The journal says
 Encoders can say it themselves -- NVENC's `bitstreamRestrictionFlag` -- and the
 edit then finds nothing to do.
 
+## Full Colour (4:4:4)
+
+Each RDP entry has a **Full Colour (4:4:4)** checkbox, off by default. AVC444
+is offered either way, for the reasons in the next section; what the checkbox
+decides is whether the auxiliary chroma view is used.
+
+- **Off (Standard colour).** The auxiliary view is dropped in transit wherever
+  the stream proves it can be spared, and the browser never combines, so even a
+  stream the drop refuses paints plain 4:2:0 at the lowest cost available. An
+  entry decides from the least evidence that can answer; an ad-hoc session,
+  which no entry vouches for, waits for the full sample.
+- **On.** The auxiliary view is kept and the browser combines it into 4:4:4,
+  which sharpens coloured text. The browser still gives 4:4:4 up when it
+  costs too much -- see *When 4:4:4 combining is declined, and when it is given
+  up*, above -- and at a HiDPI resolution it commonly does within seconds.
+
+At native resolution on a HiDPI screen Full Colour makes little visible
+difference; it is worth turning on for a standard-density display where colour
+fringing on text matters.
+
 ## Dropping the chroma view in transit
 
 AVC444 sends two pictures per frame: a main view, which is ordinary 4:2:0, and

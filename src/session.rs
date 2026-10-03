@@ -126,6 +126,12 @@ pub struct CreateSessionRequest {
     pub force_lossless: Option<bool>,
     /// Enable H.264 passthrough for RDP.
     pub enable_h264: Option<bool>,
+    /// Paint AVC444 in full 4:4:4 colour (RDP). Connection entries always
+    /// set it -- `Some(false)` is their Standard colour -- so `None` marks an
+    /// ad-hoc session, which differs only in how much evidence the
+    /// auxiliary-view drop wants first; see [`Session::aux_drop_setting`].
+    /// Never reaches guacd: AVC444 is always offered.
+    pub h264_chroma444: Option<bool>,
     // VDI fields
     /// Docker image for VDI sessions (e.g. "myregistry/desktop:latest").
     pub container_image: Option<String>,
@@ -272,6 +278,11 @@ pub struct SessionInfo {
     /// from the /api/sessions/:id fetch; omitted when false/unset.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub fullscreen_on_connect: bool,
+    /// Never combine AVC444's two views into 4:4:4 chroma, whatever the
+    /// client's own gates decide: set for every session but one asking for
+    /// full colour. Read by client.html from the /api/sessions/:id fetch.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub h264_no_combine: bool,
     /// Auto-hide the clipboard/files side tabs when idle. Read by
     /// client.html from the /api/sessions/:id fetch; omitted when false.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -343,6 +354,8 @@ pub struct Session {
     /// (#154). Surfaced verbatim in `SessionInfo` so client.html can
     /// trigger fullscreen on first user gesture after CONNECTED.
     pub fullscreen_on_connect: bool,
+    /// Copied from the request's `h264_chroma444`.
+    pub h264_chroma444: Option<bool>,
     /// Copied from the source entry's `autohide_side_tabs` flag.
     /// Surfaced in `SessionInfo` so client.html can auto-hide the
     /// clipboard/files side tabs.
@@ -630,7 +643,33 @@ pub(crate) fn dial_host(ip: std::net::IpAddr) -> String {
     }
 }
 
+/// Whether the browser may combine AVC444's two views: only for full colour.
+fn combines(h264_chroma444: Option<bool>) -> bool {
+    h264_chroma444 == Some(true)
+}
+
+/// See [`Session::aux_drop_setting`].
+fn aux_drop_setting(h264_chroma444: Option<bool>) -> Option<bool> {
+    match h264_chroma444 {
+        Some(true) => Some(false),
+        Some(false) => Some(true),
+        None => None,
+    }
+}
+
 impl Session {
+    /// The setting handed to `crate::h264_aux_drop::AuxDropper::for_session`.
+    ///
+    /// Full colour needs the auxiliary view, so it is never dropped
+    /// (`Some(false)`). An entry at Standard colour drops it as soon as the
+    /// stream proves it can be spared, from the least evidence that can
+    /// answer (`Some(true)`); an ad-hoc session, which no admin has vouched
+    /// for, waits for the corroborated sample (`None`). Either way a stream
+    /// that cannot be proved is left alone, and paints 4:2:0 regardless.
+    fn aux_drop_setting(&self) -> Option<bool> {
+        aux_drop_setting(self.h264_chroma444)
+    }
+
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
             session_id: self.id,
@@ -661,6 +700,7 @@ impl Session {
             thumbnail_url: Some(format!("/api/sessions/{}/thumbnail", self.id)),
             display_scale: self.display_scale,
             fullscreen_on_connect: self.fullscreen_on_connect,
+            h264_no_combine: !combines(self.h264_chroma444),
             autohide_side_tabs: self.autohide_side_tabs,
         }
     }
@@ -1933,6 +1973,7 @@ impl SessionManager {
             share_allowed,
             display_scale: req.display_scale,
             fullscreen_on_connect: req.fullscreen_on_connect.unwrap_or(false),
+            h264_chroma444: req.h264_chroma444,
             autohide_side_tabs: req.autohide_side_tabs.unwrap_or(false),
         };
 
@@ -2396,6 +2437,17 @@ impl SessionManager {
         }
     }
 
+    /// How this session's auxiliary-view drop is set; see
+    /// [`Session::aux_drop_setting`].
+    ///
+    /// Read at WebSocket setup rather than carried on the connection
+    /// parameters: guacd never sees this, since the removal is rustguac's.
+    pub async fn h264_drop_aux(&self, id: Uuid) -> Option<bool> {
+        let sessions = self.sessions.read().await;
+        let session = sessions.get(&id)?;
+        let session = session.lock().await;
+        session.aux_drop_setting()
+    }
     /// Get recording metadata for a session (address_book_entry, max_recordings).
     pub async fn get_recording_meta(&self, id: Uuid) -> Option<(Option<String>, Option<u32>)> {
         let sessions = self.sessions.read().await;
@@ -2904,6 +2956,7 @@ mod tests {
             share_allowed: true,
             display_scale: None,
             fullscreen_on_connect: false,
+            h264_chroma444: None,
             autohide_side_tabs: false,
         }
     }
@@ -3129,6 +3182,28 @@ mod tests {
         assert!(check_allowed_network("10.1.1.1", 22, &cidrs).is_ok());
         assert!(check_allowed_network("192.168.1.1", 22, &cidrs).is_ok());
         assert!(check_allowed_network("172.16.0.1", 22, &cidrs).is_err());
+    }
+
+    /// Only full colour keeps the auxiliary view, and only full colour lets
+    /// the browser combine: Standard paints 4:2:0 whether or not the drop
+    /// gate qualifies the stream, rather than combining where it refuses.
+    #[test]
+    fn colour_setting_maps_onto_drop_and_combine() {
+        assert_eq!(
+            aux_drop_setting(Some(true)),
+            Some(false),
+            "full colour keeps the view"
+        );
+        assert_eq!(
+            aux_drop_setting(Some(false)),
+            Some(true),
+            "entry: least evidence"
+        );
+        assert_eq!(aux_drop_setting(None), None, "ad-hoc: corroborated sample");
+
+        assert!(combines(Some(true)));
+        assert!(!combines(Some(false)));
+        assert!(!combines(None));
     }
 
     /// The fence flag is server-set; a request body must not switch it off.

@@ -268,6 +268,11 @@ async fn handle_ws(
         "Starting proxy"
     );
 
+    // How this session's colour setting maps onto dropping the AVC444
+    // auxiliary view. Read here rather than sent to guacd: the removal
+    // happens in guacd_to_ws.
+    let drop_aux = manager.h264_drop_aux(session_id).await;
+
     // Set up recording file (only for owner connections, and only if recording is enabled)
     let is_recording_enabled = manager.is_recording_enabled(session_id).await;
     let recording_path = manager
@@ -332,6 +337,7 @@ async fn handle_ws(
         cancel,
         session_id,
         binary_blobs,
+        drop_aux,
     )
     .await;
     let elapsed = start.elapsed();
@@ -453,6 +459,7 @@ async fn proxy_ws_guacd(
     cancel: CancellationToken,
     session_id: Uuid,
     binary_blobs: bool,
+    drop_aux: Option<bool>,
 ) -> ProxyOutcome {
     let (guacd_read, guacd_write) = tokio::io::split(guacd);
     let (ws_write, ws_read) = ws.split();
@@ -479,6 +486,7 @@ async fn proxy_ws_guacd(
             sd_flag,
             session_id,
             binary_blobs,
+            drop_aux,
         )
         .await
     });
@@ -543,6 +551,7 @@ async fn guacd_to_ws(
     server_disconnected: Arc<std::sync::atomic::AtomicBool>,
     session_id: Uuid,
     binary_blobs: bool,
+    drop_aux: Option<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = vec![0u8; 65536];
     let mut carry: Vec<u8> = Vec::new();
@@ -565,7 +574,7 @@ async fn guacd_to_ws(
     // The slice-header analysis it gates on lives inside it, so the stream is
     // parsed once rather than twice.
     let mut aux_dropper =
-        crate::h264_aux_drop::AuxDropper::for_session(None).reporting_as(session_id);
+        crate::h264_aux_drop::AuxDropper::for_session(drop_aux).reporting_as(session_id);
 
     // What the browser has last been told about the drop. It cannot infer it:
     // an auxiliary IDR is kept and switches 4:4:4 combining on, after which
