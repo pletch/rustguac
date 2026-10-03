@@ -408,8 +408,13 @@ impl NalProbe {
     /// leaves nothing at all to read. This says which condition is short, with
     /// the counts, so the answer is a measurement rather than a theory about
     /// thresholds.
+    ///
+    /// `None` too for a session that never carried an H.264 picture: there is
+    /// no stream to be undecided about, and "no auxiliary view in 0 pictures"
+    /// on every non-H.264 session is a line that says nothing.
     pub fn undecided_reason(&self, eager: bool) -> Option<String> {
-        if self.stats.safety(eager) != Safety::Undecided {
+        let saw_h264 = self.stats.aus + self.stats.parse_failures > 0;
+        if !saw_h264 || self.stats.safety(eager) != Safety::Undecided {
             return None;
         }
         Some(self.stats.why_undecided(eager))
