@@ -2598,6 +2598,19 @@
                     console.log('[rustguac] tunnel error:',
                                 status && status.message,
                                 'code=' + (status && status.code));
+                // An exception in an instruction handler closes the tunnel
+                // from this end, which the server logs as an ordinary browser
+                // disconnect. Say what threw and where, while the session is
+                // still there to report it against.
+                var ex = tunnel.lastException;
+                if (ex) {
+                    tunnel.lastException = null;
+                    console.error('[rustguac] instruction handler threw; '
+                            + 'closing the tunnel:', ex);
+                    reportDiagnostic('tunnel_exception', 'an exception while '
+                            + 'handling an instruction closed the tunnel: '
+                            + String(ex.stack || ex).replace(/\s*\n\s*/g, ' | '));
+                }
                 if (client.onerror) client.onerror(status || {
                     code: 519,
                     message: 'Connection lost'
