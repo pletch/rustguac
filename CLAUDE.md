@@ -81,6 +81,12 @@ fallback). Implemented on branch `feature/multi-vault-dr` (see project memory).
 
 Optional `[oidc]` section enables OpenID Connect authentication. Key settings: `issuer_url`, `client_id`, `client_secret`, `redirect_uri`. `OIDC_CLIENT_SECRET` env var can override the config value. `groups_claim` (default: "groups") specifies the JWT claim for group memberships. `extra_scopes` requests additional scopes.
 
+If login fails on the callback with "OIDC state cookie mismatch", the callback logs whether the state cookie was absent vs. present-but-different, the cookie names received, and the Host/X-Forwarded-Host/X-Forwarded-Proto headers to help diagnose. One known cause: running the reverse-proxy→rustguac leg over HTTPS (rustguac serving TLS with the proxy doing `tls_insecure_skip_verify`) can drop the auth cookies — serve rustguac over plain HTTP behind the proxy instead (the browser→proxy leg stays HTTPS, so the `Secure` cookies still work).
+
+Provider discovery is **lazy with retry** (`OidcState::client()` in `src/oidc.rs`). `init_oidc` builds the HTTP client (fatal config errors like a bad CA cert here disable SSO) and makes a best-effort eager `discover_async`; if the provider is unreachable at startup the failure is logged as a warning but SSO stays enabled (`OidcEnabled` is `true` as long as `[oidc]` is configured). Metadata is then discovered on the first `/auth/login` (or `/auth/callback`) and cached, so SSO recovers on its own once the provider comes up — no rustguac restart needed. Concurrent cold-start logins share one discovery via a write lock; the OIDC HTTP client has connect/overall timeouts so discovery can't hang.
+
+`/api/auth/status` reports `oidc_available` (provider metadata discovered/cached) separately from `oidc_enabled` (configured). When enabled-but-not-ready it calls `OidcState::warm_in_background()` via `OidcHandle`, which spawns a discovery only if none is already running (a `discovering` flag -- the endpoint is unauthenticated, so polling must not be able to stack discoveries) (the live `Option<OidcState>` shared as an Extension; `OidcState::is_ready()` is the cheap read-lock check). `static/index.html` disables the SSO button with a "temporarily unavailable" notice while `oidc_available` is false and polls `/api/auth/status` every 5s, re-enabling it on recovery — so the login page reflects provider state without a reload. Remember: `index.html` is a branded page served from memory, so this needs a rustguac restart to deploy (see in-memory page caching note).
+
 ### Roles
 
 4-tier role hierarchy: `admin` (4) > `poweruser` (3) > `operator` (2) > `viewer` (1).
@@ -94,6 +100,42 @@ Optional `[oidc]` section enables OpenID Connect authentication. Key settings: `
 - **Bare metal**: `sudo ./install.sh` on Debian 13. Installs to `/opt/rustguac`, creates `rustguac` system user with home dir, sets up systemd services.
 - **Docker**: `docker build -t rustguac .` — multi-stage, debian:trixie-slim runtime.
 - **Remote test machine**: See project memory for connection details. Binary at `/opt/rustguac/bin/rustguac`, config at `/opt/rustguac/config.toml`.
+
+### HTTP caching
+
+Nothing was said about caching until 2026-09-12, which is the worst of the
+options: with no `ETag` and no `Cache-Control` a browser caches heuristically
+and does not revalidate, so a restart kept serving the old page for hours and
+incognito was the only reliable way to see a change.
+
+**HTML revalidates; assets are content-addressed.** The branded pages are built
+once at startup into an in-memory map, so each is hashed there too and served
+with that `ETag` plus `no-cache` -- the revalidate directive, not do-not-store,
+so an unchanged page costs a 304 rather than 136K of `client.html` or 255K of
+`connections.html`. Tags are content-derived, not boot-derived: a restart that
+changes nothing still answers 304.
+
+The same pass rewrites `src="/guac/Client.js"` to `...?v=<8 hex of the file>`
+(`version_assets`), and `asset_cache_control` gives any URL carrying a `v=`
+query a year and `immutable`. That is worth doing because `client.html` reloads
+on every session launch *and relaunch*, and the WAN leg is browser-to-proxy
+HTTP/2 -- so the 37 revalidations are one round trip rather than 37, but it is
+a round trip paid exactly when the link is worst. Only a 2xx or 304 gets the
+long directive; a 404 under a versioned URL is a deployment that has gone
+wrong, and pinning it until next year would outlive its cause.
+
+**The cost is that editing an asset now needs a restart, where a reload used to
+be enough** -- the URL in the HTML and the bytes it names are produced in the
+same startup pass, so a JS edit is invisible until the hash is recomputed.
+`RUSTGUAC_NO_ASSET_VERSIONING=1` turns versioning off for that reason, leaving
+everything revalidating as before. This supersedes the older note that
+`static/guac/*.js` edits need no rebuild: they still need no *rebuild*, but
+they do now need a restart.
+
+Query-string versioning rather than hashed filenames because there is no build
+step to rename anything, and the startup rewrite already existed for branding.
+The old caution about proxies refusing to cache URLs with queries has not been
+true for many years.
 
 ## Build notes
 
@@ -118,6 +160,41 @@ while Video Encode stays at 0%). `AVC444ModePreferred=1` is also required *for
 hardware encoding*, and makes Windows send AVC444 — which is handled: both
 views are forwarded and combined in the browser into full 4:4:4 chroma. Full
 details, including verification commands, in `docs/rdp-h264.md`.
+
+**`hardwareAcceleration: 'prefer-hardware'` reads as a hint and is not one.**
+Chrome reports a configuration carrying it as unsupported outright where no
+hardware decoder exists, rather than falling back, and it fails *after*
+configure() returns -- through the error callback. So a client without one lost
+H.264 altogether and lost it in the worst shape available: the decoder closed,
+every frame was then held for a keyframe that cured nothing, and since guacd
+suppresses ordinary image operations for a layer carrying H.264, the result was
+a permanently black screen rather than a degraded picture.
+
+`ensureDecoder()` asks once and, if refused, builds again without asking, then
+says so as `decoder_software_fallback` -- a session quietly decoding in
+software is the difference between the cost this feature avoids and the cost it
+was built around, and is worth knowing about rather than discovering as
+slowness. Dropping the hint unconditionally is the smaller change and the wrong
+one: it hands the choice to the browser on every client, including the ones
+this path exists for.
+
+Measured on Chrome 153 against an Intel UHD 770 with no VA-API decode exposed:
+`isConfigSupported()` answers supported for the same codec with no hint and
+with `'prefer-software'`, and not supported with `'prefer-hardware'`. Confirmed
+in the field the same day against a real Windows host -- the fallback fired and
+the session ran normally where it would previously have gone black.
+
+**Not exotic, and not only Linux.** Any client whose driver is blocklisted, any
+VM, any browser with acceleration switched off. Worth knowing separately that
+Chrome on Linux may expose *no* decode profiles at all while `chrome://gpu`
+still says "Video Decode: Hardware accelerated" -- that line means only that
+the feature is not blocklisted. The table that answers the question is "Video
+Acceleration Information", which is `gpu.videoDecoding` over CDP, and it was
+empty on that box under every flag combination tried
+(`VaapiVideoDecodeLinuxGL`, `AcceleratedVideoDecodeLinuxGL`,
+`--disable-gpu-sandbox`, `--ignore-gpu-blocklist`) while `vainfo` listed
+`VAProfileH264High : VAEntrypointVLD` from the shell. A Linux Chrome is
+therefore not a machine to measure any of this on.
 
 **Colour range: the samples are full range, and the signalling may not
 survive the browser.** [MS-RDPEGFX Color
@@ -1350,6 +1427,7 @@ The `patches/` directory contains patches applied to guacamole-server before bui
 1. **Autoconf `-Werror` vs deprecated FreeRDP headers** — FreeRDP 3.15 deprecates `codecs_free()`, breaking `-Werror` compile tests and cascading into missing feature macros.
 2. **Deprecated function pointer API** — Replaces `->input->KeyboardEvent()` etc. with `freerdp_input_send_keyboard_event()` safe API.
 3. **NULL deref in display channel** — FreeRDP 3.x fires PubSub events before `guac_rdp_disp` is allocated.
+4. **H.264 passthrough** (`004-h264-passthrough.patch`) — see `docs/rdp-h264.md`.
 
 To add a new patch: edit `../guacamole-server`, export with `git diff > patches/NNN-description.patch`.
 
