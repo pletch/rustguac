@@ -64,6 +64,12 @@ enum Command {
         /// Expiry date in ISO 8601 format (e.g. "2025-12-31T23:59:59Z")
         #[arg(long)]
         expires: Option<String>,
+        /// Only create the admin if no admin account exists yet; otherwise
+        /// do nothing and exit successfully. For first-run provisioning
+        /// (the Docker entrypoint), where whether this is a first run
+        /// depends on the database named by db_path, not on any fixed file.
+        #[arg(long)]
+        if_none: bool,
     },
 
     /// List all admin accounts
@@ -231,7 +237,21 @@ async fn main() {
             name,
             allowed_ips,
             expires,
+            if_none,
         }) => {
+            if if_none {
+                match db::list_admins(&database) {
+                    Ok(admins) if !admins.is_empty() => {
+                        println!("Admin accounts already exist; not creating '{}'.", name);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("Error reading admins: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             cmd_add_admin(&database, &name, allowed_ips.as_deref(), expires.as_deref());
         }
         Some(Command::ListAdmins) => cmd_list_admins(&database),

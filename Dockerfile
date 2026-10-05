@@ -197,15 +197,20 @@ if [ ! -f "$CONFIG_PATH" ]; then
     cp /opt/rustguac/config.toml.default "$CONFIG_PATH"
 fi
 
-# Create admin API key on first run (if no DB exists yet)
-DB_PATH="/opt/rustguac/data/rustguac.db"
-if [ ! -f "$DB_PATH" ]; then
-    echo "First run detected — creating admin API key..."
-    /opt/rustguac/bin/rustguac --config "$CONFIG_PATH" add-admin --name docker-admin
-    echo ""
-    echo "==> SAVE THE API KEY ABOVE — it is only shown once! <=="
-    echo ""
-fi
+# Create an admin API key on first run. rustguac decides what "first run"
+# means: it opens the database named by db_path in the config and creates
+# the admin only if there is none yet. Checking for a database file at a fixed
+# path here broke any config that moved db_path: every restart then tried to
+# create the admin again and failed on the existing one (#240).
+ADMIN_OUT=$(/opt/rustguac/bin/rustguac --config "$CONFIG_PATH" add-admin --name docker-admin --if-none)
+echo "$ADMIN_OUT"
+case "$ADMIN_OUT" in
+    *"API Key:"*)
+        echo ""
+        echo "==> SAVE THE API KEY ABOVE — it is only shown once! <=="
+        echo ""
+        ;;
+esac
 
 # Start guacd in background
 echo "Starting guacd..."
