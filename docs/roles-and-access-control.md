@@ -31,6 +31,12 @@ rustguac add-admin --name ci-bot \
   --expires "2026-12-31T00:00:00Z"
 ```
 
+`--if-none` creates the admin only when no admin account exists yet, and otherwise exits successfully without creating anything. It is meant for first-run provisioning, such as a container entrypoint, and works wherever `db_path` points:
+
+```bash
+rustguac add-admin --name docker-admin --if-none
+```
+
 ### User API tokens
 
 User API tokens authenticate as the OIDC user who owns the token, with an effective role capped by the token's `max_role`. Tokens use the same `Authorization: Bearer <token>` header as admin API keys — rustguac tries admin keys first, then user tokens. See [User API tokens](#user-api-tokens) below for details.

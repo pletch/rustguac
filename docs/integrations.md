@@ -217,6 +217,14 @@ rustguac roles. See [Roles and Access Control](roles-and-access-control.md).
 - **Groups appear as object IDs, not names**: that's the default. Either
   use the object IDs in your group-to-role mappings (stable, recommended)
   or switch the claim to emit `sAMAccountName` in step 3 and use names.
+- **`ID token verification failed` with `Signature verification failed`
+  in the log**: the log line says whether the token's key id
+  (`token_kid`) is among the provider's published keys. If it is not,
+  the usual cause is an app created under **Enterprise applications**
+  rather than **App registrations**: Entra then signs tokens with an
+  app-specific key that the standard key set does not contain. Create
+  the app as in step 1. A restart also rules out a key rotation since
+  rustguac started.
 - **Login succeeds but `default_role` doesn't get applied**: `default_role`
   only fires when no group-to-role mapping matches. Configure mappings on
   the Admin page (or, for a single-user test, set `default_role = "admin"`
