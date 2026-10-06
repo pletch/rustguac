@@ -581,7 +581,7 @@ Update a connection entry. Uses read-modify-write: reads existing entry from Vau
 
 ### `DELETE /api/addressbook/folders/:scope/:folder/entries/:entry` (admin)
 
-Delete a connection entry.
+Delete a connection entry. Returns `404` if there is no such entry.
 
 ### `POST /api/addressbook/folders/:scope/:folder/entries/:entry/move` (admin)
 
@@ -602,6 +602,44 @@ Copy an entry, credentials included, to `target_scope`/`target_folder` under `ne
 ```json
 { "target_scope": "shared", "target_folder": "servers/linux", "new_name": "web01-copy" }
 ```
+
+### `POST /api/addressbook/bulk` (admin)
+
+Move, copy or delete up to 1000 entries in one request. Each entry is handled on its own, with the same rules as the single-entry endpoints above: credentials go with moved and copied entries, an existing entry is never overwritten, and a move removes the original only after the copy is written.
+
+```json
+{
+  "action": "move",
+  "items": [
+    { "scope": "shared", "folder": "imported", "name": "web01" },
+    { "scope": "shared", "folder": "imported", "name": "web02" }
+  ],
+  "target": { "scope": "shared", "folder": "servers/linux" },
+  "on_conflict": "skip"
+}
+```
+
+- `action` is `move`, `copy` or `delete`. `target` is required for `move` and `copy`.
+- `on_conflict` decides what happens when the target already has an entry of the same name: `skip` (default) leaves that entry where it is, `rename` uses the first free `name-2`, `name-3`, and so on. There is no overwrite option.
+
+The response lists what happened to each entry, plus a count per outcome:
+
+```json
+{
+  "results": [
+    { "scope": "shared", "folder": "imported", "name": "web01", "status": "moved" },
+    { "scope": "shared", "folder": "imported", "name": "web02", "status": "skipped",
+      "error": "an entry with that name already exists in the target folder" }
+  ],
+  "summary": { "moved": 1, "skipped": 1 }
+}
+```
+
+`status` is one of `moved`, `copied`, `deleted`, `skipped`, `failed`, or `copied_not_removed` (a move whose copy was written but whose original could not be removed, so the entry is in both folders). A renamed copy also carries `new_name`. Every entry acted on is recorded in the address book audit log.
+
+### `GET /api/addressbook/folder-paths` (admin)
+
+Every folder in both scopes, as `{ "folders": [{ "scope": "shared", "path": "servers/linux" }, ...] }`. Used to choose a target for bulk moves and copies.
 
 ## User API Tokens (self-service)
 

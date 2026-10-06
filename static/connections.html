@@ -117,6 +117,37 @@
         .entries-table tbody tr:last-child td { border-bottom: none; }
         .entries-table td:last-child { text-align: right; white-space: nowrap; }
 
+        /* Bulk selection (admins). */
+        .entries-table .sel-cell { width: 2em; text-align: center; padding-right: 0; }
+        .entries-table .sel-cell input { width: auto; margin: 0; cursor: pointer; }
+        .entries-table tbody tr.selected { background: var(--surface); }
+        #bulk-bar {
+            position: sticky; bottom: 0; z-index: 2;
+            display: none; align-items: center; gap: var(--s-2);
+            margin-top: var(--s-2); padding: var(--s-2) var(--s-3);
+            background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+        }
+        #bulk-bar.active { display: flex; }
+        #bulk-bar .bulk-count { font-weight: bold; margin-right: auto; }
+        .bulk-folder-list {
+            max-height: 40vh; overflow-y: auto; margin-top: var(--s-1);
+            border: 1px solid var(--border); border-radius: var(--radius);
+        }
+        .bulk-folder-list label {
+            display: flex; align-items: center; gap: 0.5em; margin: 0;
+            padding: 0.3em 0.6em; cursor: pointer; text-transform: none; letter-spacing: 0;
+        }
+        .bulk-folder-list label:hover { background: var(--surface); }
+        .bulk-folder-list input { width: auto; margin: 0; }
+        .bulk-folder-list .scope-tag { margin-left: auto; color: var(--text-dim); font-size: var(--fz-sm); }
+        .bulk-folder-list .bulk-current { color: var(--text-dim); }
+        .bulk-preview { margin-top: var(--s-3); font-size: var(--fz-sm); line-height: 1.5; }
+        .bulk-preview .bulk-warn { color: var(--status-pending); }
+        .bulk-conflict label { display: flex; align-items: center; gap: 0.5em; text-transform: none; letter-spacing: 0; cursor: pointer; }
+        .bulk-conflict input { width: auto; margin: 0; }
+        .bulk-results ul { margin: var(--s-2) 0 0 0; padding-left: 1.2em; font-size: var(--fz-sm); max-height: 30vh; overflow-y: auto; }
+        .bulk-results .bulk-bad { color: var(--primary); }
+
         /* Folder action bar */
         .folder-actions {
             display: flex; align-items: center; gap: var(--s-2);
@@ -400,6 +431,13 @@
                 </div>
                 <div id="entries-content">
                     <p class="empty">Select a folder to view entries.</p>
+                </div>
+                <div id="bulk-bar">
+                    <span class="bulk-count" id="bulk-count"></span>
+                    <button class="btn-add" id="bulk-move">Move to&hellip;</button>
+                    <button class="btn-add" id="bulk-copy">Copy to&hellip;</button>
+                    <button class="btn-small" id="bulk-delete">Delete</button>
+                    <button class="btn-small" id="bulk-clear">Clear</button>
                 </div>
             </div>
         </div>
@@ -943,6 +981,29 @@
     </div>
 
     <!-- Share session modal -->
+    <!-- Bulk move / copy / delete -->
+    <div class="modal-overlay" id="bulk-modal">
+        <div class="modal" style="max-width:560px;min-width:380px">
+            <h3 id="bulk-title"></h3>
+            <div id="bulk-pick">
+                <label for="bulk-folder-filter">Target folder</label>
+                <input type="search" id="bulk-folder-filter" placeholder="Filter folders..." autocomplete="off">
+                <div class="bulk-folder-list" id="bulk-folder-list"></div>
+            </div>
+            <div class="bulk-preview" id="bulk-preview"></div>
+            <div class="bulk-conflict" id="bulk-conflict" style="display:none;margin-top:var(--s-2)">
+                <label><input type="radio" name="bulk-conflict" value="skip" checked> Leave those where they are</label>
+                <label><input type="radio" name="bulk-conflict" value="rename"> Give them a new name (name-2, name-3, ...)</label>
+            </div>
+            <div class="bulk-results" id="bulk-results" style="display:none"></div>
+            <div id="bulk-error" style="color:var(--primary);margin-top:0.5em"></div>
+            <div class="modal-actions">
+                <button class="btn-cancel" id="bulk-cancel">Cancel</button>
+                <button class="btn-add" id="bulk-confirm" disabled></button>
+            </div>
+        </div>
+    </div>
+
     <div class="modal-overlay" id="share-modal">
         <div class="modal">
             <h3>Share Session</h3>
@@ -1060,6 +1121,9 @@
         var lastEntriesRender = null; // { entries, scope, folder } — re-render when cred status arrives
         var folderEntryCounts = {}; // "scope|path" -> count
         var folderEntries = {};    // "scope|path" -> entries array
+        var bulkSel = { key: null, names: new Set() }; // bulk selection, per folder
+        var bulkLastIndex = null;  // last checkbox clicked, for shift-click ranges
+        var bulkState = null;      // open bulk dialog: { action, items, source, target, folders }
         var subfolderCache = {};   // "scope|path" -> [FolderInfo] (lazy-loaded children)
         var expandedPaths = {};    // "scope|path" -> true (tree expansion state; persisted)
         var EXPANDED_STORAGE_KEY = 'rustguac_connections_expanded';
@@ -2057,6 +2121,10 @@
         }
 
         function renderSearchResults(matches, query, tokens) {
+            // Selection is per folder; search results are not selectable yet.
+            bulkSel.key = null;
+            bulkSel.names.clear();
+            updateBulkBar();
             var content = document.getElementById('entries-content');
             if (matches.length === 0) {
                 content.innerHTML = '<div class="empty-state" style="padding:2em;margin:1em 0">' +
@@ -2282,8 +2350,10 @@
 
         function renderEntries(entries, scope, folder) {
             lastEntriesRender = { entries: entries, scope: scope, folder: folder };
+            bulkSyncSelection(entries, scope, folder);
             var content = document.getElementById('entries-content');
             if (entries.length === 0) {
+                updateBulkBar();
                 if (isAdmin) {
                     content.innerHTML = '<div class="empty-state" style="padding:2em;margin:1em 0">' +
                         '<p style="color:#888;margin:0 0 1em 0">No entries in this folder.</p>' +
@@ -2298,12 +2368,13 @@
                 return;
             }
 
-            var html = '<table class="entries-table"><thead><tr>' +
-                '<th>Name</th><th>Type</th><th>Host</th><th>User</th><th></th>';
+            var html = '<table class="entries-table"><thead><tr>';
+            if (isAdmin) html += '<th class="sel-cell"><input type="checkbox" id="sel-all" title="Select all"></th>';
+            html += '<th>Name</th><th>Type</th><th>Host</th><th>User</th><th></th>';
             if (isAdmin) html += '<th></th><th></th><th></th>';
             html += '</tr></thead><tbody>';
 
-            entries.forEach(function(e) {
+            entries.forEach(function(e, idx) {
                 var label = e.display_name || e.name;
                 var hostBase = e.session_type === 'web' ? (e.url || '')
                              : e.session_type === 'vdi' ? (e.container_image || '')
@@ -2317,7 +2388,11 @@
                 }
                 var typeCls = 'type-' + e.session_type;
 
-                html += '<tr>';
+                var isSel = isAdmin && bulkSel.names.has(e.name);
+                html += isSel ? '<tr class="selected">' : '<tr>';
+                if (isAdmin) {
+                    html += '<td class="sel-cell"><input type="checkbox" class="sel-entry" data-sel-index="' + idx + '" data-sel-name="' + escapeAttr(e.name) + '"' + (isSel ? ' checked' : '') + ' title="Select"></td>';
+                }
                 var unsetVars = entryUnsetVars(e);
                 var credPill = unsetVars.length > 0
                     ? ' <span title="Set these first: ' + escapeAttr(unsetVars.join(', ')) + '" style="background:var(--status-pending);color:var(--bg);border-radius:8px;padding:0.05em 0.5em;font-size:0.72em;font-weight:bold;white-space:nowrap;vertical-align:middle">credentials needed</span>'
@@ -2346,6 +2421,7 @@
 
             html += '</tbody></table>';
             content.innerHTML = html;
+            updateBulkBar();
         }
 
         function escapeHtml(s) {
@@ -2357,6 +2433,326 @@
         function escapeAttr(s) {
             return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
+
+        // ── Bulk selection: move / copy / delete many entries ───────
+        //
+        // Selection is per folder: changing folder clears it. The work is
+        // done by POST /api/addressbook/bulk, which copies each entry as
+        // stored (credentials included, never overwriting) and reports a
+        // result per entry, so this page only chooses and reports.
+        function bulkSyncSelection(entries, scope, folder) {
+            var key = scope + '|' + folder;
+            if (bulkSel.key !== key) {
+                bulkSel.key = key;
+                bulkSel.names.clear();
+                bulkLastIndex = null;
+                return;
+            }
+            // Same folder re-rendered: drop names that are no longer there.
+            var present = new Set(entries.map(function(e) { return e.name; }));
+            Array.from(bulkSel.names).forEach(function(n) {
+                if (!present.has(n)) bulkSel.names.delete(n);
+            });
+        }
+
+        function updateBulkBar() {
+            var n = bulkSel.names.size;
+            var bar = document.getElementById('bulk-bar');
+            bar.classList.toggle('active', isAdmin && n > 0);
+            document.getElementById('bulk-count').textContent = n + (n === 1 ? ' entry selected' : ' entries selected');
+            var all = document.getElementById('sel-all');
+            if (all) {
+                var boxes = document.querySelectorAll('#entries-content .sel-entry');
+                all.checked = boxes.length > 0 && n === boxes.length;
+                all.indeterminate = n > 0 && n < boxes.length;
+            }
+        }
+
+        function bulkSetBox(box, checked) {
+            box.checked = checked;
+            var name = box.getAttribute('data-sel-name');
+            if (checked) bulkSel.names.add(name); else bulkSel.names.delete(name);
+            var tr = box.closest('tr');
+            if (tr) tr.classList.toggle('selected', checked);
+        }
+
+        document.getElementById('entries-content').addEventListener('click', function(e) {
+            var t = e.target;
+            if (t.id === 'sel-all') {
+                document.querySelectorAll('#entries-content .sel-entry').forEach(function(b) {
+                    bulkSetBox(b, t.checked);
+                });
+                bulkLastIndex = null;
+                updateBulkBar();
+                return;
+            }
+            if (!t.classList || !t.classList.contains('sel-entry')) return;
+            var idx = parseInt(t.getAttribute('data-sel-index'), 10);
+            if (e.shiftKey && bulkLastIndex !== null) {
+                // Range: everything between the last click and this one takes
+                // this box's new state.
+                var lo = Math.min(bulkLastIndex, idx), hi = Math.max(bulkLastIndex, idx);
+                document.querySelectorAll('#entries-content .sel-entry').forEach(function(b) {
+                    var i = parseInt(b.getAttribute('data-sel-index'), 10);
+                    if (i >= lo && i <= hi) bulkSetBox(b, t.checked);
+                });
+            } else {
+                bulkSetBox(t, t.checked);
+            }
+            bulkLastIndex = idx;
+            updateBulkBar();
+        });
+
+        document.getElementById('bulk-clear').addEventListener('click', function() {
+            bulkSel.names.clear();
+            document.querySelectorAll('#entries-content .sel-entry').forEach(function(b) { bulkSetBox(b, false); });
+            bulkLastIndex = null;
+            updateBulkBar();
+        });
+        document.getElementById('bulk-move').addEventListener('click', function() { openBulk('move'); });
+        document.getElementById('bulk-copy').addEventListener('click', function() { openBulk('copy'); });
+        document.getElementById('bulk-delete').addEventListener('click', function() { openBulk('delete'); });
+
+        function bulkNoun(n) { return n + (n === 1 ? ' entry' : ' entries'); }
+
+        function bulkNameList(names, max) {
+            var shown = names.slice(0, max).join(', ');
+            return names.length > max ? shown + ' and ' + (names.length - max) + ' more' : shown;
+        }
+
+        function openBulk(action) {
+            if (!selectedFolder || bulkSel.names.size === 0) return;
+            var source = { scope: selectedFolder.scope, folder: folderPath(selectedFolder) };
+            var names = Array.from(bulkSel.names).sort();
+            bulkState = {
+                action: action,
+                source: source,
+                items: names.map(function(n) { return { scope: source.scope, folder: source.folder, name: n }; }),
+                target: null,
+                folders: null
+            };
+            var verb = { move: 'Move', copy: 'Copy', 'delete': 'Delete' }[action];
+            document.getElementById('bulk-title').textContent = verb + ' ' + bulkNoun(names.length);
+            document.getElementById('bulk-error').textContent = '';
+            document.getElementById('bulk-results').style.display = 'none';
+            document.getElementById('bulk-conflict').style.display = 'none';
+            document.querySelector('input[name="bulk-conflict"][value="skip"]').checked = true;
+            var confirmBtn = document.getElementById('bulk-confirm');
+            confirmBtn.style.display = '';
+            confirmBtn.textContent = verb;
+            document.getElementById('bulk-cancel').textContent = 'Cancel';
+            var preview = document.getElementById('bulk-preview');
+
+            if (action === 'delete') {
+                document.getElementById('bulk-pick').style.display = 'none';
+                preview.innerHTML = '';
+                var p = document.createElement('p');
+                p.textContent = 'Permanently delete ' + bulkNoun(names.length) + ' from ' + source.folder + ': ' + bulkNameList(names, 15) + '.';
+                preview.appendChild(p);
+                var w = document.createElement('p');
+                w.className = 'bulk-warn';
+                w.textContent = 'Their stored credentials are deleted with them. This cannot be undone.';
+                preview.appendChild(w);
+                confirmBtn.disabled = false;
+            } else {
+                document.getElementById('bulk-pick').style.display = '';
+                document.getElementById('bulk-folder-filter').value = '';
+                preview.textContent = '';
+                confirmBtn.disabled = true;
+                var list = document.getElementById('bulk-folder-list');
+                list.innerHTML = '<p class="empty" style="padding:0.5em">Loading folders...</p>';
+                fetch('/api/addressbook/folder-paths', { headers: apiHeaders(), credentials: 'same-origin' })
+                    .then(function(res) {
+                        if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
+                        return res.json();
+                    })
+                    .then(function(data) {
+                        if (!bulkState) return;
+                        bulkState.folders = data.folders || [];
+                        renderBulkFolders();
+                    })
+                    .catch(function(err) {
+                        list.innerHTML = '';
+                        document.getElementById('bulk-error').textContent = 'Could not load folders: ' + err.message;
+                    });
+            }
+            document.getElementById('bulk-modal').classList.add('active');
+        }
+
+        function renderBulkFolders() {
+            var list = document.getElementById('bulk-folder-list');
+            var q = document.getElementById('bulk-folder-filter').value.trim().toLowerCase();
+            list.innerHTML = '';
+            var shown = 0;
+            bulkState.folders.forEach(function(f, i) {
+                if (q && f.path.toLowerCase().indexOf(q) < 0) return;
+                var isSource = f.scope === bulkState.source.scope && f.path === bulkState.source.folder;
+                // Moving into the folder it is already in does nothing.
+                if (isSource && bulkState.action === 'move') return;
+                var label = document.createElement('label');
+                var radio = document.createElement('input');
+                radio.type = 'radio';
+                radio.name = 'bulk-target';
+                radio.value = String(i);
+                if (bulkState.target === f) radio.checked = true;
+                radio.addEventListener('change', function() { chooseBulkTarget(f); });
+                label.appendChild(radio);
+                var name = document.createElement('span');
+                name.textContent = f.path;
+                if (isSource) name.className = 'bulk-current';
+                label.appendChild(name);
+                var tag = document.createElement('span');
+                tag.className = 'scope-tag';
+                tag.textContent = (isSource ? 'this folder, ' : '') + f.scope;
+                label.appendChild(tag);
+                list.appendChild(label);
+                shown++;
+            });
+            if (shown === 0) list.innerHTML = '<p class="empty" style="padding:0.5em">No matching folders.</p>';
+        }
+        document.getElementById('bulk-folder-filter').addEventListener('input', function() {
+            if (bulkState && bulkState.folders) renderBulkFolders();
+        });
+
+        function chooseBulkTarget(f) {
+            bulkState.target = f;
+            var confirmBtn = document.getElementById('bulk-confirm');
+            confirmBtn.disabled = true;
+            var preview = document.getElementById('bulk-preview');
+            preview.textContent = 'Checking ' + f.path + '...';
+            var base = '/api/addressbook/folders/';
+            var get = function(url) {
+                return fetch(url, { headers: apiHeaders(), credentials: 'same-origin' }).then(function(res) {
+                    if (res.status === 404) return null;
+                    if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
+                    return res.json();
+                });
+            };
+            Promise.all([
+                get(base + encodeURIComponent(f.scope) + '/' + encodeURIComponent(f.path) + '/entries'),
+                get(base + encodeURIComponent(f.scope) + '/' + encodeURIComponent(f.path) + '/config'),
+                get(base + encodeURIComponent(bulkState.source.scope) + '/' + encodeURIComponent(bulkState.source.folder) + '/config')
+            ]).then(function(r) {
+                if (!bulkState || bulkState.target !== f) return; // a later choice won
+                var existing = new Set((r[0] || []).map(function(e) { return e.name; }));
+                var clashes = bulkState.items.filter(function(i) { return existing.has(i.name); }).map(function(i) { return i.name; });
+                var verb = bulkState.action === 'move' ? 'moved' : 'copied';
+                preview.innerHTML = '';
+                var p = document.createElement('p');
+                p.textContent = bulkNoun(bulkState.items.length) + ' will be ' + verb + ' to ' + f.path + ' (' + f.scope + '). Stored credentials go with them.';
+                preview.appendChild(p);
+                if (clashes.length) {
+                    var c = document.createElement('p');
+                    c.className = 'bulk-warn';
+                    c.textContent = clashes.length + ' already ' + (clashes.length === 1 ? 'exists' : 'exist') + ' there: ' + bulkNameList(clashes, 10) + '. Existing entries are never overwritten.';
+                    preview.appendChild(c);
+                }
+                document.getElementById('bulk-conflict').style.display = clashes.length ? '' : 'none';
+                if (f.scope !== bulkState.source.scope) {
+                    var s = document.createElement('p');
+                    s.className = 'bulk-warn';
+                    s.textContent = 'This crosses from ' + bulkState.source.scope + ' to ' + f.scope + ', which changes which rustguac instances can see these entries.';
+                    preview.appendChild(s);
+                }
+                var srcGroups = ((r[2] && r[2].allowed_groups) || []).slice().sort().join(', ');
+                var dstGroups = ((r[1] && r[1].allowed_groups) || []).slice().sort().join(', ');
+                if (srcGroups !== dstGroups) {
+                    var g = document.createElement('p');
+                    g.className = 'bulk-warn';
+                    g.textContent = 'The target folder has different access groups (here: ' + (srcGroups || 'none') + '; there: ' + (dstGroups || 'none') + '), so who can see and connect to these entries will change.';
+                    preview.appendChild(g);
+                }
+                confirmBtn.disabled = false;
+            }).catch(function(err) {
+                preview.textContent = '';
+                document.getElementById('bulk-error').textContent = 'Could not check the target folder: ' + err.message;
+            });
+        }
+
+        document.getElementById('bulk-confirm').addEventListener('click', function() {
+            if (!bulkState) return;
+            var confirmBtn = this;
+            var body = { action: bulkState.action, items: bulkState.items };
+            if (bulkState.action !== 'delete') {
+                if (!bulkState.target) return;
+                body.target = { scope: bulkState.target.scope, folder: bulkState.target.path };
+                body.on_conflict = document.querySelector('input[name="bulk-conflict"]:checked').value;
+            }
+            confirmBtn.disabled = true;
+            confirmBtn.textContent = 'Working...';
+            document.getElementById('bulk-error').textContent = '';
+            fetch('/api/addressbook/bulk', {
+                method: 'POST',
+                headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                credentials: 'same-origin',
+                body: JSON.stringify(body)
+            })
+            .then(function(res) {
+                if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
+                return res.json();
+            })
+            .then(function(data) { showBulkResults(data); })
+            .catch(function(err) {
+                document.getElementById('bulk-error').textContent = err.message;
+                confirmBtn.disabled = false;
+                confirmBtn.textContent = 'Retry';
+            });
+        });
+
+        function showBulkResults(data) {
+            var labels = {
+                moved: 'moved', copied: 'copied', deleted: 'deleted', skipped: 'skipped',
+                failed: 'failed', copied_not_removed: 'copied but not removed from here'
+            };
+            var counts = data.summary || {};
+            var parts = Object.keys(counts).map(function(k) { return counts[k] + ' ' + (labels[k] || k); });
+            var box = document.getElementById('bulk-results');
+            box.innerHTML = '';
+            var p = document.createElement('p');
+            p.textContent = parts.join(', ') + '.';
+            box.appendChild(p);
+            var notable = (data.results || []).filter(function(r) {
+                var plain = r.status === 'moved' || r.status === 'copied' || r.status === 'deleted';
+                return !plain || !!r.new_name;
+            });
+            if (notable.length) {
+                var ul = document.createElement('ul');
+                notable.forEach(function(r) {
+                    var li = document.createElement('li');
+                    var bad = r.status === 'failed' || r.status === 'copied_not_removed';
+                    if (bad) li.className = 'bulk-bad';
+                    li.textContent = r.name + ': ' + (r.new_name ? 'saved as ' + r.new_name : (r.error || labels[r.status] || r.status));
+                    ul.appendChild(li);
+                });
+                box.appendChild(ul);
+            }
+            box.style.display = '';
+            document.getElementById('bulk-pick').style.display = 'none';
+            document.getElementById('bulk-conflict').style.display = 'none';
+            document.getElementById('bulk-preview').innerHTML = '';
+            document.getElementById('bulk-confirm').style.display = 'none';
+            document.getElementById('bulk-cancel').textContent = 'Close';
+            bulkState.done = true;
+        }
+
+        function closeBulk() {
+            var st = bulkState;
+            bulkState = null;
+            document.getElementById('bulk-modal').classList.remove('active');
+            if (!st || !st.done) return;
+            // Refresh what changed: the source always, the target if cached.
+            bulkSel.names.clear();
+            if (st.target) {
+                var tk = folderKey(st.target.scope, st.target.path);
+                delete folderEntries[tk];
+                delete folderEntryCounts[tk];
+            }
+            loadEntries(st.source.scope, st.source.folder, true);
+        }
+        document.getElementById('bulk-cancel').addEventListener('click', closeBulk);
+        document.getElementById('bulk-modal').addEventListener('click', function(ev) {
+            if (ev.target === this) closeBulk();
+        });
 
         // Connect to an entry (with optional credential prompt)
         var pendingConnect = null; // { scope, folder, name, btn }

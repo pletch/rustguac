@@ -3640,6 +3640,373 @@ pub async fn ab_move_entry(
     (StatusCode::OK, Json(json!({"ok": true}))).into_response()
 }
 
+/// Most entries one bulk request may name.
+const BULK_MAX_ITEMS: usize = 1000;
+/// Entries processed at once within a bulk request.
+const BULK_CONCURRENCY: usize = 8;
+/// Highest suffix tried when renaming around a clash (`name-2` .. `name-N`).
+const BULK_MAX_RENAME: u32 = 99;
+
+#[derive(Deserialize, Clone, PartialEq, Eq, Hash)]
+pub struct BulkItem {
+    pub scope: String,
+    pub folder: String,
+    pub name: String,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct BulkTarget {
+    pub scope: String,
+    pub folder: String,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum BulkAction {
+    Move,
+    Copy,
+    Delete,
+}
+
+/// What to do when the target already has an entry of the same name.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum OnConflict {
+    /// Leave that entry where it is and report it as skipped.
+    #[default]
+    Skip,
+    /// Use the first free `name-2`, `name-3`, ... instead.
+    Rename,
+}
+
+#[derive(Deserialize)]
+pub struct BulkRequest {
+    pub action: BulkAction,
+    pub items: Vec<BulkItem>,
+    #[serde(default)]
+    pub target: Option<BulkTarget>,
+    #[serde(default)]
+    pub on_conflict: OnConflict,
+}
+
+/// Names to try for an entry copied around a clash: the name itself, then
+/// `name-2` .. `name-99`, trimming the base so every candidate stays within
+/// Vault's 64-character name limit.
+fn rename_candidates(name: &str, rename: bool) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    if rename {
+        for n in 2..=BULK_MAX_RENAME {
+            let suffix = format!("-{n}");
+            let keep = 64usize.saturating_sub(suffix.len()).min(name.len());
+            // Names are validated ASCII, so a byte cut is a char boundary.
+            out.push(format!("{}{}", &name[..keep], suffix));
+        }
+    }
+    out
+}
+
+/// Copy a stored entry, secrets included, into the target folder under the
+/// first free name allowed by `on_conflict`. Returns the name used, or
+/// `None` when the name was taken and the policy is to skip.
+async fn copy_entry_into(
+    vault: &VaultState,
+    item: &BulkItem,
+    target: &BulkTarget,
+    on_conflict: OnConflict,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let full = vault
+        .get_entry(&item.scope, &item.folder, &item.name)
+        .await
+        .map_err(ab_vault_error)?;
+    for candidate in rename_candidates(&item.name, on_conflict == OnConflict::Rename) {
+        // Vault refuses the write if anything exists there, so a clash is
+        // detected atomically and nothing is ever overwritten.
+        match vault
+            .put_entry_if_absent(&target.scope, &target.folder, &candidate, &full)
+            .await
+        {
+            Ok(true) => return Ok(Some(candidate)),
+            Ok(false) => continue,
+            Err(e) => return Err(ab_vault_error(e)),
+        }
+    }
+    if on_conflict == OnConflict::Rename {
+        Err((
+            StatusCode::CONFLICT,
+            "no free name found for the copy".into(),
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+/// One entry of a bulk request, handled on its own so a failure never
+/// affects the others. Audits what it did.
+async fn bulk_one(
+    vault: &VaultState,
+    database: &Db,
+    admin_email: &str,
+    ip: &str,
+    req: &BulkRequest,
+    item: &BulkItem,
+) -> serde_json::Value {
+    let mut result = json!({
+        "scope": item.scope,
+        "folder": item.folder,
+        "name": item.name,
+    });
+    let set = |r: &mut serde_json::Value, k: &str, v: serde_json::Value| {
+        r[k] = v;
+    };
+
+    if req.action == BulkAction::Delete {
+        // Vault reports success for deleting a path that does not exist, so
+        // look first: otherwise a missing entry would be reported (and
+        // audited) as deleted.
+        if let Err(e) = vault.get_entry(&item.scope, &item.folder, &item.name).await {
+            let (_, msg) = ab_vault_error(e);
+            set(&mut result, "status", json!("failed"));
+            set(&mut result, "error", json!(msg));
+            return result;
+        }
+        match vault
+            .delete_entry(&item.scope, &item.folder, &item.name)
+            .await
+        {
+            Ok(()) => {
+                log_ab_event(
+                    database,
+                    admin_email,
+                    "delete_entry",
+                    &item.scope,
+                    &item.folder,
+                    Some(&item.name),
+                    ip,
+                    Some(r#"{"bulk":true}"#),
+                )
+                .await;
+                set(&mut result, "status", json!("deleted"));
+            }
+            Err(e) => {
+                let (_, msg) = ab_vault_error(e);
+                set(&mut result, "status", json!("failed"));
+                set(&mut result, "error", json!(msg));
+            }
+        }
+        return result;
+    }
+
+    // Move and copy both have a target (checked by the caller).
+    let target = req.target.as_ref().expect("target checked");
+    if req.action == BulkAction::Move && item.scope == target.scope && item.folder == target.folder
+    {
+        set(&mut result, "status", json!("skipped"));
+        set(&mut result, "error", json!("already in that folder"));
+        return result;
+    }
+
+    let used = match copy_entry_into(vault, item, target, req.on_conflict).await {
+        Ok(Some(name)) => name,
+        Ok(None) => {
+            set(&mut result, "status", json!("skipped"));
+            set(
+                &mut result,
+                "error",
+                json!("an entry with that name already exists in the target folder"),
+            );
+            return result;
+        }
+        Err((_, msg)) => {
+            set(&mut result, "status", json!("failed"));
+            set(&mut result, "error", json!(msg));
+            return result;
+        }
+    };
+    if used != item.name {
+        set(&mut result, "new_name", json!(used));
+    }
+    let details = json!({
+        "bulk": true,
+        "to_scope": target.scope,
+        "to_folder": target.folder,
+        "to_name": used,
+    })
+    .to_string();
+
+    if req.action == BulkAction::Copy {
+        log_ab_event(
+            database,
+            admin_email,
+            "copy_entry",
+            &item.scope,
+            &item.folder,
+            Some(&item.name),
+            ip,
+            Some(&details),
+        )
+        .await;
+        set(&mut result, "status", json!("copied"));
+        return result;
+    }
+
+    // Move: the copy is in place, so a failed removal leaves the entry in
+    // both folders, never in neither. Report that distinctly.
+    match vault
+        .delete_entry(&item.scope, &item.folder, &item.name)
+        .await
+    {
+        Ok(()) => {
+            log_ab_event(
+                database,
+                admin_email,
+                "move_entry",
+                &item.scope,
+                &item.folder,
+                Some(&item.name),
+                ip,
+                Some(&details),
+            )
+            .await;
+            set(&mut result, "status", json!("moved"));
+        }
+        Err(e) => {
+            log_ab_event(
+                database,
+                admin_email,
+                "move_entry_incomplete",
+                &item.scope,
+                &item.folder,
+                Some(&item.name),
+                ip,
+                Some(&details),
+            )
+            .await;
+            set(&mut result, "status", json!("copied_not_removed"));
+            set(
+                &mut result,
+                "error",
+                json!(format!(
+                    "copied, but the original could not be removed: {}",
+                    ab_vault_error(e).1
+                )),
+            );
+        }
+    }
+    result
+}
+
+/// POST /api/addressbook/bulk
+///
+/// Move, copy or delete many entries in one request. Each entry is handled
+/// on its own, through the same stored-entry copy as the single-entry
+/// endpoints (credentials included, never overwriting), and the response
+/// reports what happened to each. Admin only. See `copy_stored_entry` for
+/// the rule any future per-folder delegation must follow.
+pub async fn ab_bulk(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+    identity: Option<Extension<AuthIdentity>>,
+    trusted: Option<Extension<TrustedProxies>>,
+    Extension(database): Extension<Db>,
+    Extension(vault): Extension<VaultState>,
+    Json(req): Json<BulkRequest>,
+) -> impl IntoResponse {
+    use futures_util::StreamExt;
+
+    let admin_email = match require_ab_admin(&identity) {
+        Ok(e) => e,
+        Err((status, msg)) => return ab_error(status, msg),
+    };
+    if req.items.is_empty() {
+        return ab_error(StatusCode::BAD_REQUEST, "no entries given");
+    }
+    if req.items.len() > BULK_MAX_ITEMS {
+        return ab_error(
+            StatusCode::BAD_REQUEST,
+            format!("at most {BULK_MAX_ITEMS} entries per request"),
+        );
+    }
+    if req.action != BulkAction::Delete && req.target.is_none() {
+        return ab_error(StatusCode::BAD_REQUEST, "move and copy need a target");
+    }
+
+    // The same entry named twice would race itself (a move whose source is
+    // gone by the second pass), so act on each once.
+    let mut seen = std::collections::HashSet::new();
+    let items: Vec<BulkItem> = req
+        .items
+        .iter()
+        .filter(|i| seen.insert((*i).clone()))
+        .cloned()
+        .collect();
+
+    let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
+    // Each future owns what it uses: borrowing into a buffered stream does
+    // not satisfy the handler's Send bound.
+    let req = Arc::new(req);
+    let results: Vec<serde_json::Value> = futures_util::stream::iter(items)
+        .map(|item| {
+            let (vault, database, admin_email, ip, req) = (
+                vault.clone(),
+                database.clone(),
+                admin_email.clone(),
+                ip.clone(),
+                req.clone(),
+            );
+            async move { bulk_one(&vault, &database, &admin_email, &ip, &req, &item).await }
+        })
+        .buffered(BULK_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut summary = std::collections::BTreeMap::<String, usize>::new();
+    for r in &results {
+        if let Some(s) = r["status"].as_str() {
+            *summary.entry(s.to_string()).or_default() += 1;
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "results": results, "summary": summary })),
+    )
+        .into_response()
+}
+
+/// GET /api/addressbook/folder-paths
+///
+/// Every folder in both scopes, for the bulk move/copy picker. Admin only,
+/// as it is only used to choose where entries go. The tree view loads
+/// subfolders lazily, so it cannot supply this itself.
+pub async fn ab_folder_paths(
+    identity: Option<Extension<AuthIdentity>>,
+    Extension(vault): Extension<VaultState>,
+) -> impl IntoResponse {
+    if let Err((status, msg)) = require_ab_admin(&identity) {
+        return ab_error(status, msg);
+    }
+    let (top, unavailable) = match vault.list_all_folders().await {
+        Ok(t) => t,
+        Err(e) => return ab_error(StatusCode::BAD_GATEWAY, e.to_string()),
+    };
+    let mut queue: Vec<(String, String)> = top
+        .into_iter()
+        .map(|f| (f.scope, f.path.unwrap_or(f.name)))
+        .collect();
+    let mut folders = Vec::new();
+    while let Some((scope, path)) = queue.pop() {
+        if let Ok(subs) = vault.list_subfolders(&scope, &path).await {
+            for s in subs {
+                queue.push((scope.clone(), s.path.unwrap_or_else(|| s.name.clone())));
+            }
+        }
+        folders.push(json!({ "scope": scope, "path": path }));
+    }
+    folders.sort_by(|a, b| {
+        (a["scope"].as_str(), a["path"].as_str()).cmp(&(b["scope"].as_str(), b["path"].as_str()))
+    });
+    Json(json!({ "folders": folders, "unavailable": unavailable })).into_response()
+}
+
 /// POST /api/addressbook/folders/:scope/:folder/entries/:entry/copy
 ///
 /// Copies an entry with everything stored in it, under `new_name` in the
@@ -3718,6 +4085,26 @@ pub async fn ab_delete_entry(
                 .into_response()
         }
     };
+
+    // Vault reports success for deleting a path that does not exist, so
+    // look first rather than answer (and audit) a delete of nothing.
+    match vault.get_entry(&scope, &folder, &entry).await {
+        Ok(_) => {}
+        Err(VaultError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "entry not found"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response()
+        }
+    }
 
     match vault.delete_entry(&scope, &folder, &entry).await {
         Ok(()) => {
@@ -5715,5 +6102,52 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = super::ab_vault_error(VaultError::NotFound);
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn rename_candidates_skip_policy_is_just_the_name() {
+        assert_eq!(super::rename_candidates("web01", false), vec!["web01"]);
+    }
+
+    #[test]
+    fn rename_candidates_suffix_and_stay_within_name_limit() {
+        let c = super::rename_candidates("web01", true);
+        assert_eq!(c[0], "web01");
+        assert_eq!(c[1], "web01-2");
+        assert_eq!(c.last().unwrap(), "web01-99");
+        let long = "a".repeat(64);
+        for cand in super::rename_candidates(&long, true) {
+            assert!(cand.len() <= 64, "{cand}");
+        }
+        assert_eq!(
+            super::rename_candidates(&long, true)[1],
+            format!("{}-2", "a".repeat(62))
+        );
+    }
+
+    #[test]
+    fn bulk_request_defaults_to_skip_and_rejects_unknown_actions() {
+        let req: super::BulkRequest = serde_json::from_value(json!({
+            "action": "move",
+            "items": [{"scope": "shared", "folder": "a", "name": "x"}],
+            "target": {"scope": "shared", "folder": "b"},
+        }))
+        .unwrap();
+        assert_eq!(req.action, super::BulkAction::Move);
+        assert_eq!(req.on_conflict, super::OnConflict::Skip);
+        assert!(serde_json::from_value::<super::BulkRequest>(json!({
+            "action": "chmod",
+            "items": [],
+        }))
+        .is_err());
+        assert!(
+            serde_json::from_value::<super::BulkRequest>(json!({
+                "action": "copy",
+                "items": [],
+                "on_conflict": "overwrite",
+            }))
+            .is_err(),
+            "there is no overwrite policy"
+        );
     }
 }

@@ -1254,6 +1254,14 @@ async fn run_server(config: Config, database: Db) {
         .route("/api/addressbook/search-index", get(api::ab_search_index))
         .route("/api/addressbook/folders", get(api::ab_list_folders))
         .route("/api/addressbook/folders", post(api::ab_create_folder))
+        .route("/api/addressbook/folder-paths", get(api::ab_folder_paths))
+        // Up to 1000 entries is ~100KB of JSON, over the global 64KB body
+        // cap. Raised for this route alone; it is admin-only and the auth
+        // middleware rejects a request before its body is read.
+        .route(
+            "/api/addressbook/bulk",
+            post(api::ab_bulk).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
         .route(
             "/api/addressbook/folders/{scope}/{folder}",
             put(api::ab_update_folder),
