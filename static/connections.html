@@ -147,6 +147,8 @@
         .bulk-conflict input { width: auto; margin: 0; }
         .bulk-results ul { margin: var(--s-2) 0 0 0; padding-left: 1.2em; font-size: var(--fz-sm); max-height: 30vh; overflow-y: auto; }
         .bulk-results .bulk-bad { color: var(--primary); }
+        #bulk-confirm.bulk-danger { color: var(--status-error); border-color: var(--status-error); }
+        #bulk-confirm.bulk-danger:hover:not(:disabled) { color: var(--bg); background: var(--status-error); }
 
         /* Folder action bar */
         .folder-actions {
@@ -2540,6 +2542,7 @@
             var confirmBtn = document.getElementById('bulk-confirm');
             confirmBtn.style.display = '';
             confirmBtn.textContent = verb;
+            confirmBtn.classList.toggle('bulk-danger', action === 'delete');
             document.getElementById('bulk-cancel').textContent = 'Cancel';
             var preview = document.getElementById('bulk-preview');
 
