@@ -229,7 +229,15 @@ The `jump_hosts` array defines an ordered chain of SSH bastion hops. Each hop co
 | `height` | integer | All | Display height in pixels |
 | `dpi` | integer | All | Display DPI |
 | `banner` | string | All | Banner message shown before session starts |
+| `ssh_font_size` | integer | SSH | Terminal font size in points (default 12, 6 to 72) |
+| `wol_send_packet` | boolean | SSH, RDP, VNC | Send a Wake-on-LAN magic packet before connecting |
+| `wol_mac_addr` | string | SSH, RDP, VNC | MAC address to wake (required with `wol_send_packet`) |
+| `wol_broadcast_addr` | string | SSH, RDP, VNC | Broadcast address for the packet (guacd default `255.255.255.255`) |
+| `wol_udp_port` | integer | SSH, RDP, VNC | UDP port for the packet (guacd default 9) |
+| `wol_wait_time` | integer | SSH, RDP, VNC | Seconds to wait for the host to boot before connecting (at most 600) |
 | `owner` | string | All | Create the session on behalf of this user (their login email). Admin callers only, see [Creating a session for someone else](#creating-a-session-for-someone-else) |
+
+Wake-on-LAN settings are ignored on sessions created by non-admin users; set them on a connection entry instead.
 
 **SPICE fields** (`session_type: spice`, direct connection to a SPICE server):
 
