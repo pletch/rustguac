@@ -131,24 +131,38 @@ Operators can view their tokens (created by an admin on their behalf) but cannot
 
 ## Folder access control
 
-Connections folders have group-based access control. Each folder has an `allowed_groups` list stored in its `.config` entry in Vault.
+Each Connections folder decides who can see it, in its `.config` entry in Vault:
 
-- **Admins** bypass group checks and see all folders
-- **Operators and powerusers** see only folders where their OIDC groups intersect with the folder's `allowed_groups`
-- If `allowed_groups` is empty, all authenticated users can see the folder
+- `allowed_groups`: OIDC groups that can see the folder.
+- `allowed_users`: individual users who can see the folder, by login email (compared without regard to case). A user does not need to have logged in before being listed: access is checked from their identity when they use rustguac.
+
+A user can see a folder if any of their groups is in `allowed_groups` **or** their email is in `allowed_users`.
+
+- **Admins** bypass these checks and see all folders.
+- **Operators and powerusers** see only folders that grant them access.
+- If both lists are empty, the folder is **admin-only**.
 - Folders the user cannot access are **hidden** from the tree, not shown-then-denied. This applies at every level, including subfolders.
-- A folder the user cannot access directly is still shown if they can access one of its descendants, so a deeper grant is never orphaned out of the tree. Access of a child can be granted independently of its parent (see Inheritance below).
+- A folder the user cannot access is still shown if it leads to a subfolder they can, so a deeper grant is never orphaned out of the tree. Its own entries stay hidden; the user opens the subfolder. For example, a folder `users/jsmith` shared with `jsmith@example.com` shows `users` in jsmith's tree even if `users` itself is admin-only.
+- The list of allowed users is only shown to admins. A user who can open a folder does not see who else can.
+
+Because folder settings live in Vault, they apply on every rustguac instance sharing that Vault.
 
 ### Inheritance
 
-A subfolder created with `inherit_from_parent: true` (the default for new subfolders) grants access to anyone who can access its parent. A subfolder with its own non-empty `allowed_groups` and `inherit_from_parent: false` is gated solely by its own list, independent of the parent.
+A subfolder created with `inherit_from_parent: true` (the default for new subfolders) grants access to anyone who can access its parent. A subfolder with `inherit_from_parent: false` is gated solely by its own `allowed_groups` and `allowed_users`, independent of the parent.
 
-### Example
+### Examples
 
 A folder with `allowed_groups: ["engineering", "devops"]`:
 - A user with OIDC groups `["engineering", "marketing"]` **can** access it (engineering matches)
 - A user with OIDC groups `["marketing", "sales"]` **cannot** access it (no match)
 - An admin **can** always access it regardless of groups
+
+A folder per user, for example a personal VM:
+```json
+{ "allowed_groups": [], "allowed_users": ["jsmith@example.com"] }
+```
+Only jsmith (and admins) can see it. Create it with `POST /api/addressbook/folders`, add the VM as an entry, and jsmith finds it in Connections on their first login.
 
 ## Group-to-role mappings
 

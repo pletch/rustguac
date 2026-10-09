@@ -467,7 +467,10 @@
                     <button type="button" class="btn-add" id="fm-groups-add">Add</button>
                 </div>
             </div>
-            <div class="field-hint">OIDC groups that can see this folder. Leave empty for admin-only access. Type to filter known groups or enter a custom one; Enter or Add to attach; &times; on a chip to remove.</div>
+            <div class="field-hint">OIDC groups that can see this folder. Type to filter known groups or enter a custom one; Enter or Add to attach; &times; on a chip to remove.</div>
+            <label for="fm-users">Allowed users</label>
+            <textarea id="fm-users" rows="3" placeholder="jsmith@example.com" spellcheck="false" autocomplete="off"></textarea>
+            <div class="field-hint">Individual users who can see this folder, by login email, one per line. They don't need to have logged in yet. Leave both lists empty for admin-only access.</div>
             <label style="display:flex;align-items:center;gap:0.5em;cursor:pointer">
                 <input type="checkbox" id="fm-inherit" style="width:auto">
                 Inherit permissions from parent folder
@@ -1747,6 +1750,10 @@
                 folderEntryCounts = {};
                 allFolders.forEach(function(f) {
                     var key = folderKey(f.scope, f.path || f.name);
+                    // A path-only folder is listed because something below it
+                    // is shared with you; its own entries are not. Leave it
+                    // uncached so opening it asks the server, which says so.
+                    if (f.path_only) return;
                     folderEntries[key] = f.entries || [];
                     folderEntryCounts[key] = (f.entries || []).length;
                 });
@@ -2257,10 +2264,21 @@
                 credentials: 'same-origin'
             })
             .then(function(res) {
+                // A folder can be in the tree only because something below
+                // it is shared with you; its own entries are not. Say so
+                // rather than showing the raw refusal.
+                if (res.status === 403) return null;
                 if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
                 return res.json();
             })
             .then(function(entries) {
+                if (entries === null) {
+                    currentEntries = [];
+                    bulkSyncSelection([], scope, folderPath);
+                    updateBulkBar();
+                    content.innerHTML = '<p class="empty">You don\'t have access to this folder itself. Open a folder inside it to see what has been shared with you.</p>';
+                    return;
+                }
                 currentEntries = entries;
                 folderEntries[cacheKey] = entries;
                 folderEntryCounts[cacheKey] = entries.length;
@@ -2657,12 +2675,24 @@
                     s.textContent = 'This crosses from ' + bulkState.source.scope + ' to ' + f.scope + ', which changes which rustguac instances can see these entries.';
                     preview.appendChild(s);
                 }
-                var srcGroups = ((r[2] && r[2].allowed_groups) || []).slice().sort().join(', ');
-                var dstGroups = ((r[1] && r[1].allowed_groups) || []).slice().sort().join(', ');
-                if (srcGroups !== dstGroups) {
+                // Groups match case-sensitively, emails do not.
+                var norm = function(cfg, key) {
+                    var list = (cfg && cfg[key]) || [];
+                    if (key === 'allowed_users') list = list.map(function(x) { return x.toLowerCase(); });
+                    return list.slice().sort().join(', ');
+                };
+                var srcGroups = norm(r[2], 'allowed_groups'), dstGroups = norm(r[1], 'allowed_groups');
+                var srcUsers = norm(r[2], 'allowed_users'), dstUsers = norm(r[1], 'allowed_users');
+                if (srcGroups !== dstGroups || srcUsers !== dstUsers) {
                     var g = document.createElement('p');
                     g.className = 'bulk-warn';
-                    g.textContent = 'The target folder has different access groups (here: ' + (srcGroups || 'none') + '; there: ' + (dstGroups || 'none') + '), so who can see and connect to these entries will change.';
+                    var desc = function(groups, users) {
+                        var parts = [];
+                        parts.push('groups: ' + (groups || 'none'));
+                        if (users) parts.push('users: ' + users);
+                        return parts.join('; ');
+                    };
+                    g.textContent = 'The target folder grants access differently (here: ' + desc(srcGroups, srcUsers) + '. There: ' + desc(dstGroups, dstUsers) + '), so who can see and connect to these entries will change.';
                     preview.appendChild(g);
                 }
                 confirmBtn.disabled = false;
@@ -2984,6 +3014,7 @@
         // ── Folder modal ──
 
         var folderEditMode = null; // null = create, {scope, name, path} = edit
+        var fmUsersLoaded = false; // edit mode: has the folder's allowed_users arrived yet?
         var subfolderParent = null; // null, or { scope, path } when creating a subfolder
 
         function openNewFolder() {
@@ -2998,6 +3029,8 @@
             document.getElementById('fm-error').textContent = '';
             document.getElementById('fm-groups-input').value = '';
             document.getElementById('fm-inherit').checked = false;
+            document.getElementById('fm-users').value = '';
+            fmUsersLoaded = true;
             fmGroups = [];
             renderFmGroupChips();
             loadKnownGroups(populateFmGroupOptions);
@@ -3017,6 +3050,8 @@
             document.getElementById('fm-error').textContent = '';
             document.getElementById('fm-groups-input').value = '';
             document.getElementById('fm-inherit').checked = true;
+            document.getElementById('fm-users').value = '';
+            fmUsersLoaded = true;
             fmGroups = [];
             renderFmGroupChips();
             loadKnownGroups(populateFmGroupOptions);
@@ -3041,6 +3076,8 @@
 
             // Reset chip state and kick off known-groups load, then fetch current config.
             document.getElementById('fm-groups-input').value = '';
+            document.getElementById('fm-users').value = '';
+            fmUsersLoaded = false;
             fmGroups = [];
             renderFmGroupChips();
             loadKnownGroups(populateFmGroupOptions);
@@ -3057,6 +3094,10 @@
                     populateFmGroupOptions();
                 }
                 document.getElementById('fm-inherit').checked = !!(data && data.inherit_from_parent);
+                if (data && Array.isArray(data.allowed_users)) {
+                    document.getElementById('fm-users').value = data.allowed_users.join('\n');
+                    fmUsersLoaded = true;
+                }
             }).catch(function() {});
 
             document.getElementById('folder-modal').classList.add('active');
@@ -3106,6 +3147,7 @@
             // Include anything still typed in the group input but not chipped yet
             addFmGroupFromInput();
             var groups = fmGroups.slice();
+            var users = document.getElementById('fm-users').value.split(/[\s,;]+/).filter(function(u) { return u; });
             var scope = document.getElementById('fm-scope').value;
             var errEl = document.getElementById('fm-error');
 
@@ -3124,7 +3166,12 @@
                     method: 'PUT',
                     headers: apiHeaders({ 'Content-Type': 'application/json' }),
                     credentials: 'same-origin',
-                    body: JSON.stringify({ allowed_groups: groups, description: desc, inherit_from_parent: document.getElementById('fm-inherit').checked })
+                    body: JSON.stringify(Object.assign(
+                        { allowed_groups: groups, description: desc, inherit_from_parent: document.getElementById('fm-inherit').checked },
+                        // Only send the list once it has loaded: an omitted
+                        // field keeps the stored list, an empty one clears it.
+                        fmUsersLoaded ? { allowed_users: users } : {}
+                    ))
                 })
                 .then(function(res) {
                     if (!res.ok) return res.text().then(function(t) { throw new Error(t); });
@@ -3142,7 +3189,7 @@
                     method: 'POST',
                     headers: apiHeaders({ 'Content-Type': 'application/json' }),
                     credentials: 'same-origin',
-                    body: JSON.stringify({ name: fullPath, allowed_groups: groups, description: desc, scope: postScope, inherit_from_parent: document.getElementById('fm-inherit').checked })
+                    body: JSON.stringify({ name: fullPath, allowed_groups: groups, allowed_users: users, description: desc, scope: postScope, inherit_from_parent: document.getElementById('fm-inherit').checked })
                 })
                 .then(function(res) {
                     if (!res.ok) return res.text().then(function(t) { throw new Error(t); });

@@ -58,6 +58,12 @@ impl From<reqwest::Error> for VaultError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderConfig {
     pub allowed_groups: Vec<String>,
+    /// Users granted access by login email, in addition to `allowed_groups`.
+    /// Compared without regard to case. A user need not have logged in yet:
+    /// access is decided from their identity at the time they ask. Omitted
+    /// from the stored config when empty, so existing configs are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_users: Vec<String>,
     #[serde(default)]
     pub description: String,
     /// When true, if the folder's own `allowed_groups` doesn't grant access,
@@ -67,6 +73,35 @@ pub struct FolderConfig {
     /// per-folder-only semantics until an admin opts in.
     #[serde(default)]
     pub inherit_from_parent: bool,
+}
+
+/// Who is asking for access to a folder: their login email (absent for API
+/// keys, which are admins and never get here) and their OIDC groups.
+#[derive(Debug, Clone, Copy)]
+pub struct FolderSubject<'a> {
+    pub email: Option<&'a str>,
+    pub groups: &'a [String],
+}
+
+impl FolderConfig {
+    /// Whether this folder's own settings let `who` in: a shared group, or
+    /// their email in `allowed_users`. Inheritance is the caller's concern.
+    pub fn grants(&self, who: FolderSubject<'_>) -> bool {
+        if self
+            .allowed_groups
+            .iter()
+            .any(|g| who.groups.iter().any(|ug| ug == g))
+        {
+            return true;
+        }
+        match who.email.map(str::trim) {
+            Some(email) if !email.is_empty() => self
+                .allowed_users
+                .iter()
+                .any(|u| u.trim().eq_ignore_ascii_case(email)),
+            _ => false,
+        }
+    }
 }
 
 /// A connection entry stored in Vault.
@@ -928,9 +963,10 @@ impl VaultClient {
         }
     }
 
-    /// Resolve whether `user_groups` grants access to `folder` under `scope`.
+    /// Resolve whether `who` may access `folder` under `scope`.
     ///
-    /// Checks the folder's own `allowed_groups` first. If none match and the
+    /// Checks the folder's own `allowed_groups` and `allowed_users` first
+    /// (see `FolderConfig::grants`). If neither matches and the
     /// folder's `inherit_from_parent` is true, walks up the slash-separated
     /// path and evaluates each ancestor's config the same way. Returns `false`
     /// once a folder denies and doesn't inherit, or once the walk reaches the
@@ -940,7 +976,7 @@ impl VaultClient {
         &self,
         scope: &str,
         folder: &str,
-        user_groups: &[String],
+        who: FolderSubject<'_>,
     ) -> Result<bool, VaultError> {
         let mut current = folder.to_string();
         loop {
@@ -949,11 +985,7 @@ impl VaultClient {
                 Err(VaultError::NotFound) => return Ok(false),
                 Err(e) => return Err(e),
             };
-            if config
-                .allowed_groups
-                .iter()
-                .any(|g| user_groups.iter().any(|ug| ug == g))
-            {
+            if config.grants(who) {
                 return Ok(true);
             }
             if !config.inherit_from_parent {
@@ -1665,6 +1697,63 @@ pub fn resolve_credential_variables(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg(groups: &[&str], users: &[&str]) -> FolderConfig {
+        FolderConfig {
+            allowed_groups: groups.iter().map(|s| s.to_string()).collect(),
+            allowed_users: users.iter().map(|s| s.to_string()).collect(),
+            description: String::new(),
+            inherit_from_parent: false,
+        }
+    }
+
+    fn who<'a>(email: Option<&'a str>, groups: &'a [String]) -> FolderSubject<'a> {
+        FolderSubject { email, groups }
+    }
+
+    #[test]
+    fn folder_grants_by_group_or_user() {
+        let ops = vec!["ops".to_string()];
+        let none: Vec<String> = vec![];
+        let c = cfg(&["ops"], &["jsmith@example.com"]);
+        assert!(c.grants(who(Some("someone@example.com"), &ops)), "group");
+        assert!(c.grants(who(Some("jsmith@example.com"), &none)), "user");
+        assert!(
+            c.grants(who(Some("JSmith@Example.COM"), &none)),
+            "case-insensitive"
+        );
+        assert!(!c.grants(who(Some("other@example.com"), &none)));
+    }
+
+    #[test]
+    fn folder_user_grant_needs_a_real_email() {
+        let none: Vec<String> = vec![];
+        let c = cfg(&[], &["jsmith@example.com"]);
+        assert!(!c.grants(who(None, &none)), "no identity email");
+        assert!(!c.grants(who(Some(""), &none)), "empty email");
+        // An empty or blank entry in the list must not match a blank email.
+        let blank = cfg(&[], &["", "  "]);
+        assert!(!blank.grants(who(Some(" "), &none)));
+    }
+
+    #[test]
+    fn empty_folder_config_grants_nobody() {
+        let ops = vec!["ops".to_string()];
+        assert!(!cfg(&[], &[]).grants(who(Some("jsmith@example.com"), &ops)));
+    }
+
+    /// Configs written before allowed_users existed still load, and a config
+    /// with no users is stored exactly as before.
+    #[test]
+    fn folder_config_allowed_users_is_backward_compatible() {
+        let old: FolderConfig =
+            serde_json::from_str(r#"{"allowed_groups":["ops"],"description":"x"}"#).unwrap();
+        assert!(old.allowed_users.is_empty());
+        let json = serde_json::to_value(cfg(&["ops"], &[])).unwrap();
+        assert!(json.get("allowed_users").is_none(), "{json}");
+        let json = serde_json::to_value(cfg(&[], &["a@b.c"])).unwrap();
+        assert_eq!(json["allowed_users"][0], "a@b.c");
+    }
 
     fn base_config() -> VaultConfig {
         VaultConfig {

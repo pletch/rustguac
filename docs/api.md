@@ -519,13 +519,23 @@ Create a folder.
   "scope": "shared",
   "name": "production",
   "allowed_groups": ["engineering", "devops"],
-  "description": "Production servers"
+  "allowed_users": ["oncall@example.com"],
+  "description": "Production servers",
+  "inherit_from_parent": false
 }
 ```
 
+- `allowed_groups`: OIDC groups that can see the folder.
+- `allowed_users` (optional): login emails of individual users who can see the folder. They need not have logged in yet. Up to 500 per folder; blanks and repeats (ignoring case) are dropped, and an entry containing spaces or control characters is refused with `400`.
+- With both lists empty the folder is admin-only. See [Folder access control](roles-and-access-control.md#folder-access-control).
+
 ### `PUT /api/addressbook/folders/:scope/:folder` (admin)
 
-Update folder configuration (allowed_groups, description).
+Update folder configuration (`allowed_groups`, `allowed_users`, `description`, `inherit_from_parent`). If `allowed_users` is left out, the stored list is kept as it is; send `[]` to clear it.
+
+### `GET /api/addressbook/folders/:scope/:folder/config` (admin)
+
+The folder's access settings, including `allowed_users`. The folder listings that operators can read include `allowed_groups` but never `allowed_users`.
 
 ### `DELETE /api/addressbook/folders/:scope/:folder` (admin)
 

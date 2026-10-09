@@ -2205,11 +2205,11 @@ impl VaultBackends {
         &self,
         scope: &str,
         folder: &str,
-        user_groups: &[String],
+        who: crate::vault::FolderSubject<'_>,
     ) -> Result<bool, VaultError> {
         self.scoped(scope)
             .await?
-            .resolve_folder_access(scope, folder, user_groups)
+            .resolve_folder_access(scope, folder, who)
             .await
     }
 
@@ -2355,11 +2355,8 @@ async fn check_folder_access(
         return Ok(());
     }
 
-    let user_groups = identity.groups();
-    match vault
-        .resolve_folder_access(scope, folder, user_groups)
-        .await
-    {
+    let who = identity.folder_subject();
+    match vault.resolve_folder_access(scope, folder, who).await {
         Ok(true) => Ok(()),
         Ok(false) => Err((
             StatusCode::FORBIDDEN,
@@ -2392,11 +2389,11 @@ fn folder_or_descendant_accessible<'a>(
     vault: &'a VaultBackends,
     scope: &'a str,
     path: &'a str,
-    user_groups: &'a [String],
+    who: crate::vault::FolderSubject<'a>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
     Box::pin(async move {
         if vault
-            .resolve_folder_access(scope, path, user_groups)
+            .resolve_folder_access(scope, path, who)
             .await
             .unwrap_or(false)
         {
@@ -2406,7 +2403,7 @@ fn folder_or_descendant_accessible<'a>(
         if let Ok(subs) = vault.list_subfolders(scope, path).await {
             for sub in subs {
                 let child = sub.path.unwrap_or(sub.name);
-                if folder_or_descendant_accessible(vault, scope, &child, user_groups).await {
+                if folder_or_descendant_accessible(vault, scope, &child, who).await {
                     return true;
                 }
             }
@@ -2442,18 +2439,15 @@ pub async fn ab_list_folders(
         }
     };
 
-    // Filter by group access (admins see all).
-    // Top-level folders have no parent so the resolver's inheritance walk is
-    // effectively a single-folder check here, but we go through the resolver
-    // to keep access logic in one place.
-    let user_groups = id.groups();
+    // Filter by access (admins see all). A top-level folder is shown if the
+    // user can open it OR it is on the path to a subfolder they can: access
+    // granted only to `users/jsmith` must still be reachable from the tree.
+    // The folder's own entries stay refused by the per-folder check.
+    let who = id.folder_subject();
     let mut visible = Vec::new();
     for folder in folders {
         if id.has_role("admin")
-            || vault
-                .resolve_folder_access(&folder.scope, &folder.name, user_groups)
-                .await
-                .unwrap_or(false)
+            || folder_or_descendant_accessible(&vault, &folder.scope, &folder.name, who).await
         {
             visible.push(folder);
         }
@@ -2479,8 +2473,18 @@ pub async fn ab_list_subfolders(
         }
     };
 
-    if let Err(resp) = check_folder_access(&vault, &scope, &folder, id).await {
-        return resp;
+    // Listing children only needs the folder to be on the user's path, not
+    // openable: that is how a grant on a deeper folder is reached. The
+    // children are filtered the same way below, so nothing off the path is
+    // named, and the folder's own entries are still refused elsewhere.
+    if !id.has_role("admin")
+        && !folder_or_descendant_accessible(&vault, &scope, &folder, id.folder_subject()).await
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "no access to this folder"})),
+        )
+            .into_response();
     }
 
     match vault.list_subfolders(&scope, &folder).await {
@@ -2494,11 +2498,11 @@ pub async fn ab_list_subfolders(
             if id.has_role("admin") {
                 return Json(json!(subfolders)).into_response();
             }
-            let user_groups = id.groups();
+            let who = id.folder_subject();
             let mut visible = Vec::with_capacity(subfolders.len());
             for sf in subfolders {
                 let path = sf.path.clone().unwrap_or_else(|| sf.name.clone());
-                if folder_or_descendant_accessible(&vault, &scope, &path, user_groups).await {
+                if folder_or_descendant_accessible(&vault, &scope, &path, who).await {
                     visible.push(sf);
                 }
             }
@@ -2542,15 +2546,29 @@ pub async fn ab_list_all(
     };
 
     let mut result = Vec::new();
-    let user_groups = id.groups();
+    let who = id.folder_subject();
     for folder in folders {
-        // Group access check (admins see all); inherits via resolver walk-up.
+        // Access check (admins see all); inherits via resolver walk-up. A
+        // folder the user cannot open is still listed, without its entries,
+        // when it leads to a subfolder they can: that is how the tree reaches
+        // a grant made only on `users/jsmith`.
         if !id.has_role("admin")
             && !vault
-                .resolve_folder_access(&folder.scope, &folder.name, user_groups)
+                .resolve_folder_access(&folder.scope, &folder.name, who)
                 .await
                 .unwrap_or(false)
         {
+            if folder_or_descendant_accessible(&vault, &folder.scope, &folder.name, who).await {
+                result.push(json!({
+                    "name": folder.name,
+                    "scope": folder.scope,
+                    "path": folder.path,
+                    "has_children": folder.has_children,
+                    "description": folder.description,
+                    "path_only": true,
+                    "entries": [],
+                }));
+            }
             continue;
         }
 
@@ -2579,6 +2597,9 @@ pub async fn ab_list_all(
             "has_children": folder.has_children,
             "description": folder.description,
             "allowed_groups": config.as_ref().map(|c| &c.allowed_groups),
+            // allowed_users is deliberately not listed: operators see this,
+            // and a user who can open a folder should not learn who else can.
+            // Admins read it from GET .../config.
             "entries": entries,
         }));
     }
@@ -2612,7 +2633,7 @@ pub async fn ab_search_index(
         }
     };
 
-    let user_groups = id.groups();
+    let who = id.folder_subject();
     let is_admin = id.has_role("admin");
 
     let top = match vault.list_all_folders().await {
@@ -2642,7 +2663,7 @@ pub async fn ab_search_index(
 
         let allowed = is_admin
             || vault
-                .resolve_folder_access(&scope, &path, user_groups)
+                .resolve_folder_access(&scope, &path, who)
                 .await
                 .unwrap_or(false);
         if !allowed {
@@ -3031,6 +3052,9 @@ pub async fn ab_connect_entry(
 pub struct CreateFolderRequest {
     pub name: String,
     pub allowed_groups: Vec<String>,
+    /// Login emails granted access in addition to `allowed_groups`.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
     #[serde(default)]
     pub description: String,
     /// "shared" or "instance" (default: "shared")
@@ -3042,6 +3066,33 @@ pub struct CreateFolderRequest {
 
 fn default_scope() -> String {
     "shared".into()
+}
+
+/// Most users one folder may list in `allowed_users`.
+const MAX_ALLOWED_USERS: usize = 500;
+
+/// Tidy a folder's `allowed_users`: trim, drop blanks and case-insensitive
+/// repeats, and refuse anything that cannot be a login identity. Usually an
+/// email, but not required to contain `@`: rustguac falls back to the OIDC
+/// subject when a provider sends no email claim.
+fn normalize_allowed_users(users: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in users {
+        let u = raw.trim();
+        if u.is_empty() {
+            continue;
+        }
+        if u.len() > 320 || u.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(format!("not a valid user identity: {u:?}"));
+        }
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(u)) {
+            out.push(u.to_string());
+        }
+    }
+    if out.len() > MAX_ALLOWED_USERS {
+        return Err(format!("at most {MAX_ALLOWED_USERS} users per folder"));
+    }
+    Ok(out)
 }
 
 /// Resolve the caller's client IP (honouring trusted proxies) into a string
@@ -3115,10 +3166,16 @@ pub async fn ab_create_folder(
         }
     };
 
+    let allowed_users = match normalize_allowed_users(req.allowed_users) {
+        Ok(u) => u,
+        Err(msg) => return ab_error(StatusCode::BAD_REQUEST, msg),
+    };
     let allowed_count = req.allowed_groups.len();
+    let users_count = allowed_users.len();
     let inherit = req.inherit_from_parent;
     let config = FolderConfig {
         allowed_groups: req.allowed_groups,
+        allowed_users,
         description: req.description,
         inherit_from_parent: req.inherit_from_parent,
     };
@@ -3131,6 +3188,7 @@ pub async fn ab_create_folder(
             let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
             let details = json!({
                 "allowed_groups_count": allowed_count,
+                "allowed_users_count": users_count,
                 "inherit_from_parent": inherit,
             })
             .to_string();
@@ -3158,6 +3216,10 @@ pub async fn ab_create_folder(
 #[derive(Deserialize)]
 pub struct UpdateFolderRequest {
     pub allowed_groups: Vec<String>,
+    /// Login emails granted access. Omitted means "leave as is", so a client
+    /// that predates this field cannot wipe the list by saving the folder.
+    #[serde(default)]
+    pub allowed_users: Option<Vec<String>>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
@@ -3187,10 +3249,23 @@ pub async fn ab_update_folder(
         }
     };
 
+    let allowed_users = match req.allowed_users {
+        Some(users) => match normalize_allowed_users(users) {
+            Ok(u) => u,
+            Err(msg) => return ab_error(StatusCode::BAD_REQUEST, msg),
+        },
+        None => match vault.get_folder_config(&scope, &folder).await {
+            Ok(existing) => existing.allowed_users,
+            Err(VaultError::NotFound) => Vec::new(),
+            Err(e) => return ab_error(StatusCode::BAD_GATEWAY, e.to_string()),
+        },
+    };
     let allowed_count = req.allowed_groups.len();
+    let users_count = allowed_users.len();
     let inherit = req.inherit_from_parent;
     let config = FolderConfig {
         allowed_groups: req.allowed_groups,
+        allowed_users,
         description: req.description,
         inherit_from_parent: req.inherit_from_parent,
     };
@@ -3200,6 +3275,7 @@ pub async fn ab_update_folder(
             let ip = audit_client_ip(&headers, &addr, trusted.as_ref());
             let details = json!({
                 "allowed_groups_count": allowed_count,
+                "allowed_users_count": users_count,
                 "inherit_from_parent": inherit,
             })
             .to_string();
@@ -3247,12 +3323,14 @@ pub async fn ab_get_folder_config(
     match vault.get_folder_config(&scope, &folder).await {
         Ok(cfg) => Json(json!({
             "allowed_groups": cfg.allowed_groups,
+            "allowed_users": cfg.allowed_users,
             "description": cfg.description,
             "inherit_from_parent": cfg.inherit_from_parent,
         }))
         .into_response(),
         Err(crate::vault::VaultError::NotFound) => Json(json!({
             "allowed_groups": Vec::<String>::new(),
+            "allowed_users": Vec::<String>::new(),
             "description": "",
             "inherit_from_parent": false,
         }))
@@ -6151,5 +6229,28 @@ mod tests {
             .is_err(),
             "there is no overwrite policy"
         );
+    }
+
+    #[test]
+    fn allowed_users_are_tidied() {
+        let got = super::normalize_allowed_users(vec![
+            " jsmith@example.com ".into(),
+            "".into(),
+            "JSmith@Example.com".into(),
+            "sub-1234".into(),
+        ])
+        .unwrap();
+        assert_eq!(got, vec!["jsmith@example.com", "sub-1234"]);
+    }
+
+    #[test]
+    fn allowed_users_reject_junk_and_cap_size() {
+        assert!(super::normalize_allowed_users(vec!["a b@example.com".into()]).is_err());
+        assert!(super::normalize_allowed_users(vec!["a\u{7}@example.com".into()]).is_err());
+        assert!(super::normalize_allowed_users(vec!["x".repeat(321)]).is_err());
+        let many: Vec<String> = (0..=super::MAX_ALLOWED_USERS)
+            .map(|i| format!("u{i}@example.com"))
+            .collect();
+        assert!(super::normalize_allowed_users(many).is_err());
     }
 }

@@ -307,6 +307,7 @@ pub async fn cmd_import_guacamole(
     // to write identical allowed_groups on every child.
     let root_config = FolderConfig {
         allowed_groups: allowed_groups.to_vec(),
+        allowed_users: Vec::new(),
         description: "Imported from Guacamole".to_string(),
         inherit_from_parent: false,
     };
@@ -336,6 +337,7 @@ pub async fn cmd_import_guacamole(
         let full = format!("{}/{}", folder, sub);
         let cfg = FolderConfig {
             allowed_groups: vec![],
+            allowed_users: Vec::new(),
             description: format!("Imported from Guacamole: {}", sub),
             inherit_from_parent: true,
         };
