@@ -2762,7 +2762,9 @@ pub async fn ssh_probe_host_key(
             &body.hostname,
             port,
             &manager.config().ssh_allowed_networks,
-        ) {
+        )
+        .await
+        {
             Ok(ip) => crate::session::dial_host(ip),
             Err(e) => {
                 return (

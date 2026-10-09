@@ -9,7 +9,6 @@ use ipnetwork::IpNetwork;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time;
@@ -489,14 +488,14 @@ fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16), Sess
 /// about where the bastion connects. Hop 0 is fenced, for untrusted callers,
 /// where the chain is built (`fence_all_targets`); what lies beyond it is the
 /// bastion's to permit.
-fn check_session_network(
+async fn check_session_network(
     target_host: &str,
     target_port: u16,
     allowed: &[String],
     jump_hops: &[tunnel::JumpHost],
 ) -> Result<(), SessionError> {
     if jump_hops.is_empty() {
-        return check_allowed_network(target_host, target_port, allowed);
+        return check_allowed_network(target_host, target_port, allowed).await;
     }
     tracing::debug!(
         target = %target_host,
@@ -511,8 +510,38 @@ fn check_session_network(
 /// address should use [`allowed_address`] and dial the address it returns,
 /// since a hostname re-resolved later (by guacd, say) can give a different
 /// answer than it gave here.
-fn check_allowed_network(host: &str, port: u16, allowed: &[String]) -> Result<(), SessionError> {
-    allowed_address(host, port, allowed).map(|_| ())
+async fn check_allowed_network(
+    host: &str,
+    port: u16,
+    allowed: &[String],
+) -> Result<(), SessionError> {
+    allowed_address(host, port, allowed).await.map(|_| ())
+}
+
+/// Longest a target hostname lookup may take before the connect fails.
+const DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resolve `host:port` without tying up the async runtime.
+///
+/// The system resolver blocks, and with a DNS server that does not answer it
+/// blocks for its whole retry budget (tens of seconds). Called directly from
+/// a request handler, a few of those occupied every tokio worker thread, and
+/// rustguac stopped answering anything, health checks included, until they
+/// gave up. `lookup_host` runs the resolver on the blocking thread pool, and
+/// the timeout fails this one connect promptly instead of holding it open.
+async fn resolve_host(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, SessionError> {
+    match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(addrs)) => Ok(addrs.collect()),
+        Ok(Err(e)) => Err(SessionError::ValidationError(format!(
+            "failed to resolve host '{}': {}",
+            host, e
+        ))),
+        Err(_) => Err(SessionError::ValidationError(format!(
+            "failed to resolve host '{}': DNS did not answer within {} seconds",
+            host,
+            DNS_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 /// Resolve `host` and return the first address inside the allowlist.
@@ -523,7 +552,7 @@ fn check_allowed_network(host: &str, port: u16, allowed: &[String]) -> Result<()
 /// to an internal one (guacd, Vault, a metadata service) for the connection.
 /// Addresses outside the allowlist are ignored rather than rejected, so a
 /// dual-stack host whose IPv6 address is not listed still works over IPv4.
-pub(crate) fn allowed_address(
+pub(crate) async fn allowed_address(
     host: &str,
     port: u16,
     allowed: &[String],
@@ -551,12 +580,7 @@ pub(crate) fn allowed_address(
     }
 
     // Resolve hostname to IP addresses
-    let addrs: Vec<std::net::SocketAddr> = format!("{}:{}", host, port)
-        .to_socket_addrs()
-        .map_err(|e| {
-            SessionError::ValidationError(format!("failed to resolve host '{}': {}", host, e))
-        })?
-        .collect();
+    let addrs = resolve_host(host, port).await?;
 
     if addrs.is_empty() {
         return Err(SessionError::ValidationError(format!(
@@ -852,6 +876,7 @@ impl SessionManager {
                 first.port,
                 &self.config.ssh_allowed_networks,
             )
+            .await
             .map_err(|e| SessionError::ValidationError(format!("jump host: {e}")))?;
             first.hostname = dial_host(ip);
         }
@@ -882,7 +907,9 @@ impl SessionManager {
                 // the bastion can see. Otherwise guacd dials the address
                 // checked here.
                 let connect_host = if jump_hops.is_empty() {
-                    allowed_address(&hostname, port, &self.config.ssh_allowed_networks)?.to_string()
+                    allowed_address(&hostname, port, &self.config.ssh_allowed_networks)
+                        .await?
+                        .to_string()
                 } else {
                     hostname.clone()
                 };
@@ -1012,7 +1039,8 @@ impl SessionManager {
                     port,
                     &self.config.rdp_allowed_networks,
                     &jump_hops,
-                )?;
+                )
+                .await?;
 
                 tracing::info!(
                     session_id = %session_id,
@@ -1120,7 +1148,9 @@ impl SessionManager {
                 // the bastion can see. Otherwise guacd dials the address
                 // checked here.
                 let connect_host = if jump_hops.is_empty() {
-                    allowed_address(&hostname, port, &self.config.vnc_allowed_networks)?.to_string()
+                    allowed_address(&hostname, port, &self.config.vnc_allowed_networks)
+                        .await?
+                        .to_string()
                 } else {
                     hostname.clone()
                 };
@@ -1161,7 +1191,8 @@ impl SessionManager {
                     port,
                     &self.config.vnc_allowed_networks,
                     &jump_hops,
-                )?;
+                )
+                .await?;
 
                 let spice = guacd::SpiceParams {
                     hostname: hostname.clone(),
@@ -1221,6 +1252,7 @@ impl SessionManager {
                 if fence_all_targets && jump_hops.is_empty() {
                     let (api_host, api_port) = parse_host_port(&pve_url, 8006)?;
                     check_allowed_network(&api_host, api_port, &self.config.vnc_allowed_networks)
+                        .await
                         .map_err(|e| SessionError::ValidationError(format!("Proxmox API: {e}")))?;
                 }
 
@@ -1291,6 +1323,7 @@ impl SessionManager {
                         proxy_port,
                         &self.config.vnc_allowed_networks,
                     )
+                    .await
                     .map_err(|e| {
                         SessionError::ValidationError(format!("Proxmox SPICE proxy: {e}"))
                     })?;
@@ -1420,7 +1453,8 @@ impl SessionManager {
                     url_port,
                     &self.config.web_allowed_networks,
                     &jump_hops,
-                )?;
+                )
+                .await?;
 
                 tracing::info!(
                     session_id = %session_id,
@@ -3078,32 +3112,44 @@ mod tests {
         assert_eq!(guard.active_connections, 0);
     }
 
-    #[test]
-    fn test_check_allowed_network_ipv4_match() {
-        assert!(check_allowed_network("127.0.0.1", 22, &["127.0.0.0/8".into()]).is_ok());
-        assert!(check_allowed_network("10.1.2.3", 80, &["10.0.0.0/8".into()]).is_ok());
+    #[tokio::test]
+    async fn test_check_allowed_network_ipv4_match() {
+        assert!(
+            check_allowed_network("127.0.0.1", 22, &["127.0.0.0/8".into()])
+                .await
+                .is_ok()
+        );
+        assert!(
+            check_allowed_network("10.1.2.3", 80, &["10.0.0.0/8".into()])
+                .await
+                .is_ok()
+        );
     }
 
-    #[test]
-    fn test_check_allowed_network_ipv4_denied() {
-        let err = check_allowed_network("8.8.8.8", 22, &["127.0.0.0/8".into()]);
+    #[tokio::test]
+    async fn test_check_allowed_network_ipv4_denied() {
+        let err = check_allowed_network("8.8.8.8", 22, &["127.0.0.0/8".into()]).await;
         assert!(err.is_err());
     }
 
-    #[test]
-    fn test_check_allowed_network_empty_allowlist() {
-        let err = check_allowed_network("127.0.0.1", 22, &[]);
+    #[tokio::test]
+    async fn test_check_allowed_network_empty_allowlist() {
+        let err = check_allowed_network("127.0.0.1", 22, &[]).await;
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("no valid CIDR"), "got: {}", msg);
     }
 
-    #[test]
-    fn test_check_allowed_network_multiple_cidrs() {
+    #[tokio::test]
+    async fn test_check_allowed_network_multiple_cidrs() {
         let cidrs = vec!["10.0.0.0/8".into(), "192.168.0.0/16".into()];
-        assert!(check_allowed_network("10.1.1.1", 22, &cidrs).is_ok());
-        assert!(check_allowed_network("192.168.1.1", 22, &cidrs).is_ok());
-        assert!(check_allowed_network("172.16.0.1", 22, &cidrs).is_err());
+        assert!(check_allowed_network("10.1.1.1", 22, &cidrs).await.is_ok());
+        assert!(check_allowed_network("192.168.1.1", 22, &cidrs)
+            .await
+            .is_ok());
+        assert!(check_allowed_network("172.16.0.1", 22, &cidrs)
+            .await
+            .is_err());
     }
 
     /// The fence flag is server-set; a request body must not switch it off.
@@ -3184,23 +3230,74 @@ mod tests {
         assert_eq!(trusted.wait_time, Some(MAX_WOL_WAIT_SECS));
     }
 
-    #[test]
-    fn test_allowed_address_returns_literal() {
-        let ip = allowed_address("10.1.2.3", 22, &["10.0.0.0/8".into()]).unwrap();
+    async fn allowed_address_for_test(host: &str) -> Result<std::net::IpAddr, SessionError> {
+        allowed_address(host, 22, &["10.0.0.0/8".to_string()]).await
+    }
+
+    /// Reproduces the DNS stall: with a resolver that never answers, the
+    /// allowlist lookup held tokio worker threads for the whole resolver
+    /// timeout, so the rest of rustguac (including /api/health) stopped.
+    /// Needs a dead resolver, so it is ignored by default. Run it with:
+    ///
+    ///   printf 'nameserver 10.255.255.1\noptions timeout:3 attempts:2\n' > /tmp/dead.conf
+    ///   unshare -rm sh -c 'mount --bind /tmp/dead.conf /etc/resolv.conf && \
+    ///     cargo test slow_dns_does_not_stall_the_runtime -- --ignored'
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs a resolver that does not answer; see the comment"]
+    async fn slow_dns_does_not_stall_the_runtime() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let beats = Arc::new(AtomicU64::new(0));
+        let b = beats.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                b.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let lookups: Vec<_> = (0..4)
+            .map(|i| {
+                tokio::spawn(async move {
+                    let host = format!("host{i}.unresolvable.example");
+                    let _ = allowed_address_for_test(&host).await;
+                })
+            })
+            .collect();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let n = beats.load(Ordering::Relaxed);
+        heartbeat.abort();
+        for l in lookups {
+            l.abort();
+        }
+        // 3s at one beat per 50ms is ~60; a stalled runtime manages almost none.
+        assert!(
+            n >= 30,
+            "runtime stalled during DNS lookups: {n} heartbeats in 3s"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_allowed_address_returns_literal() {
+        let ip = allowed_address("10.1.2.3", 22, &["10.0.0.0/8".into()])
+            .await
+            .unwrap();
         assert_eq!(ip.to_string(), "10.1.2.3");
     }
 
     /// A dual-stack name with only one family allowed still resolves to the
     /// allowed address instead of failing.
-    #[test]
-    fn test_allowed_address_skips_disallowed_family() {
-        let ip = allowed_address("localhost", 22, &["127.0.0.0/8".into()]).unwrap();
+    #[tokio::test]
+    async fn test_allowed_address_skips_disallowed_family() {
+        let ip = allowed_address("localhost", 22, &["127.0.0.0/8".into()])
+            .await
+            .unwrap();
         assert!(ip.is_ipv4() && ip.is_loopback(), "got {ip}");
     }
 
-    #[test]
-    fn test_allowed_address_rejects_when_none_allowed() {
-        assert!(allowed_address("localhost", 22, &["10.0.0.0/8".into()]).is_err());
+    #[tokio::test]
+    async fn test_allowed_address_rejects_when_none_allowed() {
+        assert!(allowed_address("localhost", 22, &["10.0.0.0/8".into()])
+            .await
+            .is_err());
     }
 
     #[test]
@@ -3220,20 +3317,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn session_network_without_hops_checks_the_target() {
+    #[tokio::test]
+    async fn session_network_without_hops_checks_the_target() {
         let cidrs = vec!["127.0.0.0/8".into()];
-        assert!(check_session_network("127.0.0.1", 3389, &cidrs, &[]).is_ok());
-        assert!(check_session_network("8.8.8.8", 3389, &cidrs, &[]).is_err());
+        assert!(check_session_network("127.0.0.1", 3389, &cidrs, &[])
+            .await
+            .is_ok());
+        assert!(check_session_network("8.8.8.8", 3389, &cidrs, &[])
+            .await
+            .is_err());
     }
 
-    #[test]
-    fn session_network_with_hops_skips_unresolvable_target() {
+    #[tokio::test]
+    async fn session_network_with_hops_skips_unresolvable_target() {
         // The whole point of a bastion: the target name resolves only there.
         let rdp = vec!["10.0.0.0/8".into()];
         let hops = vec![hop("127.0.0.1", 22)];
         assert!(
-            check_session_network("liva-z-remote", 3389, &rdp, &hops).is_ok(),
+            check_session_network("liva-z-remote", 3389, &rdp, &hops)
+                .await
+                .is_ok(),
             "bastion-only target name must not be resolved locally"
         );
     }
@@ -3241,18 +3344,20 @@ mod tests {
     /// Hop 0 is fenced only for untrusted callers, where the chain is built
     /// (see `fenced_jump_host_outside_allowlist_refused`); admins and
     /// connection entries name their own bastions.
-    #[test]
-    fn session_network_leaves_hop_zero_to_the_fence() {
+    #[tokio::test]
+    async fn session_network_leaves_hop_zero_to_the_fence() {
         let rdp = vec!["10.0.0.0/8".into()];
         let hops = vec![hop("192.0.2.10", 22), hop("unresolvable-second-hop", 22)];
-        assert!(check_session_network("liva-z-remote", 3389, &rdp, &hops).is_ok());
+        assert!(check_session_network("liva-z-remote", 3389, &rdp, &hops)
+            .await
+            .is_ok());
     }
 
-    #[test]
-    fn test_check_allowed_network_localhost_resolves() {
+    #[tokio::test]
+    async fn test_check_allowed_network_localhost_resolves() {
         // "localhost" should resolve to 127.0.0.1 or ::1
         let cidrs = vec!["127.0.0.0/8".into(), "::1/128".into()];
-        assert!(check_allowed_network("localhost", 80, &cidrs).is_ok());
+        assert!(check_allowed_network("localhost", 80, &cidrs).await.is_ok());
     }
 
     #[test]
