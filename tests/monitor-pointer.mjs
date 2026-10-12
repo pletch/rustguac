@@ -45,13 +45,16 @@ const sources = await Promise.all([
  * none of those numbers are the same, so a mapping that drops a term or uses
  * the wrong rect cannot land on the right answer by luck.
  */
-function mounted({ rect = { left: 2560, top: 0, width: 1920, height: 1080 } } = {}) {
+function mounted({ rect = { left: 2560, top: 0, width: 1920, height: 1080 },
+        bounds = null } = {}) {
 
     const sent = [];
     const listeners = {};
 
     const canvas = {
+        captured : [],
         addEventListener : (name, fn) => { (listeners[name] ||= []).push(fn); },
+        setPointerCapture (id) { this.captured.push(id); },
         getBoundingClientRect : () => ({ left: 100, top: 50, width: 800, height: 400 })
     };
 
@@ -72,10 +75,10 @@ function mounted({ rect = { left: 2560, top: 0, width: 1920, height: 1080 } } = 
 
     let current = rect;
     sandbox.Guacamole.MonitorPointer(canvas, () => current,
-            (state) => sent.push(state));
+            (state) => sent.push(state), bounds ? () => bounds : undefined);
 
     return {
-        sandbox, sent, listeners,
+        sandbox, sent, listeners, canvas,
         setRect : (r) => { current = r; },
         fire : (name, ev) => (listeners[name] || []).forEach((fn) => fn(ev)),
         has  : (name) => !!listeners[name]
@@ -120,6 +123,44 @@ test('the origin of the canvas is the origin of that monitor', () => {
     m.fire('mousemove', at(100, 50));
     assert.deepEqual([m.sent[0].x, m.sent[0].y], [2560, 0],
             "a second head's offset must be added, not assumed to be zero");
+});
+
+/* The canvas is 800 CSS px across for a 1920-pixel monitor: 2.4 remote pixels
+ * per CSS pixel, which a drag past the edge must keep using. */
+const COMBINED = { width: 2560 + 1920, height: 1080 };
+
+test('a drag past the left edge carries on into the monitor beside it', () => {
+    const m = mounted({ bounds: COMBINED });
+    m.fire('mousedown', at(110, 250, 1));
+    m.fire('mousemove', at(0, 250, 1));    // 100 CSS px left of the canvas
+    assert.deepEqual([m.sent[1].x, m.sent[1].y], [2560 - 240, 540],
+            'held to this monitor, a window dragged across stops at the border');
+});
+
+test('a drag is held to the combined framebuffer, not to this monitor', () => {
+    const m = mounted({ bounds: COMBINED });
+    m.fire('mousemove', at(-99999, 99999, 1));
+    assert.deepEqual([m.sent[0].x, m.sent[0].y], [0, COMBINED.height - 1]);
+    m.fire('mousemove', at(99999, -99999, 1));
+    assert.deepEqual([m.sent[1].x, m.sent[1].y], [COMBINED.width - 1, 0]);
+});
+
+test('a mouse press captures the pointer, so the drag can leave the window', () => {
+    const m = mounted({ bounds: { width: 4480, height: 1080 } });
+    m.fire('pointerdown', at(500, 250, 1, { pointerType: 'mouse', pointerId: 7 }));
+    assert.deepEqual(m.canvas.captured, [7]);
+});
+
+test('touch and pen are not captured here', () => {
+    const m = mounted({ bounds: { width: 4480, height: 1080 } });
+    m.fire('pointerdown', at(500, 250, 1, { pointerType: 'touch', pointerId: 2 }));
+    assert.deepEqual(m.canvas.captured, []);
+});
+
+test('without a button held, the canvas still clamps', () => {
+    const m = mounted({ bounds: COMBINED });
+    m.fire('mousemove', at(0, 250));
+    assert.equal(m.sent[0].x, 2560, 'hovering beside a window is not a drag');
 });
 
 test('a position outside the canvas is clamped to it', () => {
