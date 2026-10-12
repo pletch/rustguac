@@ -1,0 +1,41 @@
+diff --git a/src/protocols/rdp/gdi.c b/src/protocols/rdp/gdi.c
+index 0d141663..7fe4a88a 100644
+--- a/src/protocols/rdp/gdi.c
++++ b/src/protocols/rdp/gdi.c
+@@ -192,8 +192,18 @@ BOOL guac_rdp_gdi_desktop_resize(rdpContext* context) {
+      * flushes a full repaint to the client. Without this the dirty rect is
+      * empty after a resize, so newly-exposed (or stale) regions of the layer
+      * render as solid black until something else happens to repaint them.
+-     * See sol1/rustguac#118. */
+-    guac_rect_init(&current_context->dirty, 0, 0, gdi->width, gdi->height);
++     * See sol1/rustguac#118.
++     *
++     * Not under H.264 passthrough, for the reason logged below: the repaint is
++     * encoded from a buffer guacd never decodes into, so it paints the whole
++     * screen with nothing. It used to be harmless more often than not, landing
++     * a few hundred milliseconds after the new surface's first keyframe so
++     * that the next one covered it; landing in the same instant instead, it
++     * left the screen white and an idle desktop never repaired it. The server
++     * repaints a new surface itself -- that keyframe is what the client
++     * shows -- so there is nothing here for the repaint to add. */
++    if (rdp_client->h264_passthrough_frames == 0)
++        guac_rect_init(&current_context->dirty, 0, 0, gdi->width, gdi->height);
+ 
+     /* That full-layer repaint is encoded from gdi->primary_buffer, and under
+      * H.264 passthrough guacd never decodes into it: every region the server
+@@ -210,11 +220,10 @@ BOOL guac_rdp_gdi_desktop_resize(rdpContext* context) {
+     if (rdp_client->h264_passthrough_frames > 0)
+         guac_client_log(client, GUAC_LOG_WARNING,
+                 "Display resized to %ix%i while H.264 passthrough is active "
+-                "(%i frames passed through undecoded). The full-layer repaint "
+-                "for #118 is about to send guacd's own framebuffer, which "
+-                "holds no pixels for any region delivered as H.264. Expect "
+-                "those regions to go black in the browser until the server "
+-                "repaints them.", gdi->width, gdi->height,
++                "(%i frames passed through undecoded). Skipping the "
++                "full-layer repaint for #118: guacd's own framebuffer holds "
++                "no pixels for any region delivered as H.264, and the server "
++                "repaints the new surface itself.", gdi->width, gdi->height,
+                 rdp_client->h264_passthrough_frames);
+     else
+         guac_client_log(client, GUAC_LOG_INFO,
