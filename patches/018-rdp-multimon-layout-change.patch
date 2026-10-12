@@ -1,0 +1,64 @@
+diff --git a/src/protocols/rdp/channels/disp.c b/src/protocols/rdp/channels/disp.c
+index 9e182609..2b772dbe 100644
+--- a/src/protocols/rdp/channels/disp.c
++++ b/src/protocols/rdp/channels/disp.c
+@@ -52,6 +52,7 @@ guac_rdp_disp* guac_rdp_disp_alloc(guac_client* client) {
+     disp->requested_height = 0;
+     disp->reconnect_needed = 0;
+     disp->monitor_count = 0;
++    disp->layout_changed = 0;
+ 
+     return disp;
+ 
+@@ -346,6 +347,9 @@ void guac_rdp_disp_set_monitor(guac_rdp_disp* disp, guac_rdp_settings* settings,
+ 
+     guac_rdp_disp_recalc(disp);
+ 
++    /* Sent even if the combined desktop keeps its size. See layout_changed. */
++    disp->layout_changed = 1;
++
+     /* Send the updated layout to the server (and republish to the client) */
+     guac_rdp_disp_update_size(disp, settings, rdp_inst);
+ 
+@@ -367,13 +371,15 @@ void guac_rdp_disp_update_size(guac_rdp_disp* disp,
+     if (now - disp->last_request <= GUAC_RDP_DISP_UPDATE_INTERVAL)
+         return;
+ 
+-    /* Do NOT send requests unless the size will change */
+-    if (rdp_inst != NULL
++    /* Do NOT send requests unless the size will change -- or, with several
++     * monitors, the layout has, which the combined size cannot show */
++    if (!disp->layout_changed && rdp_inst != NULL
+             && width == guac_rdp_get_width(rdp_inst)
+             && height == guac_rdp_get_height(rdp_inst))
+         return;
+ 
+     disp->last_request = now;
++    disp->layout_changed = 0;
+ 
+     if (settings->resize_method == GUAC_RESIZE_RECONNECT) {
+ 
+diff --git a/src/protocols/rdp/channels/disp.h b/src/protocols/rdp/channels/disp.h
+index 71b74400..55d8290b 100644
+--- a/src/protocols/rdp/channels/disp.h
++++ b/src/protocols/rdp/channels/disp.h
+@@ -120,6 +120,19 @@ typedef struct guac_rdp_disp {
+      */
+     int monitor_count;
+ 
++    /**
++     * Set when the client has changed the monitor layout since the last
++     * update was sent, and cleared when one is.
++     *
++     * The update is otherwise skipped when the combined desktop would keep its
++     * size, which with several monitors says nothing about any one of them:
++     * a secondary growing to the height of a taller primary -- the second of
++     * two equal monitors going fullscreen -- leaves the bounding box exactly
++     * as it was. That request was dropped, and the monitor stayed at its old
++     * resolution, stretched to fill its screen.
++     */
++    int layout_changed;
++
+ } guac_rdp_disp;
+ 
+ /**
