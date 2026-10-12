@@ -542,6 +542,42 @@ so a count of zero always means the server said zero.
 
 Depends on `004` for the instruction and on `014` for the wrappers it extends.
 
+## 016-rdpgfx-multimon-h264.patch — one H.264 sequence per monitor
+
+A server running several monitors over RDPGFX gives each monitor a surface of
+its own, mapped at that monitor's position, and encodes each as a separate
+H.264 sequence in surface-relative coordinates. FreeRDP's gdi adds each
+surface's output origin when it composites (`gdi/gfx.c`); passthrough skips the
+composite, so before this every surface's pictures went to the default layer at
+the origin, one on top of the other, and through one browser decoder that
+received two encoders' streams interleaved. In the field (an xrdp Wayland
+session, `ResetGraphics: 3840x1008, 2 monitor(s)`) the second monitor stayed
+the white guacd had filled the widened framebuffer with.
+
+Three trailing arguments are appended to the `h264` instruction after
+`<recreated>`: `<surface>`, the surface ID, and `<origin_x> <origin_y>`, where
+that surface sits on the layer (from `GetSurfaceData`'s `outputOriginX/Y` when
+the surface is mapped, otherwise 0). Everything before them stays
+surface-relative, since that is also where the picture is read *from*. The
+client keeps a decoder per surface and offsets only the destination; a client
+that stops parsing before them sees exactly what a single-monitor session
+always sent.
+
+The same-size recreation flag moves into the surface slot. Held session-wide,
+it went to whichever surface sent the next picture — and a monitor layout
+change recreates every surface at once, so the first of them to paint took the
+flag whether or not it was the one recreated at its own size.
+
+| File | Change |
+|------|--------|
+| `src/protocols/rdp/channels/rdpgfx.c` | Looks up the surface's output origin; reads and clears the per-surface recreation flag |
+| `src/protocols/rdp/rdp.h` | `recreated` on `guac_rdp_gfx_surface`, replacing the session-wide `gfx_surface_recreated` |
+| `src/libguac/display-plan.c` | Writes `<surface> <origin_x> <origin_y>` after `<recreated>` |
+| `src/libguac/display-layer.c`, `src/libguac/display-priv.h`, `src/libguac/guacamole/display.h` | Frame fields and the setter's signature |
+
+Depends on `004` and `015`, and needs `010` for there to be more than one
+monitor at all.
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

@@ -1098,6 +1098,16 @@ Guacamole.Client = function(tunnel) {
      */
     var h264AuxDropped = false;
 
+    /**
+     * One H.264 decoder per RDPGFX surface, keyed by surface ID. A server that
+     * gives each monitor its own surface sends each as a separate H.264
+     * sequence, which no single decoder can follow.
+     *
+     * @private
+     * @type {!Object.<string, Guacamole.H264Decoder>}
+     */
+    var h264Decoders = {};
+
     var instructionHandlers = {
 
         "ack": function(parameters) {
@@ -1489,8 +1499,8 @@ Guacamole.Client = function(tunnel) {
              * flag applied to a decoder that does not exist is lost silently
              * and the cost of being wrong here is the whole point of the
              * instruction. */
-            if (guac_client._h264Decoder)
-                guac_client._h264Decoder.setAuxDropped(h264AuxDropped);
+            for (var surface in h264Decoders)
+                h264Decoders[surface].setAuxDropped(h264AuxDropped);
 
         },
 
@@ -1560,6 +1570,22 @@ Guacamole.Client = function(tunnel) {
             var recreated = parameters.length > 10 + numRects * 4
                     ? parseInt(parameters[10 + numRects * 4]) !== 0 : false;
 
+            // Which surface the picture belongs to, and where that surface's
+            // origin sits on the layer. A server that gives each monitor its
+            // own surface sends one H.264 sequence per surface, each in
+            // surface-relative coordinates: they need a decoder apiece --
+            // interleaved through one, each corrupts the other -- and each
+            // picture belongs at its monitor's place in the combined
+            // framebuffer. Absent, as from an older guacd, this is surface 0
+            // at the origin, which is every single-monitor session.
+            var trailer = 11 + numRects * 4;
+            var surface = parameters.length > trailer
+                    ? parseInt(parameters[trailer]) : 0;
+            var originX = parameters.length > trailer + 1
+                    ? parseInt(parameters[trailer + 1]) : 0;
+            var originY = parameters.length > trailer + 2
+                    ? parseInt(parameters[trailer + 2]) : 0;
+
             // Create stream to receive H.264 NAL unit data
             var stream = streams[stream_index] = new Guacamole.InputStream(guac_client, stream_index);
 
@@ -1572,10 +1598,15 @@ Guacamole.Client = function(tunnel) {
                 return;
             }
 
-            // Create or reuse H.264 decoder for this display
-            if (!guac_client._h264Decoder) {
-                guac_client._h264Decoder = new Guacamole.H264Decoder(display);
-                guac_client._h264Decoder.setAuxDropped(h264AuxDropped);
+            // Create or reuse the H.264 decoder for this surface. The first
+            // one built stays reachable as _h264Decoder, which the page's
+            // diagnostics read; with one monitor it is the only one.
+            var decoder = h264Decoders[surface];
+            if (!decoder) {
+                decoder = h264Decoders[surface] = new Guacamole.H264Decoder(display);
+                decoder.setAuxDropped(h264AuxDropped);
+                if (!guac_client._h264Decoder)
+                    guac_client._h264Decoder = decoder;
             }
 
             // Collect NAL unit data. Guacamole.ArrayBufferReader decodes each
@@ -1623,11 +1654,11 @@ Guacamole.Client = function(tunnel) {
                     // stale video over newer content -- visible as ghosting
                     // wherever a server interleaves H.264 with other codecs.
                     display.drawH264(
-                        layer, guac_client._h264Decoder,
+                        layer, decoder,
                         x, y, width, height,
                         bytes.buffer, isKeyFrame,
                         parameters.length > 8 ? rects : null, view, paired,
-                        recreated
+                        recreated, originX, originY
                     );
                 } catch (e) {
                     if (typeof console !== 'undefined')
@@ -1908,12 +1939,19 @@ Guacamole.Client = function(tunnel) {
                 };
 
                 // Gate sync response on H.264 decode completion so that
-                // guacd receives accurate backpressure from decode speed
-                if (guac_client._h264Decoder) {
-                    guac_client._h264Decoder.waitForPending(sendSync, flushMs);
-                } else {
-                    sendSync();
-                }
+                // guacd receives accurate backpressure from decode speed --
+                // every surface's, since the frame spans all of them. Each
+                // waits in turn; the second's wait is usually nothing, as
+                // both pipelines drained while the first was held.
+                var waiting = Object.keys(h264Decoders);
+                var waitNext = function waitNext() {
+                    var surface = waiting.shift();
+                    if (surface === undefined)
+                        sendSync();
+                    else
+                        h264Decoders[surface].waitForPending(waitNext, flushMs);
+                };
+                waitNext();
 
             }, timestamp, frames);
 

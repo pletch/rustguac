@@ -269,6 +269,23 @@ the measurement work that made the browser-side combine affordable.
   longer renders oversized on high-DPI displays (SSH DPI pinned to a 96
   baseline; the client auto-scales).
 
+### Multiple monitors
+
+- **One H.264 decoder per surface** (`patches/016-rdpgfx-multimon-h264.patch`)
+  — a multi-monitor RDPGFX session is one surface per monitor, each its own
+  H.264 sequence in surface-relative coordinates. Passthrough sent every
+  surface to the same place through one browser decoder, so a second monitor's
+  pictures landed on the first while the decoder was fed two encoders' streams
+  interleaved. `016` appends `<surface> <origin_x> <origin_y>` to the `h264`
+  instruction, the origin taken from the surface's output mapping as FreeRDP's
+  own gdi does, and the client keeps a decoder per surface and offsets only
+  where each picture is painted. With several decoders on one page, the sync
+  gate waits on each in turn, the copy-share gate is charged for every
+  decoder's copies (it protects one main thread), and the auxiliary-view drop
+  switches off at the second surface, since its gate reasons about one
+  sequence's references. A guacd or client without the trailer behaves as
+  before.
+
 ### Input
 
 - **Mouse moves the browser coalesced away are replayed**

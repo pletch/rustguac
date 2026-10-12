@@ -576,8 +576,10 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var fbWidth = display ? display.getWidth() : layerCanvas.width;
         var fbHeight = display ? display.getHeight() : layerCanvas.height;
 
-        var w = Math.min(snapshot.width, fbWidth - frameState.x);
-        var h = Math.min(snapshot.height, fbHeight - frameState.y);
+        var w = Math.min(snapshot.width,
+                fbWidth - frameState.x - frameState.ox);
+        var h = Math.min(snapshot.height,
+                fbHeight - frameState.y - frameState.oy);
 
         var decoded, landed;
         try {
@@ -645,15 +647,17 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 x1 = Math.max(x1, rect.x + rect.width);
                 y1 = Math.max(y1, rect.y + rect.height);
             }
-            sx = lx = Math.max(0, x0);
-            sy = ly = Math.max(0, y0);
+            sx = Math.max(0, x0);
+            sy = Math.max(0, y0);
+            lx = sx + frameState.ox;
+            ly = sy + frameState.oy;
             w = Math.min(x1, sw) - sx;
             h = Math.min(y1, sh) - sy;
         }
         else {
             sx = sy = 0;
-            lx = frameState.x;
-            ly = frameState.y;
+            lx = frameState.x + frameState.ox;
+            ly = frameState.y + frameState.oy;
             w = sw;
             h = sh;
         }
@@ -1298,6 +1302,12 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      */
     function noteCombineCopy(copyMs) {
 
+        /* Counted before anything can return: a decoder that is not combining
+         * copies nothing, and one that is still costs the main thread every
+         * other decoder's window has to see. */
+        if (copyMs > 0)
+            Guacamole.H264Decoder.sharedCopyMs += copyMs;
+
         if (override('h264Chroma444') !== undefined || !combining
                 || combineLatchedOff || !(copyMs > 0)) {
             copyWindow = null;
@@ -1307,7 +1317,8 @@ Guacamole.H264Decoder = function H264Decoder(display) {
         var now = nowMs();
 
         if (!copyWindow)
-            copyWindow = { start: now, pictures: 0, sumMs: 0 };
+            copyWindow = { start: now, pictures: 0, sumMs: 0,
+                sharedAtStart: Guacamole.H264Decoder.sharedCopyMs - copyMs };
 
         copyWindow.pictures++;
         copyWindow.sumMs += copyMs;
@@ -1327,8 +1338,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 || copyWindow.pictures < minPictures)
             return;
 
+        /* The share is of the main thread, which every decoder blocks: one
+         * per monitor, each copying 20% of the time, is 40% gone, and a gate
+         * reading only its own decoder's copies would pass both. The mean
+         * stays this decoder's, since it describes this decoder's pictures. */
         var mean = copyWindow.sumMs / copyWindow.pictures;
-        var copyMsInWindow = copyWindow.sumMs;
+        var copyMsInWindow = Guacamole.H264Decoder.sharedCopyMs
+                - copyWindow.sharedAtStart;
         var pictures = copyWindow.pictures;
         var span = now - copyWindow.start;
         copyWindow = null;
@@ -3699,7 +3715,7 @@ Guacamole.H264Decoder = function H264Decoder(display) {
      *     null if it could not be submitted.
      */
     this.decode = function(layer, x, y, width, height, nalData, isKeyFrame,
-            rects, onReady, view, paired, recreated) {
+            rects, onReady, view, paired, recreated, originX, originY) {
 
         ensureDecoder(width, height, nalData);
 
@@ -3763,6 +3779,13 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                 layer: layer,
                 x: x,
                 y: y,
+
+                /* Where this decoder's surface sits on the layer. Everything
+                 * above, rects included, is surface-relative and is where the
+                 * picture is read *from*; only the destination moves. Zero for
+                 * every single-monitor session. */
+                ox: originX || 0,
+                oy: originY || 0,
                 rects: (rects && rects.length) ? rects : null,
 
                 /* An empty list, unlike an absent one, says no region of the
@@ -3938,13 +3961,15 @@ Guacamole.H264Decoder = function H264Decoder(display) {
                         var rect = frameState.rects[r];
                         ctx.drawImage(snapshot,
                                 rect.x, rect.y, rect.width, rect.height,
-                                rect.x, rect.y, rect.width, rect.height);
+                                rect.x + frameState.ox, rect.y + frameState.oy,
+                                rect.width, rect.height);
                     }
                 }
 
                 /* No regions given: the entire picture is valid */
                 else
-                    ctx.drawImage(snapshot, frameState.x, frameState.y);
+                    ctx.drawImage(snapshot, frameState.x + frameState.ox,
+                            frameState.y + frameState.oy);
 
                 counts.painted++;
                 counts.lastPaintAt = nowMs();
@@ -4382,4 +4407,14 @@ Guacamole.H264Decoder.isSupported = function isSupported() {
  * @type {?function(string, string)}
  */
 Guacamole.H264Decoder.onDiagnostic = null;
+
+/**
+ * Synchronous VideoFrame.copyTo() time spent by every decoder on the page, in
+ * ms, ever. Each decoder's copy-share gate reads the difference across its
+ * window, so that decoders sharing the main thread -- one per monitor -- are
+ * judged on what they cost it together.
+ *
+ * @type {!number}
+ */
+Guacamole.H264Decoder.sharedCopyMs = 0;
 

@@ -1,0 +1,247 @@
+diff --git a/src/libguac/display-layer.c b/src/libguac/display-layer.c
+index 9ed2141f..918334a0 100644
+--- a/src/libguac/display-layer.c
++++ b/src/libguac/display-layer.c
+@@ -342,7 +342,7 @@ void guac_display_layer_set_h264(guac_display_layer* layer,
+         const unsigned char* data, uint32_t length, int is_keyframe,
+         int x, int y, int width, int height,
+         const guac_rect* rects, int num_rects, int view, int paired,
+-        int recreated) {
++        int recreated, int surface, int origin_x, int origin_y) {
+ 
+     int dropped = 0;
+ 
+@@ -358,6 +358,9 @@ void guac_display_layer_set_h264(guac_display_layer* layer,
+     frame->view = view;
+     frame->paired = paired;
+     frame->recreated = recreated;
++    frame->surface = surface;
++    frame->origin_x = origin_x;
++    frame->origin_y = origin_y;
+     guac_rect_init(&frame->rect, x, y, width, height);
+     frame->next = NULL;
+ 
+diff --git a/src/libguac/display-plan.c b/src/libguac/display-plan.c
+index 9cb6aaad..b44877ed 100644
+--- a/src/libguac/display-plan.c
++++ b/src/libguac/display-plan.c
+@@ -419,7 +419,7 @@ static void guac_display_plan_send_h264_frame(guac_client* client,
+      *
+      *   h264 <stream> <layer> <keyframe> <x> <y> <width> <height>
+      *        <view> <numrects> [<x> <y> <width> <height>]... <paired>
+-     *        <recreated>
++     *        <recreated> <surface> <origin_x> <origin_y>
+      *
+      * <view> identifies what the access unit carries: 0 is a displayable
+      * picture (AVC420, or the main view of AVC444), 1 and 2 are the auxiliary
+@@ -458,7 +458,18 @@ static void guac_display_plan_send_h264_frame(guac_client* client,
+      * reference it. Only the server can say this: a client can see that a
+      * picture decoded black, but not whether that is the screen or an empty
+      * surface. It trails <paired> for the same reason <paired> trails the
+-     * rects. */
++     * rects.
++     *
++     * <surface> identifies which surface the picture belongs to, and
++     * <origin_x> <origin_y> where that surface's origin sits on the layer. A
++     * server that gives each monitor its own surface sends one H.264 sequence
++     * per surface, so a client MUST decode each surface with a decoder of its
++     * own -- interleaving two sequences through one decoder corrupts both --
++     * and MUST offset every destination, rects included, by the origin. The
++     * coordinates above stay surface-relative, which is also where they are
++     * read *from* in the decoded picture. A client that stops parsing before
++     * these sees what it saw before, which is correct for one surface at the
++     * origin: every single-monitor session. */
+     int header[] = {
+         stream->index,
+         layer->layer->index,
+@@ -488,6 +499,9 @@ static void guac_display_plan_send_h264_frame(guac_client* client,
+ 
+     guac_h264_write_arg(socket, frame->paired);
+     guac_h264_write_arg(socket, frame->recreated);
++    guac_h264_write_arg(socket, frame->surface);
++    guac_h264_write_arg(socket, frame->origin_x);
++    guac_h264_write_arg(socket, frame->origin_y);
+ 
+     guac_socket_write_string(socket, ";");
+     guac_socket_instruction_end(socket);
+diff --git a/src/libguac/display-priv.h b/src/libguac/display-priv.h
+index ddcd3047..2eb9892d 100644
+--- a/src/libguac/display-priv.h
++++ b/src/libguac/display-priv.h
+@@ -360,6 +360,17 @@ struct guac_h264_frame {
+      */
+     int recreated;
+ 
++    /**
++     * The surface this frame belongs to, and where on the layer that surface's
++     * origin is shown. A server giving each monitor its own surface sends one
++     * H.264 sequence per surface, each in surface-relative coordinates, so
++     * both are needed to decode them apart and to put each where its monitor
++     * is in the combined framebuffer.
++     */
++    int surface;
++    int origin_x;
++    int origin_y;
++
+     /**
+      * The bounds of the surface this frame decodes to. Retained for logging
+      * and as a fallback when the server supplies no region rects.
+diff --git a/src/libguac/guacamole/display.h b/src/libguac/guacamole/display.h
+index f1192e59..803ffe02 100644
+--- a/src/libguac/guacamole/display.h
++++ b/src/libguac/guacamole/display.h
+@@ -474,6 +474,18 @@ void guac_display_free_layer(guac_display_layer* display_layer);
+  *     size it already had, and its content is therefore an empty surface
+  *     rather than a screen that has gone blank.
+  *
++ * @param surface
++ *     The ID of the surface this frame belongs to. Each surface is a separate
++ *     H.264 sequence -- one per monitor when the server gives each monitor its
++ *     own -- and must be decoded by a decoder of its own.
++ *
++ * @param origin_x
++ *     The X coordinate on the layer at which the surface's origin is shown.
++ *     The coordinates above, and the rects, are relative to the surface.
++ *
++ * @param origin_y
++ *     The Y coordinate on the layer at which the surface's origin is shown.
++ *
+  */
+ /**
+  * An ordinary AVC420 access unit, or the main view of an AVC444 stream. A
+@@ -498,7 +510,7 @@ void guac_display_layer_set_h264(guac_display_layer* layer,
+         const unsigned char* data, uint32_t length, int is_keyframe,
+         int x, int y, int width, int height,
+         const guac_rect* rects, int num_rects, int view, int paired,
+-        int recreated);
++        int recreated, int surface, int origin_x, int origin_y);
+ 
+ /**
+  * Returns the number of H.264 frames of video queued on the given layer and
+diff --git a/src/protocols/rdp/channels/rdpgfx.c b/src/protocols/rdp/channels/rdpgfx.c
+index f7d8e500..65e38444 100644
+--- a/src/protocols/rdp/channels/rdpgfx.c
++++ b/src/protocols/rdp/channels/rdpgfx.c
+@@ -163,6 +163,9 @@ static guac_rect* guac_rdp_h264_copy_rects(const RDPGFX_H264_METABLOCK* meta,
+  * to clients by the display worker pipeline (in guac_display_plan_apply)
+  * instead of encoding the pixel data as JPEG/PNG/WebP.
+  */
++static guac_rdp_gfx_surface* guac_rdp_gfx_surface_slot(
++        guac_rdp_client* rdp_client, UINT16 id, int allocate);
++
+ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+         const RDPGFX_SURFACE_COMMAND* cmd) {
+ 
+@@ -336,15 +339,39 @@ static UINT guac_rdp_gfx_surface_command(RdpgfxClientContext* context,
+          * painting the picture is the client's decision, not ours. Cleared
+          * once attached: it describes the first picture of the new surface,
+          * not every picture after it. */
+-        int recreated = rdp_client->gfx_surface_recreated;
+-        rdp_client->gfx_surface_recreated = 0;
++        int recreated = 0;
++        guac_rdp_gfx_surface* slot =
++                guac_rdp_gfx_surface_slot(rdp_client, cmd->surfaceId, 0);
++        if (slot != NULL) {
++            recreated = slot->recreated;
++            slot->recreated = 0;
++        }
++
++        /* Where this surface is shown in the combined framebuffer. A server
++         * gives each monitor a surface of its own, mapped at that monitor's
++         * position, and encodes each in surface-relative coordinates --
++         * FreeRDP's gdi adds the origin when it composites (gdi/gfx.c), and
++         * passthrough, which skips that, must say what it is. An unmapped
++         * surface is not shown at all; its pictures still go out at the
++         * origin for their references, as they did before. */
++        int origin_x = 0;
++        int origin_y = 0;
++        if (context->GetSurfaceData != NULL) {
++            gdiGfxSurface* surface = (gdiGfxSurface*)
++                    context->GetSurfaceData(context, cmd->surfaceId);
++            if (surface != NULL && surface->outputMapped) {
++                origin_x = (int) surface->outputOriginX;
++                origin_y = (int) surface->outputOriginY;
++            }
++        }
+ 
+         for (int i = 0; i < saved_count; i++)
+             guac_display_layer_set_h264(default_layer,
+                     saved_h264[i], saved_length[i], saved_keyframe[i],
+                     cmd->left, cmd->top, cmd->width, cmd->height,
+                     saved_rects[i], saved_num_rects[i], saved_view[i],
+-                    (i == 0 && saved_count == 2), recreated);
++                    (i == 0 && saved_count == 2), recreated,
++                    (int) cmd->surfaceId, origin_x, origin_y);
+ 
+         /* With the decode skipped, guac_rdp_gdi_end_paint() never runs, so
+          * nothing marks the display as modified and the queued frames would
+@@ -1142,6 +1169,7 @@ static guac_rdp_gfx_surface* guac_rdp_gfx_surface_slot(
+     rdp_client->gfx_surfaces[free_slot].deleted = 0;
+     rdp_client->gfx_surfaces[free_slot].width = 0;
+     rdp_client->gfx_surfaces[free_slot].height = 0;
++    rdp_client->gfx_surfaces[free_slot].recreated = 0;
+     return &rdp_client->gfx_surfaces[free_slot];
+ 
+ }
+@@ -1154,7 +1182,7 @@ static guac_rdp_gfx_surface* guac_rdp_gfx_surface_slot(
+  *
+  * A same-size recreation is the one shape after which Windows does *not*
+  * repaint the whole screen, so its first picture is black over a surface the
+- * browser is still displaying correctly. See gfx_surface_recreated in rdp.h.
++ * browser is still displaying correctly. See guac_rdp_gfx_surface in rdp.h.
+  */
+ static UINT guac_rdp_gfx_create_surface(RdpgfxClientContext* context,
+         const RDPGFX_CREATE_SURFACE_PDU* pdu) {
+@@ -1181,7 +1209,7 @@ static UINT guac_rdp_gfx_create_surface(RdpgfxClientContext* context,
+             if (slot->deleted && slot->width == pdu->width
+                     && slot->height == pdu->height) {
+ 
+-                rdp_client->gfx_surface_recreated = 1;
++                slot->recreated = 1;
+ 
+                 guac_client_log(client, GUAC_LOG_INFO,
+                         "RDPGFX surface %u recreated at the size it already "
+diff --git a/src/protocols/rdp/rdp.h b/src/protocols/rdp/rdp.h
+index a43e626a..1a0141f5 100644
+--- a/src/protocols/rdp/rdp.h
++++ b/src/protocols/rdp/rdp.h
+@@ -107,6 +107,21 @@ typedef struct guac_rdp_gfx_surface {
+      */
+     int deleted;
+ 
++    /**
++     * Set when this surface has been recreated at the size it already had,
++     * and cleared by its next H.264 surface command, which carries it to the
++     * client as the <recreated> flag of its "h264" instructions.
++     *
++     * Per surface, because a layout change recreates every monitor's surface
++     * at once: held session-wide, the first of them to send a picture took
++     * the flag, whichever surface had actually been recreated at its size.
++     *
++     * Only an H.264 command clears it. A recreation followed by a progressive
++     * or planar command is one where guacd still holds the pixels, so there is
++     * nothing for the client to withhold and nothing to tell it about.
++     */
++    int recreated;
++
+ } guac_rdp_gfx_surface;
+ 
+ /**
+@@ -237,17 +252,6 @@ typedef struct guac_rdp_client {
+      */
+     guac_rdp_gfx_surface gfx_surfaces[GUAC_RDP_GFX_MAX_SURFACES];
+ 
+-    /**
+-     * Set when a surface has been recreated at the size it already had, and
+-     * cleared by the next H.264 surface command, which carries it to the
+-     * client as the <recreated> flag of its "h264" instructions.
+-     *
+-     * Only an H.264 command clears it. A recreation followed by a progressive
+-     * or planar command is one where guacd still holds the pixels, so there is
+-     * nothing for the client to withhold and nothing to tell it about.
+-     */
+-    int gfx_surface_recreated;
+-
+     /**
+      * Counts of each wrapped surface operation since the session began. The
+      * frequent operations are summarised periodically rather than logged

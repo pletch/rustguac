@@ -1142,6 +1142,36 @@ default. Pacing belongs at the source anyway -- it is the only place that can
 decline to *capture and encode* a frame, and the only place that serves the
 native RDP clients rustguac never sees.
 
+#### Multiple monitors: one decoder per surface
+
+A multi-monitor session over RDPGFX is one surface per monitor, each its own
+H.264 sequence in surface-relative coordinates. `016` appends `<surface>
+<origin_x> <origin_y>` to the `h264` instruction; `Client.js` keeps a decoder
+per surface (`h264Decoders`, with the first also reachable as `_h264Decoder`
+for the page's diagnostics) and `H264Decoder` offsets only the destination of
+each paint, so the combined framebuffer is assembled exactly as guacd's gdi
+would have assembled it. The monitor windows and the main window's crop read
+that one framebuffer and needed nothing.
+
+Three things follow from several decoders sharing one page:
+
+* **The sync gate waits on every decoder**, in turn, since a frame spans all
+  of them.
+* **The copy-share gate is charged for every decoder's copies**
+  (`Guacamole.H264Decoder.sharedCopyMs`): it protects the main thread, and two
+  monitors at 20% each is 40% of it gone while each decoder alone reads 20%.
+* **The auxiliary-view drop switches off at the second surface**, for the rest
+  of the session, and tells the client so. Its gate reasons about the
+  references within one sequence, and two encoders' `frame_num` and long-term
+  indices interleaved describe nothing. Per-surface dropper state would lift
+  that, at the cost of a real refactor; with the xrdp fork sending little
+  chroma during motion it would buy little, and against Windows it is the
+  thing to build if multi-monitor H.264 sessions turn out to matter.
+
+The SPS rewriter still decides once per session, from the first SPS. Every
+surface comes from the same encoder, so the shapes agree; a host that mixed
+encoders across monitors would be the case to revisit.
+
 #### Black regions on Windows: what is instrumented, and why
 
 Passthrough skips the GDI decode, so `gdi->primary_buffer` — the buffer guacd
