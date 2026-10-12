@@ -521,6 +521,32 @@ which is why it happens only when the flag has asked for numbers.
 Still true that the xrdp fork's `CHROMA_INTERVAL` is better placed than any
 client-side gate, since it cuts the second decode and the bandwidth too.
 
+**The xrdp fork now decides at the source what this gate decides too late,
+and on such a host Full Colour is the setting to use.** Its accel-assist
+helper sends the auxiliary picture only where a change needs it: an area that
+has been changing for 150ms (video, scrolling, a drag) goes luma-only until it
+has been still for 120ms, auxiliary pictures go at most every 250ms while
+anything moves, and the chroma it owes catches up afterwards in an aux-only
+frame (`LC=2`). A second rule withholds it during motion altogether when the
+round trip says frames are queueing, which an unthrottled LAN never triggers.
+Details are in the xrdp fork's README, under AVC444.
+
+The expensive case therefore never reaches the client. Combining runs when the
+screen is still, where a banded copy of the damaged rows is cheap, and the
+gate has nothing to trip on: in field use on 2026-10-12 a Full Colour session
+held 4:4:4 throughout, where the same host previously dropped in and out of
+combining under ordinary scrolling. That is the source saving the encode, the
+bandwidth, the decode and the read-back, where the gate can only stop the
+read-back after the other three are paid.
+
+So the xrdp combine-cost figures in this section -- VS Code scrolling at
+46-60% of the main thread in `copyTo()`, glxgears at 70%, and the auxiliary
+view as 43% of the payload -- describe the server *before* motion-aware
+auxiliary pictures, not xrdp as it stands. The gate and the transit drop are
+still the only levers against a Windows host, which sends chroma about one
+picture in eight whether or not anything is moving, and Standard stays the
+right default for a host nobody has characterized.
+
 `h264CombineLog` reports every 5s, splitting each stage by whether the picture
 carried an auxiliary view: **decode** (`decode()` submitted to the frame
 arriving in `output()`), **combine** (read-back, upload, conversion, transfer)
