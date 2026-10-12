@@ -288,6 +288,9 @@ the measurement work that made the browser-side combine affordable.
 - **F11 in a monitor window** fullscreens that window. A monitor window is a
   popup, which always shows the browser's title and address bar until it is
   fullscreen, but `Guacamole.Keyboard` swallowed F11 and sent it to the remote.
+- **Closing the last secondary monitor forgets the layout** — guacd republishes
+  the layout only while more than one monitor is active, so the main window
+  went on cropping to monitor 0's old rect, letterboxed, until it was cleared.
 
 ### Input
 

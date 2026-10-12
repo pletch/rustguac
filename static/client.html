@@ -1376,6 +1376,18 @@
                 // Tell the server to close this monitor (non-positive size).
                 client.sendSize(0, 0, index, 0);
                 try { if (rec.win && !rec.win.closed) rec.win.close(); } catch (e) {}
+                // guacd republishes the layout only while more than one
+                // monitor is active, so the last secondary closing is never
+                // announced: the main window went on cropping and scaling to
+                // monitor 0's rect as it last was -- after leaving fullscreen,
+                // a 1072-row rect squeezed into a 911-row window. With only
+                // the primary left there is no layout to honour, so forget it
+                // and refit now; with others still open, the republish that
+                // follows corrects it as before.
+                if (Object.keys(monitorWindows).length === 0) {
+                    monitorLayout = {};
+                    if (typeof scaleDisplay === 'function') scaleDisplay();
+                }
                 renderMonitorControls();
             }
 
