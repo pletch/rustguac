@@ -578,6 +578,28 @@ flag whether or not it was the one recreated at its own size.
 Depends on `004` and `015`, and needs `010` for there to be more than one
 monitor at all.
 
+## 017-rdp-resize-no-repaint-under-passthrough.patch — no full-layer repaint over H.264
+
+`005` marks the whole layer dirty on every server resize so that guacd repaints
+it (#118). That repaint is encoded from `gdi->primary_buffer`, which H.264
+passthrough never decodes into, so under passthrough it paints the entire
+screen with guacd's empty buffer — white on the xrdp hosts measured. Most of
+the time it did no lasting harm, landing a few hundred milliseconds after the
+new surface's first keyframe so that the next keyframe covered it; when it
+landed in the same instant it covered the keyframe instead, and an idle
+desktop, which repaints only what changes, stayed mostly white. `014` had been
+logging exactly this hazard on every such resize.
+
+Skipped whenever any H.264 has been passed through. The server repaints a new
+surface itself, and that keyframe is what the client shows, so the repaint has
+nothing to add; the tile path #118 was about is unchanged.
+
+| File | Change |
+|------|--------|
+| `src/protocols/rdp/gdi.c` | Marks the layer dirty on resize only before any H.264 has passed through; the `014` warning now says the repaint is skipped |
+
+Depends on `005` and `014`.
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:

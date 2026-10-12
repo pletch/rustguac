@@ -195,6 +195,13 @@ the measurement work that made the browser-side combine affordable.
   `localStorage` survives a session relaunch, since the client rebuilds its own
   URL, and only `h264Chroma444` and `h264ChromaFilter` are read per picture, so
   they are the two a window global can change mid-session.
+- **No full-layer repaint over an H.264 picture on resize**
+  (`patches/017-rdp-resize-no-repaint-under-passthrough.patch`) — `005`
+  repaints the whole layer after every server resize, from a buffer
+  passthrough never decodes into. When that repaint landed in the same instant
+  as a new surface's first keyframe it covered it, and an idle xrdp desktop,
+  repainting only what changes, stayed mostly white. It is skipped once any
+  H.264 has passed through, since the server repaints a new surface itself.
 
 ### Transport
 
