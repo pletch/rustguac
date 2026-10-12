@@ -306,6 +306,11 @@ the measurement work that made the browser-side combine affordable.
   across the edge while monitor windows are open, and a monitor window's
   position may run on into the neighbouring monitor, held only to the combined
   framebuffer. Each monitor window also gets a Fullscreen button.
+- **A monitor's resize is sent even when the combined desktop keeps its size**
+  (`patches/018-rdp-multimon-layout-change.patch`) — guacd skipped a display
+  update that left the bounding box unchanged, so the second of two equal
+  monitors going fullscreen was never resized and stayed stretched 7% taller
+  than its neighbor. A layout change now always counts as a change.
 
 ### Input
 

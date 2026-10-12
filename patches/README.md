@@ -600,6 +600,29 @@ nothing to add; the tile path #118 was about is unchanged.
 
 Depends on `005` and `014`.
 
+## 018-rdp-multimon-layout-change.patch — a monitor's resize is sent even when the desktop keeps its size
+
+`guac_rdp_disp_update_size()` skips any update that would leave the desktop
+the size it already is. With several monitors the size it compares is the
+combined bounding box, which says nothing about any one monitor: when the
+second of two equal 1920x1080 displays went fullscreen, its monitor grew from
+1920x1008 to 1920x1072 — the height monitor 0 already had — and the combined
+desktop stayed 3840x1072. The update was skipped every time, so that monitor
+kept its windowed resolution and was stretched 7% taller than its neighbour,
+which showed plainly on a window spanning the two.
+
+`guac_rdp_disp_set_monitor()` now marks the layout changed, and the size check
+applies only when it has not; the flag clears when an update goes out. A
+request held back by the update interval is still sent on the next pass, since
+the flag survives until then.
+
+| File | Change |
+|------|--------|
+| `src/protocols/rdp/channels/disp.h` | `layout_changed` on `guac_rdp_disp` |
+| `src/protocols/rdp/channels/disp.c` | Set by `set_monitor`, honoured and cleared by `update_size` |
+
+Depends on `010`.
+
 ## Applying patches
 
 Patches are applied automatically by all build scripts (`build-deb.sh`, `build-rpm.sh`, `install.sh`, `dev.sh`, `Dockerfile`). To apply manually:
