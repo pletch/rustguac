@@ -50,6 +50,13 @@ if (!recreatedExpr)
             + 'Client.js — if it was renamed or reshaped, update this test '
             + 'rather than deleting it');
 
+const surfaceBlock = clientSource.match(
+        /(var trailer = [\s\S]*?var originY = [\s\S]*?;)\n/);
+if (!surfaceBlock)
+    throw new Error('could not find the `var trailer = ... var originY = ...` '
+            + 'block in Client.js — if it was renamed or reshaped, update this '
+            + 'test rather than deleting it');
+
 const numRectsExpr = clientSource.match(
         /var numRects = (parameters\.length[^;]*);/);
 if (!numRectsExpr)
@@ -59,8 +66,10 @@ const readPaired = new Function('parameters',
         `var numRects = ${numRectsExpr[1]};
          var paired = ${pairedExpr[1]};
          var recreated = ${recreatedExpr[1]};
+         ${surfaceBlock[1]}
          return { numRects: numRects, paired: paired,
-                  recreated: recreated };`);
+                  recreated: recreated, surface: surface,
+                  originX: originX, originY: originY };`);
 
 /* ---- the encoder, as guac_h264_write_arg() writes it ---- */
 
@@ -69,7 +78,7 @@ function instruction(args) {
 }
 
 function h264Instruction({ view = 0, rects = [], paired = null,
-        recreated = null, legacy = null }) {
+        recreated = null, surface = null, legacy = null }) {
 
     const args = ['h264', 7, 1, 1, 0, 0, 1920, 1080];
 
@@ -90,6 +99,9 @@ function h264Instruction({ view = 0, rects = [], paired = null,
 
     if (recreated !== null)
         args.push(recreated ? 1 : 0);
+
+    if (surface !== null)
+        args.push(surface.id, surface.x, surface.y);
 
     return instruction(args);
 
@@ -136,12 +148,30 @@ const cases = [
     ['guacd without <recreated>',   { rects: R3, paired: true,  recreated: null },  3, true,  false],
     ['guacd without <paired>',      { rects: R3, paired: null },   3, false, false],
     ['guacd without <numrects>',    { legacy: 'no-rects' },        0, false, false],
-    ['guacd without <view>',        { legacy: 'no-view' },         0, false, false]
+    ['guacd without <view>',        { legacy: 'no-view' },         0, false, false],
+
+    /* <surface> <origin_x> <origin_y> trail <recreated>. The second monitor's
+     * surface sits beside the first, so a misread here paints one monitor on
+     * top of the other -- and a coordinate read as a surface ID splits one
+     * sequence across two decoders. */
+    ['surface 1 at 1920,0',         { rects: R3, paired: true, recreated: false,
+                                      surface: { id: 1, x: 1920, y: 0 } },
+                                    3, true, false, { id: 1, x: 1920, y: 0 }],
+    ['surface 0, no rects',         { rects: [], paired: false, recreated: true,
+                                      surface: { id: 0, x: 0, y: 0 } },
+                                    0, false, true, { id: 0, x: 0, y: 0 }],
+    ['surface 2 below, 1 rect',     { rects: R1, paired: false, recreated: false,
+                                      surface: { id: 2, x: 0, y: 1080 } },
+                                    1, false, false, { id: 2, x: 0, y: 1080 }]
 ];
 
 let failures = 0;
 
-for (const [name, spec, expectRects, expectPaired, expectRecreated] of cases) {
+/* Every instruction without the trailer is one surface at the origin. */
+const ORIGIN = { id: 0, x: 0, y: 0 };
+
+for (const [name, spec, expectRects, expectPaired, expectRecreated,
+        expectSurface = ORIGIN] of cases) {
 
     const text = h264Instruction(spec);
     const { params } = parse(text);
@@ -150,13 +180,18 @@ for (const [name, spec, expectRects, expectPaired, expectRecreated] of cases) {
     const got = readPaired(params);
 
     const ok = got.numRects === expectRects && got.paired === expectPaired
-            && got.recreated === expectRecreated;
+            && got.recreated === expectRecreated
+            && got.surface === expectSurface.id
+            && got.originX === expectSurface.x
+            && got.originY === expectSurface.y;
     if (!ok) failures++;
 
     console.log(`${ok ? 'ok  ' : 'FAIL'}  ${name.padEnd(28)}`
             + ` numRects=${got.numRects} (want ${expectRects})`
             + ` paired=${got.paired} (want ${expectPaired})`
-            + ` recreated=${got.recreated} (want ${expectRecreated})`);
+            + ` recreated=${got.recreated} (want ${expectRecreated})`
+            + ` surface=${got.surface}@${got.originX},${got.originY}`
+            + ` (want ${expectSurface.id}@${expectSurface.x},${expectSurface.y})`);
 
 }
 

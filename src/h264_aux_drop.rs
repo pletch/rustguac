@@ -146,6 +146,11 @@ pub struct AuxDropper {
     /// Held here because the summary is written from `Drop` rather than by the
     /// caller. See the `Drop` impl.
     session: Option<uuid::Uuid>,
+    /// The RDPGFX surface the first H.264 picture came from.
+    first_surface: Option<u32>,
+    /// Set once H.264 has arrived from a second surface, which switches the
+    /// drop off for the rest of the session. See `other_surface`.
+    multi_surface: bool,
 }
 
 impl AuxDropper {
@@ -206,6 +211,8 @@ impl AuxDropper {
             eager: false,
             switched_off: !enabled,
             session: None,
+            first_surface: None,
+            multi_surface: false,
         }
     }
 
@@ -223,8 +230,28 @@ impl AuxDropper {
     /// so every instruction start in it is a real one, and an instruction is
     /// never split across two calls.
     pub fn process<'a>(&mut self, text: &'a str) -> (Cow<'a, str>, Vec<String>) {
-        self.probe.observe(text);
         let mut lines = Vec::new();
+
+        // Ahead of the probe, so that it never reads the two sequences as one:
+        // its every verdict is about the references within a single H.264
+        // sequence, and the frame_num and long-term indices of two encoders
+        // interleaved describe nothing at all.
+        if self.state != State::Off {
+            if let Some((first, other)) = self.other_surface(text) {
+                self.state = State::Off;
+                self.multi_surface = true;
+                lines.push(format!(
+                    "auxiliary view dropping is OFF for the rest of this \
+                     session: H.264 now arrives from surface {} as well as \
+                     surface {} — one per monitor — and the gate reasons \
+                     about a single H.264 sequence",
+                    other, first
+                ));
+                return (Cow::Borrowed(text), lines);
+            }
+        }
+
+        self.probe.observe(text);
 
         if self.state == State::Off {
             return (Cow::Borrowed(text), lines);
@@ -289,6 +316,55 @@ impl AuxDropper {
         }
 
         (self.filter(text), lines)
+    }
+
+    /// The first surface seen and a different one, if this chunk carries H.264
+    /// from a surface other than the first.
+    ///
+    /// A server that gives each monitor its own surface sends one H.264
+    /// sequence per surface, interleaved on one connection. Telling them apart
+    /// takes the `<surface>` guacd appends after `<recreated>`; a guacd without
+    /// it says nothing, which reads as surface 0, the single-monitor case.
+    fn other_surface(&mut self, text: &str) -> Option<(u32, u32)> {
+        if !text.contains("4.h264,") {
+            return None;
+        }
+
+        let mut pos = 0usize;
+        while pos < text.len() {
+            let (opcode, mut next, mut terminator) = crate::binary_blob::element(text, pos)?;
+            let h264 = opcode == "h264";
+            let mut args: Vec<&str> = Vec::new();
+
+            while terminator == b',' {
+                let (value, after, term) = crate::binary_blob::element(text, next)?;
+                if h264 {
+                    args.push(value);
+                }
+                next = after;
+                terminator = term;
+            }
+            pos = next;
+
+            if !h264 || args.len() < 9 {
+                continue;
+            }
+            let Ok(num_rects) = args[8].parse::<usize>() else {
+                continue;
+            };
+            let surface = args
+                .get(11 + num_rects * 4)
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+
+            match self.first_surface {
+                None => self.first_surface = Some(surface),
+                Some(first) if first != surface => return Some((first, surface)),
+                Some(_) => {}
+            }
+        }
+
+        None
     }
 
     /// Rewrites one chunk, borrowing it unchanged when nothing needed doing --
@@ -459,6 +535,13 @@ impl AuxDropper {
             return None;
         }
         if self.dropped_pictures == 0 {
+            if self.multi_surface {
+                return Some(
+                    "auxiliary view was never dropped: H.264 came from more \
+                     than one surface (one per monitor)"
+                        .to_string(),
+                );
+            }
             // Nothing was dropped. If it never decided, say what it was short
             // of: the gate is silent until it makes up its mind, so otherwise
             // a session that never decides leaves nothing to read at all.
@@ -469,12 +552,17 @@ impl AuxDropper {
         }
         Some(format!(
             "dropped {} auxiliary pictures ({} KiB), kept {} auxiliary \
-             keyframes, unpaired {} main views, {} in flight{}",
+             keyframes, unpaired {} main views, {} in flight{}{}",
             self.dropped_pictures,
             self.dropped_bytes / 1024,
             self.kept_idrs,
             self.unpaired,
             self.dropped_streams.len(),
+            if self.multi_surface {
+                ", until a second surface (monitor) stopped it"
+            } else {
+                ""
+            },
             if self.orphan_clears > 0 {
                 format!(
                     ", OVERFLOWED {} times — streams were left in flight and \
@@ -603,6 +691,94 @@ mod tests {
         let mut d = AuxDropper::new();
         d.state = State::Dropping;
         d
+    }
+
+    /// An `h264` carrying the trailer guacd appends for multi-monitor:
+    /// `<paired> <recreated> <surface> <origin_x> <origin_y>`.
+    fn h264_on(index: u32, view: u8, rects: usize, surface: u32, origin_x: u32) -> String {
+        let mut args = vec![
+            index.to_string(),
+            "0".into(),
+            "0".into(),
+            "0".into(),
+            "0".into(),
+            "1920".into(),
+            "1080".into(),
+            view.to_string(),
+            rects.to_string(),
+        ];
+        for r in 0..rects {
+            args.extend([r.to_string(), "0".into(), "16".into(), "16".into()]);
+        }
+        args.extend([
+            "0".into(),
+            "0".into(),
+            surface.to_string(),
+            origin_x.to_string(),
+            "0".into(),
+        ]);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        encode_instruction("h264", &refs)
+    }
+
+    /// Two monitors are two H.264 sequences interleaved, which the gate
+    /// cannot reason about, so the second surface switches the drop off --
+    /// and the change is what tells the client to stop expecting it.
+    #[test]
+    fn a_second_surface_switches_the_drop_off() {
+        let mut d = dropping();
+
+        let one = h264_on(1, 0, 2, 0, 0) + &h264_on(2, 0, 0, 0, 0);
+        let (_, lines) = d.process(&one);
+        assert!(lines.is_empty());
+        assert!(
+            d.dropping(),
+            "one surface, however many pictures, keeps dropping"
+        );
+
+        let two = h264_on(3, 0, 3, 1, 1920);
+        let (out, lines) = d.process(&two);
+        assert!(!d.dropping(), "a second surface stops it");
+        assert_eq!(out, two, "and the chunk that showed it passes untouched");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("surface 1 as well as surface 0"),
+            "{}",
+            lines[0]
+        );
+
+        // Off stays off: the first surface alone does not bring it back.
+        d.process(&h264_on(4, 1, 1, 0, 0));
+        assert!(!d.dropping());
+        assert!(d
+            .summary()
+            .is_some_and(|s| s.contains("more than one surface")));
+    }
+
+    /// Which surface comes first is the server's choice, not always 0.
+    #[test]
+    fn the_first_surface_need_not_be_zero() {
+        let mut d = dropping();
+        d.process(&h264_on(1, 0, 1, 3, 0));
+        d.process(&h264_on(2, 0, 1, 3, 0));
+        assert!(d.dropping());
+        let (_, lines) = d.process(&h264_on(3, 0, 1, 0, 0));
+        assert!(!d.dropping());
+        assert!(
+            lines[0].contains("surface 0 as well as surface 3"),
+            "{}",
+            lines[0]
+        );
+    }
+
+    /// A guacd without the trailer says nothing about surfaces, which is
+    /// surface 0 every time: the single-monitor case it was built for.
+    #[test]
+    fn no_trailer_is_one_surface() {
+        let mut d = dropping();
+        d.process(&(h264(1, false, 0, 2, true) + &h264(2, false, 0, 0, false)));
+        d.process(&h264_on(3, 0, 1, 0, 0));
+        assert!(d.dropping());
     }
 
     /// The entry setting decides from less evidence; it does not decide
