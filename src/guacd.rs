@@ -1,6 +1,6 @@
 //! guacd connection and Guacamole protocol handshake.
 
-use crate::protocol::{Instruction, InstructionParser};
+use crate::protocol::Instruction;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -760,29 +760,90 @@ async fn send_handshake(
     Ok(())
 }
 
-/// Read a single complete instruction from an async stream.
+/// Read a single complete instruction from an async stream, and not a byte
+/// more.
+///
+/// The stream is handed on to the WebSocket bridge after the handshake, so
+/// anything read past the end of `ready` here would be lost to the browser.
+/// guacd writes to the user's socket as soon as it has joined -- the RDP
+/// plugin advertises `secondary-monitors` as an `argv` stream straight after
+/// `ready` -- and reading in blocks dropped it whenever it shared a read with
+/// `ready`, which is timing: the monitor controls then said the connection
+/// offered a single monitor. So this reads element by element, by the length
+/// prefixes, and stops at the terminating `;`. The handshake is a few
+/// instructions once a session, so the small reads cost nothing.
 async fn read_instruction(
     stream: &mut (impl AsyncRead + Unpin),
 ) -> Result<Instruction, GuacdError> {
-    let mut parser = InstructionParser::new();
-    let mut buf = [0u8; 4096];
-
+    let mut elements: Vec<String> = Vec::new();
     loop {
-        let n = stream
-            .read(&mut buf)
-            .await
-            .map_err(|e| GuacdError::Io(e.to_string()))?;
-        if n == 0 {
-            return Err(GuacdError::Connection("guacd closed connection".into()));
+        // Length: decimal digits up to '.', counting Unicode code points.
+        let mut len: usize = 0;
+        let mut digits = 0;
+        loop {
+            let b = read_byte(stream).await?;
+            match b {
+                b'0'..=b'9' if digits < 9 => {
+                    len = len * 10 + (b - b'0') as usize;
+                    digits += 1;
+                }
+                b'.' if digits > 0 => break,
+                _ => {
+                    return Err(GuacdError::Protocol(format!(
+                        "malformed element length from guacd (byte 0x{:02x})",
+                        b
+                    )))
+                }
+            }
         }
-        let data = std::str::from_utf8(&buf[..n])
+        // Value: `len` code points, each one to four bytes.
+        let mut value = Vec::with_capacity(len);
+        for _ in 0..len {
+            let lead = read_byte(stream).await?;
+            value.push(lead);
+            let more = match lead {
+                0x00..=0x7f => 0,
+                0xc0..=0xdf => 1,
+                0xe0..=0xef => 2,
+                0xf0..=0xf7 => 3,
+                _ => return Err(GuacdError::Protocol("Invalid UTF-8 from guacd".into())),
+            };
+            for _ in 0..more {
+                value.push(read_byte(stream).await?);
+            }
+        }
+        let value = String::from_utf8(value)
             .map_err(|e| GuacdError::Protocol(format!("Invalid UTF-8 from guacd: {}", e)))?;
-
-        let results = parser.receive(data);
-        if let Some(result) = results.into_iter().next() {
-            return result.map_err(|e| GuacdError::Protocol(e.to_string()));
+        elements.push(value);
+        // Terminator: ',' for another element, ';' for the end.
+        match read_byte(stream).await? {
+            b',' => continue,
+            b';' => break,
+            b => {
+                return Err(GuacdError::Protocol(format!(
+                    "malformed instruction from guacd (byte 0x{:02x} after an element)",
+                    b
+                )))
+            }
         }
     }
+    let opcode = elements.remove(0);
+    Ok(Instruction {
+        opcode,
+        args: elements,
+    })
+}
+
+async fn read_byte(stream: &mut (impl AsyncRead + Unpin)) -> Result<u8, GuacdError> {
+    let mut b = [0u8; 1];
+    let n = stream
+        .read(&mut b)
+        .await
+        .map_err(|e| GuacdError::Io(e.to_string()))?;
+    if n == 0 {
+        return Err(GuacdError::Connection("guacd closed connection".into()));
+    }
+    Ok(b[0])
 }
 
 #[derive(Debug)]
@@ -807,6 +868,44 @@ impl std::error::Error for GuacdError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_instruction_leaves_what_follows_ready_in_the_stream() {
+        // `ready` and the argv guacd sends straight after it, in one read.
+        let wire = "5.ready,37.$260d01da-779b-4ee4-afc0-c16e154e8d6b;\
+                    4.argv,1.1,10.text/plain,18.secondary-monitors;"
+            .as_bytes();
+        let mut stream = wire;
+        let ready = read_instruction(&mut stream).await.unwrap();
+        assert_eq!(ready.opcode, "ready");
+        assert_eq!(ready.args, vec!["$260d01da-779b-4ee4-afc0-c16e154e8d6b"]);
+        assert_eq!(
+            stream,
+            "4.argv,1.1,10.text/plain,18.secondary-monitors;".as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_instruction_counts_code_points_not_bytes() {
+        let mut stream = "4.args,3.\u{e9}t\u{e9},1.a;".as_bytes();
+        let i = read_instruction(&mut stream).await.unwrap();
+        assert_eq!(i.opcode, "args");
+        assert_eq!(i.args, vec!["\u{e9}t\u{e9}", "a"]);
+        assert!(stream.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_instruction_keeps_a_semicolon_inside_a_value() {
+        let mut stream = "4.args,3.a;b;".as_bytes();
+        let i = read_instruction(&mut stream).await.unwrap();
+        assert_eq!(i.args, vec!["a;b"]);
+    }
+
+    #[tokio::test]
+    async fn read_instruction_refuses_a_malformed_length() {
+        let mut stream = "x.ready;".as_bytes();
+        assert!(read_instruction(&mut stream).await.is_err());
+    }
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

@@ -204,38 +204,6 @@ pub fn last_instruction_boundary(buf: &[u8]) -> Option<usize> {
     }
 }
 
-/// Streaming parser that accumulates data and yields complete instructions.
-#[derive(Default)]
-pub struct InstructionParser {
-    buffer: String,
-}
-
-impl InstructionParser {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Feed data into the parser and return any complete instructions.
-    pub fn receive(&mut self, data: &str) -> Vec<Result<Instruction, ParseError>> {
-        self.buffer.push_str(data);
-
-        if self.buffer.len() > 1_048_576 {
-            self.buffer.clear();
-            return vec![];
-        }
-
-        let mut results = Vec::new();
-
-        while let Some(semi_pos) = self.buffer.find(';') {
-            let instruction_str = self.buffer[..semi_pos].to_string();
-            self.buffer = self.buffer[semi_pos + 1..].to_string();
-            results.push(Instruction::parse(&instruction_str));
-        }
-
-        results
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,21 +261,6 @@ mod tests {
         let encoded = original.encode();
         let parsed = Instruction::parse(&encoded).unwrap();
         assert_eq!(original, parsed);
-    }
-
-    #[test]
-    fn test_streaming_parser() {
-        let mut parser = InstructionParser::new();
-
-        // Feed partial data
-        let results = parser.receive("4.size,3.80");
-        assert!(results.is_empty());
-
-        // Complete the instruction and start another
-        let results = parser.receive("0,3.600;3.nop;");
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].as_ref().unwrap().opcode, "size");
-        assert_eq!(results[1].as_ref().unwrap().opcode, "nop");
     }
 
     // ── Adversarial parser cases ───────────────────────────────────────────
@@ -399,50 +352,6 @@ mod tests {
         // proves parse() honours the length over the semicolon.
         let inst = Instruction::parse("5.a;b;c").unwrap();
         assert_eq!(inst.opcode, "a;b;c");
-    }
-
-    #[test]
-    fn streaming_parser_caps_buffer_at_1_mib() {
-        // Feed > 1 MiB in a single receive with no terminator. The buffer
-        // must clear in-place rather than grow unbounded, and the call
-        // must return cleanly without panicking. After the clear, a fresh
-        // well-formed frame parses normally.
-        let mut parser = InstructionParser::new();
-        let huge = "x".repeat(1_100_000);
-        let out = parser.receive(&huge);
-        // Over-cap input is dropped entirely (no partial instruction yield).
-        assert!(out.is_empty());
-        // Fresh input parses correctly — buffer is empty, no residue.
-        let out2 = parser.receive("3.nop;");
-        assert_eq!(out2.len(), 1);
-        assert_eq!(out2[0].as_ref().unwrap().opcode, "nop");
-    }
-
-    #[test]
-    fn streaming_parser_split_at_every_boundary() {
-        // Feed a well-formed frame byte-by-byte; the parser must assemble
-        // correctly regardless of where chunks break.
-        let full = "4.size,3.800,3.600;3.nop;";
-        let mut parser = InstructionParser::new();
-        let mut all = Vec::new();
-        for ch in full.chars() {
-            let mut buf = [0u8; 4];
-            let s = ch.encode_utf8(&mut buf);
-            all.extend(parser.receive(s));
-        }
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].as_ref().unwrap().opcode, "size");
-        assert_eq!(all[1].as_ref().unwrap().opcode, "nop");
-    }
-
-    #[test]
-    fn streaming_parser_emits_error_for_malformed_frame() {
-        // A malformed-but-terminated frame yields a Result::Err, not a panic.
-        let mut parser = InstructionParser::new();
-        let out = parser.receive("not-a-valid-instruction;3.nop;");
-        assert_eq!(out.len(), 2);
-        assert!(out[0].is_err());
-        assert_eq!(out[1].as_ref().unwrap().opcode, "nop");
     }
 
     #[test]

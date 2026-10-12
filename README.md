@@ -250,6 +250,14 @@ the measurement work that made the browser-side combine affordable.
   same startup pass. `RUSTGUAC_NO_ASSET_VERSIONING=1` turns versioning off for
   that reason, leaving everything revalidating as before.
 
+- **The guacd handshake is read one instruction at a time** — the reader took
+  guacd's socket in 4KB blocks and kept only the first instruction, so
+  anything guacd sent straight after `ready` in the same read never reached the
+  browser. The RDP plugin sends exactly one such thing, the secondary-monitors
+  argv, so the monitor controls intermittently said the connection offered a
+  single monitor. It now reads element by element by the length prefixes and
+  stops at the terminating semicolon.
+
 ### Display / HiDPI
 
 - **Per-connection Native Resolution** — requests the framebuffer in the
