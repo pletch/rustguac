@@ -118,6 +118,17 @@ Guacamole.Mouse = function Mouse(element) {
      */
     var scroll_delta = 0;
 
+    /**
+     * Called when the pointer leaves the element with a button held; if it
+     * returns true the buttons stay held instead of being released. Null, the
+     * default, releases them as always. For a session spread over several
+     * windows, where a drag that crosses into the next window is still one
+     * drag on the remote desktop.
+     *
+     * @type {?function(): boolean}
+     */
+    this.holdButtonsOnLeave = null;
+
     // Block context menu so right-click gets sent properly
     element.addEventListener("contextmenu", function(e) {
         Guacamole.Event.DOMEvent.cancelEvent(e);
@@ -131,6 +142,14 @@ Guacamole.Mouse = function Mouse(element) {
             ignore_mouse--;
             return;
         }
+
+        // A button held across leaving the element is released by the first
+        // move that arrives with nothing pressed, should its release ever have
+        // gone elsewhere; otherwise it would stay held on the remote.
+        if (guac_mouse.holdButtonsOnLeave && e.buttons === 0
+                && (guac_mouse.currentState.left || guac_mouse.currentState.middle
+                    || guac_mouse.currentState.right))
+            guac_mouse.reset(e);
 
         guac_mouse.move(Guacamole.Position.fromClientPosition(element, e.clientX, e.clientY), e);
 
@@ -241,6 +260,13 @@ Guacamole.Mouse = function Mouse(element) {
                 return;
             target = target.parentNode;
         }
+
+        // A drag carried on into another window keeps its buttons: the browser
+        // goes on delivering the drag's moves and its release here, so the
+        // remote sees one continuous drag. See holdButtonsOnLeave.
+        if (e.buttons && guac_mouse.holdButtonsOnLeave
+                && guac_mouse.holdButtonsOnLeave())
+            return;
 
         // Release all buttons and fire mouseout
         guac_mouse.reset(e);

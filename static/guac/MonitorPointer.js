@@ -37,8 +37,15 @@ var Guacamole = Guacamole || {};
  * @param {!function(!Object)} sendState
  *     Called with a plain mouse state -- {x, y, left, middle, right, up, down}
  *     -- to be forwarded to the session.
+ *
+ * @param {function(): ?Object} [getBounds]
+ *     The combined framebuffer's size, as {width, height}. With it, a drag
+ *     that leaves this window carries on into its neighbours on the remote
+ *     desktop, held only to the framebuffer; without it, as before, every
+ *     position is held to this monitor.
  */
-Guacamole.MonitorPointer = function MonitorPointer(canvas, getRect, sendState) {
+Guacamole.MonitorPointer = function MonitorPointer(canvas, getRect, sendState,
+        getBounds) {
 
     /**
      * The last state sent, as a key, so the same one is not sent twice.
@@ -70,12 +77,29 @@ Guacamole.MonitorPointer = function MonitorPointer(canvas, getRect, sendState) {
         var cr = canvas.getBoundingClientRect();
         var fx = cr.width > 0 ? (ev.clientX - cr.left) / cr.width : 0;
         var fy = cr.height > 0 ? (ev.clientY - cr.top) / cr.height : 0;
-        if (fx < 0) fx = 0; else if (fx > 1) fx = 1;
-        if (fy < 0) fy = 0; else if (fy > 1) fy = 1;
+
+        /* A drag goes on receiving moves after the pointer leaves the window,
+         * and held to this monitor it stuck at the edge: a window dragged to
+         * the next monitor stopped at the border. So while a button is held
+         * the position carries on past the edge at this monitor's scale --
+         * onto the neighbour, when the displays sit as the layout tiles them
+         * -- and is held only to the combined framebuffer. */
+        var bounds = (ev.buttons && getBounds) ? getBounds() : null;
+        if (!bounds) {
+            if (fx < 0) fx = 0; else if (fx > 1) fx = 1;
+            if (fy < 0) fy = 0; else if (fy > 1) fy = 1;
+        }
+
+        var x = rect.left + fx * rect.width;
+        var y = rect.top + fy * rect.height;
+        if (bounds) {
+            x = Math.min(Math.max(0, x), bounds.width - 1);
+            y = Math.min(Math.max(0, y), bounds.height - 1);
+        }
 
         var state = {
-            x      : rect.left + fx * rect.width,
-            y      : rect.top + fy * rect.height,
+            x      : x,
+            y      : y,
             left   : (ev.buttons & 1) !== 0,
             middle : (ev.buttons & 4) !== 0,
             right  : (ev.buttons & 2) !== 0,
@@ -121,6 +145,19 @@ Guacamole.MonitorPointer = function MonitorPointer(canvas, getRect, sendState) {
         for (var i = 0; i < events.length; i++)
             pointer(events[i]);
 
+    });
+
+    /* Capture the pointer for the length of a drag. Without it Chrome
+     * delivers a drag's moves outside the window to the document rather
+     * than to this canvas, so a window dragged onto the next monitor stopped
+     * at the border -- and labwc, seeing the pointer rest on an output edge,
+     * offered to tile it there. Captured, the moves and the release come here
+     * wherever the pointer goes. Released by the browser on pointerup. */
+    canvas.addEventListener('pointerdown', function (ev) {
+        if (ev.pointerType === 'mouse' && getBounds
+                && typeof canvas.setPointerCapture === 'function') {
+            try { canvas.setPointerCapture(ev.pointerId); } catch (e) {}
+        }
     });
 
     canvas.addEventListener('mousedown', pointer);

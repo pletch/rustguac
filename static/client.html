@@ -1330,7 +1330,32 @@
                     function (state) {
                         client.sendMouseState(new Guacamole.Mouse.State(state),
                                 false);
+                    },
+                    function () {
+                        var d = client.getDisplay();
+                        return { width: d.getWidth(), height: d.getHeight() };
                     });
+
+                // A fullscreen button, since a popup cannot hide its title and
+                // address bar any other way and F11 alone proved unreliable
+                // there. Shown while windowed, top right, out of the canvas so
+                // its clicks never reach the remote; a click is the user
+                // gesture requestFullscreen() needs.
+                var fsBtn = win.document.createElement('button');
+                fsBtn.textContent = '\u26F6 Fullscreen';
+                fsBtn.title = 'Fullscreen this monitor (F11). Esc to leave.';
+                fsBtn.style.cssText = 'position:fixed;top:8px;right:8px;z-index:2;'
+                    + 'padding:6px 10px;font:13px system-ui,sans-serif;color:#fff;'
+                    + 'background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.4);'
+                    + 'border-radius:6px;cursor:pointer;opacity:.75;';
+                fsBtn.addEventListener('click', function(ev) {
+                    ev.stopPropagation();
+                    try { win.document.documentElement.requestFullscreen(); } catch (e) {}
+                });
+                win.document.body.appendChild(fsBtn);
+                win.document.addEventListener('fullscreenchange', function() {
+                    fsBtn.style.display = win.document.fullscreenElement ? 'none' : '';
+                });
 
                 // Keyboard: forward to the same client (combined session),
                 // except F11, which fullscreens this window. A popup always
@@ -2793,12 +2818,36 @@
             // here, since they are a transform the display knows nothing about.
             var fillX = 1, fillY = 1;
             var mouse = new Guacamole.Mouse(client.getDisplay().getElement());
+            // With monitor windows open, a drag that leaves this window is
+            // heading for one of them: keep its buttons held, and let its
+            // position run on past monitor 0 into the combined framebuffer,
+            // where the next monitor is. Held to the framebuffer, since the
+            // pointer can leave in any direction.
+            mouse.holdButtonsOnLeave = function() {
+                return Object.keys(monitorWindows).length > 0;
+            };
+            // And capture the pointer for the drag: uncaptured, Chrome sends
+            // the moves outside this window to the document rather than to
+            // the display element, so the remote pointer stopped at the edge
+            // of monitor 0 and the compositor offered to tile the window
+            // there. Released by the browser on pointerup.
+            client.getDisplay().getElement().addEventListener('pointerdown', function(ev) {
+                if (ev.pointerType !== 'mouse' || !Object.keys(monitorWindows).length)
+                    return;
+                try { this.setPointerCapture(ev.pointerId); } catch (e) {}
+            });
             mouse.onEach(['mousedown', 'mousemove', 'mouseup'], function(e) {
                 var state = e.state;
                 if (fillX !== 1 || fillY !== 1) {
                     state = new Guacamole.Mouse.State(state);
                     state.x /= fillX;
                     state.y /= fillY;
+                }
+                if (Object.keys(monitorWindows).length > 0) {
+                    var d = client.getDisplay(), s = d.getScale();
+                    state = new Guacamole.Mouse.State(state);
+                    state.x = Math.min(Math.max(0, state.x), d.getWidth() * s - 1);
+                    state.y = Math.min(Math.max(0, state.y), d.getHeight() * s - 1);
                 }
                 client.sendMouseState(state, true);
             });

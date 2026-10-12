@@ -298,6 +298,14 @@ the measurement work that made the browser-side combine affordable.
 - **Closing the last secondary monitor forgets the layout** — guacd republishes
   the layout only while more than one monitor is active, so the main window
   went on cropping to monitor 0's old rect, letterboxed, until it was cleared.
+- **A drag crosses between monitor windows as one drag** — dragging a window
+  to another monitor used to drop it at the border: the main window released
+  every button on mouseout, and a monitor window clamped the pointer to its own
+  monitor. A press now captures the pointer, so a drag's moves and release
+  reach the canvas it started on wherever the pointer goes; buttons are held
+  across the edge while monitor windows are open, and a monitor window's
+  position may run on into the neighbouring monitor, held only to the combined
+  framebuffer. Each monitor window also gets a Fullscreen button.
 
 ### Input
 
