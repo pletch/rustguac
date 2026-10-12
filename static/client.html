@@ -1332,10 +1332,33 @@
                                 false);
                     });
 
-                // Keyboard: forward to the same client (combined session).
+                // Keyboard: forward to the same client (combined session),
+                // except F11, which fullscreens this window. A popup always
+                // carries the browser's title and address bar, and only
+                // fullscreen removes it -- but Guacamole.Keyboard prevents the
+                // default of every key it forwards, so the browser's own F11
+                // never ran here and the remote got the keypress instead.
+                // Requesting fullscreen from the keydown works, being a user
+                // gesture in this window; Esc leaves it as usual.
+                var F11 = 0xFFC8;
                 var keyboard = new Guacamole.Keyboard(win.document);
-                keyboard.onkeydown = function(sym) { client.sendKeyEvent(1, sym); };
-                keyboard.onkeyup = function(sym) { client.sendKeyEvent(0, sym); };
+                keyboard.onkeydown = function(sym) {
+                    if (sym === F11) {
+                        var doc = win.document;
+                        try {
+                            if (doc.fullscreenElement)
+                                doc.exitFullscreen();
+                            else
+                                doc.documentElement.requestFullscreen();
+                        } catch (e) {}
+                        return false;
+                    }
+                    client.sendKeyEvent(1, sym);
+                };
+                keyboard.onkeyup = function(sym) {
+                    if (sym !== F11)
+                        client.sendKeyEvent(0, sym);
+                };
                 rec.keyboard = keyboard;
 
                 // Closing the window (or the tab) releases the monitor.

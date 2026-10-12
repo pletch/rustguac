@@ -285,6 +285,9 @@ the measurement work that made the browser-side combine affordable.
   switches off at the second surface, since its gate reasons about one
   sequence's references. A guacd or client without the trailer behaves as
   before.
+- **F11 in a monitor window** fullscreens that window. A monitor window is a
+  popup, which always shows the browser's title and address bar until it is
+  fullscreen, but `Guacamole.Keyboard` swallowed F11 and sent it to the remote.
 
 ### Input
 
