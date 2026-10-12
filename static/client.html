@@ -2729,6 +2729,29 @@
                 }
             }
 
+            // The uniform fit, held to one framebuffer pixel per physical pixel
+            // where the mod-16 margin is all that stands in the way. When both
+            // dimensions are rounded down, min() takes the axis with the
+            // smaller shortfall and so scales *up* by it -- a 1700x1000 window
+            // with a 1696x992 desktop draws at 1.0024 -- which resamples every
+            // pixel, and then counts as already resampled, so applyFill()
+            // stretches the other axis on top. Within FILL_MAX of the exact
+            // scale, take the exact one and let the margin be centered instead.
+            // A larger gap is a framebuffer that really is smaller than the
+            // window, and still scales up to fit.
+            function fitScale(availW, availH, dw, dh, dpr) {
+                var scale = Math.min(availW / dw, availH / dh);
+                var exact = 1 / dpr;
+                if (scale > exact && scale <= exact * FILL_MAX) scale = exact;
+                return scale;
+            }
+
+            // A CSS offset on a whole device pixel, since a centering margin of
+            // half a device pixel resamples a picture drawn pixel for pixel.
+            function devicePx(css, dpr) {
+                return Math.round(css * dpr) / dpr;
+            }
+
             // Show the remote pointer image as the browser's own pointer, and
             // only fall back to the display's software cursor layer where CSS
             // cursors are unsupported. Guacamole.Display puts that layer in
@@ -2815,10 +2838,11 @@
                     // per physical pixel -- no resampling. It stays correct
                     // when a panel opens or the window is resized ahead of the
                     // debounced sendSize, just at a softer intermediate scale.
-                    var scale = Math.min(availW / dw, availH / dh);
+                    var dpr = window.devicePixelRatio || 1;
+                    var scale = fitScale(availW, availH, dw, dh, dpr);
                     display.scale(scale);
                     var sw = dw * scale, sh = dh * scale;
-                    var pixelExact = Math.abs(scale * (window.devicePixelRatio || 1) - 1) < 0.002;
+                    var pixelExact = Math.abs(scale * dpr - 1) < 0.002;
                     applyFill(el, sw, sh, availW, availH, pixelExact);
                     displayEl.style.overflow = '';
                     displayEl.style.position = '';
@@ -2834,8 +2858,8 @@
                     // margins and ignores the fill transform, so the pointer
                     // maths (which divides out fillX/fillY) stays correct.
                     var fw = sw * fillX, fh = sh * fillY;
-                    el.style.marginLeft = (panelOffset + Math.max(0, (availW - fw) / 2)) + 'px';
-                    el.style.marginTop = Math.max(0, (availH - fh) / 2) + 'px';
+                    el.style.marginLeft = devicePx(panelOffset + Math.max(0, (availW - fw) / 2), dpr) + 'px';
+                    el.style.marginTop = devicePx(Math.max(0, (availH - fh) / 2), dpr) + 'px';
                 }
                 applyRemoteCursor();
             }

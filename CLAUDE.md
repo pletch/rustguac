@@ -1350,6 +1350,16 @@ render's 0.82%. The cost of separating them is a desktop scaled 180% inside a
 200% framebuffer drawing its UI ~10% smaller than nominal, which is legible and
 adjustable on the host where a resample is neither.
 
+**The mod-16 margin must not cost the 1:1 fit.** `007` rounds both
+dimensions down, so the framebuffer is usually a few pixels short on *both*
+axes, and a plain `min(availW / dw, availH / dh)` then scales up by the
+smaller shortfall -- 1.0045 at 1440x789 on a 1.25 display -- resampling every
+pixel of a session sized to need none. `fitScale()` takes exactly
+`1/devicePixelRatio` whenever the fit lands within `FILL_MAX` above it, and the
+margin is centered on whole device pixels (`devicePx()`), since a half-pixel
+offset resamples just as surely. Above that band the framebuffer really is
+smaller than the window and still scales up. `tests/client-fit.mjs` pins both.
+
 **4:4:4 combining is declined above 4K** (`COMBINE_MAX_PIXELS` in
 `H264Decoder.js`, overridable as `h264CombineMaxPixels`) **and given up when
 the copy costs too much** (`COMBINE_COPY_TRIP_SHARE`, 30% of wall clock spent

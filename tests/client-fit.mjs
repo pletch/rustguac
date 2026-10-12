@@ -44,7 +44,7 @@ assert.ok(fillMax, 'FILL_MAX must be defined in client.html');
 
 const ctx = { fillX: 1, fillY: 1 };
 vm.createContext(ctx);
-vm.runInContext(`var FILL_MAX = ${fillMax[1]};\n${lift('applyFill')}`, ctx);
+vm.runInContext(`var FILL_MAX = ${fillMax[1]};\n${lift('applyFill')}\n${lift('fitScale')}\n${lift('devicePx')}`, ctx);
 
 function fit(w, h, availW, availH, pixelExact) {
     const el = { style: {} };
@@ -84,5 +84,32 @@ r = fit(1000, 1000, 1025, 1000, false);
 assert.ok(r.fillX > 1, '2.5% is still a rounding gap');
 r = fit(1000, 1000, 1026, 1000, false);
 assert.equal(r.fillX, 1, 'over 2.5% is not');
+
+// The uniform fit. Both axes rounded down: min() picks the smaller
+// shortfall and would scale up by it, resampling the whole picture. Within
+// FILL_MAX of one framebuffer pixel per physical pixel, it takes that instead.
+const exactEnough = (scale, dpr) => Math.abs(scale * dpr - 1) < 0.002;
+let s = ctx.fitScale(1700, 1000, 1696, 992, 1);
+assert.equal(s, 1, '1696x992 in 1700x1000 is drawn 1:1, not at 1.0024');
+s = ctx.fitScale(1440, 789, 1792, 976, 1.25);
+assert.equal(s, 1 / 1.25, 'Native Resolution at 1.25 stays pixel-exact');
+s = ctx.fitScale(1710, 1074, 2128, 1328, 1.25);
+assert.ok(exactEnough(s, 1.25), 'and at 1710x1074');
+s = ctx.fitScale(1700, 1000, 3392, 2000, 2);
+assert.equal(s, 0.5, 'an exact fit is left alone');
+
+// Outside the band, the plain fit stands.
+s = ctx.fitScale(1920, 1080, 1024, 768, 1);
+assert.equal(s, 1080 / 768, 'a framebuffer much smaller than the window still scales up');
+s = ctx.fitScale(1600, 900, 1920, 1080, 1);
+assert.equal(s, 900 / 1080, 'one larger than the window still scales down');
+s = ctx.fitScale(1700, 1000, 1696, 992, 2);
+assert.equal(s, Math.min(1700 / 1696, 1000 / 992),
+    'a CSS-sized framebuffer on a 2x display is resampled anyway and keeps its fit');
+
+// Centering margins land on whole device pixels.
+assert.equal(ctx.devicePx(2.5, 1), 3);
+assert.equal(ctx.devicePx(2.5, 2), 2.5, 'half a CSS pixel is a whole device pixel at 2x');
+assert.equal(ctx.devicePx(7.3, 1.25), 7.2);
 
 console.log('client-fit: ok');
