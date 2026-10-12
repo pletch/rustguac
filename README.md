@@ -311,6 +311,11 @@ the measurement work that made the browser-side combine affordable.
   update that left the bounding box unchanged, so the second of two equal
   monitors going fullscreen was never resized and stayed stretched 7% taller
   than its neighbor. A layout change now always counts as a change.
+- **Back to fullscreen after opening a monitor window** — Chrome takes a page
+  out of fullscreen when it opens a window, and only a fresh click or keypress
+  may re-enter it, so the main window arms the same one-shot gesture
+  fullscreen-on-connect uses and says so on screen. Every size request, from
+  any window, is logged to the console, sent or skipped.
 
 ### Input
 

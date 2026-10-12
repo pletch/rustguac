@@ -1238,6 +1238,7 @@
             // coordinates.
             function openMonitorWindow(index) {
                 if (monitorWindows[index]) return;
+                var wasFullscreen = !!rgFullscreenEl();
                 var win = window.open('', 'rustguac-mon-' + index,
                     'width=1280,height=800,menubar=no,toolbar=no,location=no,status=no');
                 if (!win) {
@@ -1313,8 +1314,12 @@
                     popResizeTimer = win.setTimeout(function() {
                         var rs = deviceSize(win.innerWidth || 0,
                                 win.innerHeight || 0);
-                        if (rs.width >= 8 && rs.height >= 8
-                                && sizeWouldChange(rs.width, rs.height, index))
+                        var send = rs.width >= 8 && rs.height >= 8
+                                && sizeWouldChange(rs.width, rs.height, index);
+                        console.log('[rustguac] size request, monitor '
+                                + (index + 1) + ': ' + rs.width + 'x' + rs.height
+                                + (send ? ' sent' : ' skipped'));
+                        if (send)
                             client.sendSize(rs.width, rs.height, index, 0);
                     }, 500);
                 });
@@ -1390,6 +1395,27 @@
                 win.addEventListener('beforeunload', function() {
                     if (monitorWindows[index]) closeMonitorWindow(index);
                 });
+
+                // Chrome takes a page out of fullscreen when it opens a window,
+                // and nothing but a fresh click or keypress may put it back: the
+                // main window was left at its windowed size, which a user still
+                // expecting fullscreen reads as a desktop that no longer fills
+                // the screen. So if it was fullscreen, the next click or key in
+                // it returns there, as fullscreen-on-connect does.
+                if (wasFullscreen) {
+                    setTimeout(function() {
+                        if (rgFullscreenEl()) return;
+                        rgArmFullscreenGesture();
+                        var t = document.getElementById('fs-esc-notice');
+                        if (t) {
+                            t.textContent = 'Opening monitor ' + (index + 1)
+                                + ' took this window out of fullscreen. Click '
+                                + 'here or press a key to go back.';
+                            t.style.display = 'block';
+                            setTimeout(function() { t.style.display = 'none'; }, 8000);
+                        }
+                    }, 300);
+                }
                 renderMonitorControls();
             }
 
@@ -3062,7 +3088,11 @@
                     var anyPanelOpen = panelOpen || filePanelOpen;
                     var ts = rgTargetSize(anyPanelOpen);
                     var rz = deviceSize(ts[0], ts[1]);
-                    if (sizeWouldChange(rz.width, rz.height))
+                    var send = sizeWouldChange(rz.width, rz.height);
+                    console.log('[rustguac] size request, monitor 1: '
+                            + rz.width + 'x' + rz.height
+                            + (send ? ' sent' : ' skipped (same 16px band as the last)'));
+                    if (send)
                         client.sendSize(rz.width, rz.height);
                 }, 500);
             });
